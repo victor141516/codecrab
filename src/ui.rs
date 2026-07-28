@@ -866,6 +866,25 @@ impl App {
         self.refresh_completion();
     }
 
+    fn handle_paste(&mut self, text: &str) -> bool {
+        if self.recording.is_some()
+            || self.transcription.is_some()
+            || self.goal_picker.is_some()
+            || self.session_picker.is_some()
+            || self.model_picker.is_some()
+            || self.show_help
+            || self.show_skills
+        {
+            return false;
+        }
+        let normalized = normalize_paste(text);
+        if normalized.is_empty() {
+            return false;
+        }
+        self.insert(&normalized);
+        true
+    }
+
     fn insert_char(&mut self, value: char) {
         self.input.insert(self.cursor, value);
         self.cursor += value.len_utf8();
@@ -2677,7 +2696,9 @@ async fn run_tui(
         if event::poll(Duration::from_millis(70))? {
             match event::read()? {
                 Event::Key(key) => app.handle_key(key).await?,
-                Event::Paste(text) => app.insert(&text.replace("\r\n", "\n")),
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                }
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
@@ -4200,6 +4221,10 @@ fn dictation_shortcut_label() -> &'static str {
     }
 }
 
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn editor_action(key: &KeyEvent) -> Option<EditorAction> {
     let word_modifier = key
         .modifiers
@@ -4485,6 +4510,34 @@ mod tests {
         assert_eq!(app.input, "Review the project this");
         assert_eq!(app.cursor, "Review the project ".len());
         assert!(app.pending_user.is_none());
+    }
+
+    #[test]
+    fn terminal_paste_normalizes_line_endings_and_never_submits() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.input = "beforeafter".into();
+        app.cursor = "before".len();
+
+        assert!(app.handle_paste("one\r\ntwo\rthree\n"));
+
+        assert_eq!(app.input, "beforeone\ntwo\nthree\nafter");
+        assert_eq!(app.cursor, "beforeone\ntwo\nthree\n".len());
+        assert!(app.pending_user.is_none());
+        assert!(app.queued_prompt.is_none());
+        assert!(!app.is_running());
+    }
+
+    #[test]
+    fn terminal_paste_is_ignored_while_a_modal_owns_input() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.input = "draft".into();
+        app.cursor = app.input.len();
+        app.show_help = true;
+
+        assert!(!app.handle_paste("unexpected\npaste"));
+        assert_eq!(app.input, "draft");
     }
 
     #[tokio::test]
