@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -50,7 +50,7 @@ use crate::{
     },
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role},
-    session::{Goal, GoalStatus, SessionProject, SessionStore, list_session_projects},
+    session::{AgentTurn, Goal, GoalStatus, SessionProject, SessionStore, list_session_projects},
     skills::SkillRegistry,
     tools::ToolBox,
     transcription::Transcriber,
@@ -160,9 +160,21 @@ struct CopyTarget {
     text: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TurnKey {
+    session_id: Uuid,
+    message_index: usize,
+}
+
+struct TurnToggleTarget {
+    line: usize,
+    key: TurnKey,
+}
+
 struct ConversationSource {
     lines: Vec<Line<'static>>,
     copy_targets: Vec<CopyTarget>,
+    turn_toggles: Vec<TurnToggleTarget>,
 }
 
 #[derive(Clone)]
@@ -192,6 +204,7 @@ struct ConversationView {
     rows: Vec<VisualRow>,
     scroll: usize,
     copy_targets: Vec<CopyTarget>,
+    turn_toggles: Vec<TurnToggleTarget>,
 }
 
 impl ConversationView {
@@ -249,6 +262,14 @@ impl ConversationView {
                     && unit.source_end > range.start
             })
         })
+    }
+
+    fn turn_toggle_at(&self, point: TextPoint) -> Option<TurnKey> {
+        let source_line = self.rows.get(point.row)?.source_line;
+        self.turn_toggles
+            .iter()
+            .find(|target| target.line == source_line)
+            .map(|target| target.key)
     }
 
     fn selected_text(&self, selection: &TextSelection) -> String {
@@ -312,6 +333,11 @@ impl TextSelection {
 struct CopyFlash {
     ranges: Vec<SourceRange>,
     until: Instant,
+}
+
+struct TurnAnchor {
+    key: TurnKey,
+    viewport_row: usize,
 }
 
 struct MarkdownHighlighter {
@@ -640,6 +666,7 @@ struct App {
     transcript: Vec<Message>,
     live_messages: Vec<Message>,
     activities: Vec<AgentActivity>,
+    turns: Vec<AgentTurn>,
     running: Option<JoinHandle<Result<ConversationTurn>>>,
     event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     recording: Option<AudioRecording>,
@@ -689,6 +716,9 @@ struct App {
     skills: Vec<SkillView>,
     background_turns: HashMap<Uuid, BackgroundTurn>,
     model_catalogs: HashMap<Uuid, Vec<ModelCatalogEntry>>,
+    session_id: Uuid,
+    expanded_turns: HashSet<TurnKey>,
+    pending_turn_anchor: Option<TurnAnchor>,
 }
 
 struct BackgroundTurn {
@@ -725,6 +755,7 @@ impl App {
             .collect::<Vec<_>>();
         let transcript = agent.session().messages.clone();
         let activities = agent.session().activities.clone();
+        let turns = agent.session().turns.clone();
         let goals = agent.session().goals.clone();
         let visible_goal_id = agent.session().visible_goal_id;
         let initial_error = catalog_error
@@ -741,6 +772,7 @@ impl App {
             transcript,
             live_messages: Vec::new(),
             activities,
+            turns,
             running: None,
             event_rx: None,
             recording: None,
@@ -790,6 +822,9 @@ impl App {
             skills,
             background_turns: HashMap::new(),
             model_catalogs,
+            session_id,
+            expanded_turns: HashSet::new(),
+            pending_turn_anchor: None,
         })
     }
 
@@ -1295,8 +1330,10 @@ impl App {
     fn apply_snapshot(&mut self, snapshot: ConversationSnapshot) {
         self.transcript.clone_from(&snapshot.session.messages);
         self.activities.clone_from(&snapshot.session.activities);
+        self.turns.clone_from(&snapshot.session.turns);
         self.goals.clone_from(&snapshot.session.goals);
         self.visible_goal_id = snapshot.session.visible_goal_id;
+        self.session_id = snapshot.session.id;
         self.project_root = snapshot.project_root;
         self.project = self.project_root.display().to_string();
         self.model.clone_from(&snapshot.session.model);
@@ -1983,6 +2020,23 @@ impl App {
                 return;
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                let turn_toggle = self.conversation_view.as_ref().and_then(|view| {
+                    let point = view.point_at(mouse.column, mouse.row, false)?;
+                    Some((
+                        view.turn_toggle_at(point)?,
+                        point.row.saturating_sub(view.scroll),
+                    ))
+                });
+                if let Some((key, viewport_row)) = turn_toggle {
+                    if !self.expanded_turns.remove(&key) {
+                        self.expanded_turns.insert(key);
+                    }
+                    self.pending_turn_anchor = Some(TurnAnchor { key, viewport_row });
+                    self.text_selection = None;
+                    self.copy_flash = None;
+                    self.auto_scroll = false;
+                    return;
+                }
                 if let Some(point) = self
                     .conversation_view
                     .as_ref()
@@ -2889,6 +2943,18 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let source = conversation_source(app);
     let rows = wrap_conversation_lines(&source.lines, inner.width.max(1));
+    if let Some(anchor) = app.pending_turn_anchor.take()
+        && let Some(summary_line) = source
+            .turn_toggles
+            .iter()
+            .find(|target| target.key == anchor.key)
+            .map(|target| target.line)
+        && let Some(summary_row) = rows.iter().position(|row| row.source_line == summary_line)
+    {
+        app.scroll = summary_row
+            .saturating_sub(anchor.viewport_row)
+            .min(u16::MAX as usize) as u16;
+    }
     app.max_scroll = rows
         .len()
         .saturating_sub(inner.height as usize)
@@ -2911,6 +2977,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         rows,
         scroll: app.scroll as usize,
         copy_targets: source.copy_targets,
+        turn_toggles: source.turn_toggles,
     });
 }
 
@@ -2923,6 +2990,7 @@ fn conversation_source(app: &App) -> ConversationSource {
     let mut source = ConversationSource {
         lines: Vec::new(),
         copy_targets: Vec::new(),
+        turn_toggles: Vec::new(),
     };
     let mut message_index = 0;
     while message_index < app.transcript.len() {
@@ -3082,9 +3150,48 @@ fn push_turn_lines(
         events.sort_by_key(|event| event.sequence());
     }
 
+    let completed_turn = app
+        .turns
+        .iter()
+        .find(|turn| turn.message_index == turn_message_index && turn.completed_at.is_some());
+    let final_message_index = events
+        .iter()
+        .rposition(|event| matches!(event, TurnDisplayEvent::Message(_)));
+    let collapsible = completed_turn.is_some()
+        && final_message_index.is_some_and(|index| index > 0 && index + 1 == events.len());
+    if !collapsible {
+        push_turn_events(source, app, &events);
+        return;
+    }
+
+    let final_message_index = final_message_index.expect("collapsible turns have a final message");
+    let key = TurnKey {
+        session_id: app.session_id,
+        message_index: turn_message_index,
+    };
+    let expanded = app.expanded_turns.contains(&key);
+    if expanded {
+        push_turn_events(source, app, &events[..final_message_index]);
+        source.lines.push(Line::default());
+    }
+    let turn = completed_turn.expect("collapsible turns are completed");
+    let operation_count = events[..final_message_index]
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TurnDisplayEvent::Activity(activity) if activity.tool != "model_request"
+            )
+        })
+        .count();
+    push_turn_summary(source, key, turn, operation_count, expanded);
+    push_turn_events(source, app, &events[final_message_index..]);
+}
+
+fn push_turn_events(source: &mut ConversationSource, app: &App, events: &[TurnDisplayEvent<'_>]) {
     let mut emitted_any = false;
     let mut last_was_message = false;
-    for event in events {
+    for event in events.iter().copied() {
         match event {
             TurnDisplayEvent::Message(message) => {
                 let content =
@@ -3106,6 +3213,46 @@ fn push_turn_lines(
             }
         }
     }
+}
+
+fn push_turn_summary(
+    source: &mut ConversationSource,
+    key: TurnKey,
+    turn: &AgentTurn,
+    operation_count: usize,
+    expanded: bool,
+) {
+    let completed_at = turn
+        .completed_at
+        .expect("turn summaries require a completion time");
+    let duration = completed_at
+        .signed_duration_since(turn.started_at)
+        .num_milliseconds()
+        .max(0);
+    let rounded_seconds = ((duration + 500) / 1_000).max(1);
+    let duration = if rounded_seconds < 60 {
+        format!("{rounded_seconds}s")
+    } else {
+        let minutes = rounded_seconds / 60;
+        let seconds = rounded_seconds % 60;
+        if seconds == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {seconds}s")
+        }
+    };
+    let operations = if operation_count == 1 {
+        "1 operation".to_owned()
+    } else {
+        format!("{operation_count} operations")
+    };
+    let marker = if expanded { "▾" } else { "▸" };
+    let line = source.lines.len();
+    source.lines.push(Line::from(Span::styled(
+        format!("  {marker} Worked for {duration} · {operations}"),
+        Style::default().fg(MUTED),
+    )));
+    source.turn_toggles.push(TurnToggleTarget { line, key });
 }
 
 #[derive(Clone, Copy)]
@@ -4657,6 +4804,137 @@ mod tests {
         assert!(!copied.iter().any(|text| text.contains("Wrote src")));
     }
 
+    fn add_terminal_turn(app: &mut App, completed: bool) -> TurnKey {
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
+        app.transcript
+            .push(Message::text(Role::User, "Run the checks"));
+        let mut progress = Message::text(Role::Assistant, "I’ll inspect the project.");
+        progress.sequence = Some(1);
+        app.transcript.push(progress);
+        let mut final_message = Message::text(Role::Assistant, "Everything passes.");
+        final_message.sequence = Some(3);
+        app.transcript.push(final_message);
+        app.activities.push(AgentActivity {
+            id: "shell-1".into(),
+            turn_message_index: 0,
+            sequence: Some(2),
+            started_at: Some(started_at),
+            completed_at: completed.then_some(started_at + chrono::Duration::seconds(5)),
+            tool: "shell".into(),
+            kind: ActivityKind::Shell,
+            status: if completed {
+                ActivityStatus::Completed
+            } else {
+                ActivityStatus::Running
+            },
+            title: "Ran".into(),
+            detail: "cargo test".into(),
+        });
+        app.turns.push(AgentTurn {
+            message_index: 0,
+            started_at,
+            completed_at: completed.then_some(started_at + chrono::Duration::seconds(7)),
+        });
+        TurnKey {
+            session_id: app.session_id,
+            message_index: 0,
+        }
+    }
+
+    #[test]
+    fn completed_terminal_turns_collapse_progress_above_the_final_message() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let key = add_terminal_turn(&mut app, true);
+
+        let source = conversation_source(&app);
+        let lines = source.lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        let summary = lines
+            .iter()
+            .position(|line| line.contains("Worked for 7s · 1 operation"))
+            .unwrap();
+        let final_message = lines
+            .iter()
+            .position(|line| line == "Everything passes.")
+            .unwrap();
+
+        assert!(!lines.iter().any(|line| line == "I’ll inspect the project."));
+        assert!(!lines.iter().any(|line| line.contains("cargo test")));
+        assert_eq!(summary + 1, final_message);
+        assert_eq!(source.turn_toggles.len(), 1);
+        assert_eq!(source.turn_toggles[0].key, key);
+    }
+
+    #[test]
+    fn active_terminal_turns_stay_expanded_and_completed_summaries_are_mouse_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut active = test_app(root.path());
+        add_terminal_turn(&mut active, false);
+        let active_source = conversation_source(&active);
+        let active_lines = active_source
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            active_lines
+                .iter()
+                .any(|line| line == "I’ll inspect the project.")
+        );
+        assert!(active_lines.iter().any(|line| line.contains("cargo test")));
+        assert!(active_source.turn_toggles.is_empty());
+
+        let mut completed = test_app(root.path());
+        let key = add_terminal_turn(&mut completed, true);
+        let source = conversation_source(&completed);
+        let rows = wrap_conversation_lines(&source.lines, 80);
+        let summary_line = source.turn_toggles[0].line;
+        let summary_row = rows
+            .iter()
+            .position(|row| row.source_line == summary_line)
+            .unwrap();
+        completed.conversation_view = Some(ConversationView {
+            area: Rect::new(0, 0, 80, rows.len() as u16),
+            rows,
+            scroll: 0,
+            copy_targets: source.copy_targets,
+            turn_toggles: source.turn_toggles,
+        });
+
+        completed.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: summary_row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(completed.expanded_turns.contains(&key));
+        let expanded = conversation_source(&completed)
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let progress = expanded
+            .iter()
+            .position(|line| line == "I’ll inspect the project.")
+            .unwrap();
+        let activity = expanded
+            .iter()
+            .position(|line| line.contains("cargo test"))
+            .unwrap();
+        let summary = expanded
+            .iter()
+            .position(|line| line.contains("Worked for 7s · 1 operation"))
+            .unwrap();
+        let final_message = expanded
+            .iter()
+            .position(|line| line == "Everything passes.")
+            .unwrap();
+        assert!(progress < activity);
+        assert!(activity < summary);
+        assert_eq!(summary + 1, final_message);
+    }
+
     #[test]
     fn dragged_selection_copies_visual_text_without_newlines_at_soft_wraps() {
         let lines = vec![Line::from("abcdef"), Line::from("🦀x")];
@@ -4666,6 +4944,7 @@ mod tests {
             rows,
             scroll: 0,
             copy_targets: Vec::new(),
+            turn_toggles: Vec::new(),
         };
         let selection = TextSelection {
             anchor: TextPoint { row: 0, unit: 1 },
@@ -4845,6 +5124,7 @@ mod tests {
                 .collect(),
             scroll: 5,
             copy_targets: Vec::new(),
+            turn_toggles: Vec::new(),
         });
         app.text_selection = Some(TextSelection {
             anchor: TextPoint { row: 7, unit: 0 },

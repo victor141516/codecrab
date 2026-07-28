@@ -15,9 +15,10 @@ terminal interface and an optional embedded web application.
 - JSON/NDJSON API for conversations, sessions, models, skills, and agent state.
 - Live, persisted tool activity in both clients: reads, searches, writes,
   edits, shell commands, and skill loading are visible while they happen.
-- Completed web turns collapse their intermediate progress into a one-line
-  duration and operation summary; the final answer remains visible and the
-  complete progress can be expanded again.
+- Completed turns in both clients collapse their intermediate progress into a
+  one-line duration and operation summary; the final answer remains visible
+  and the complete progress can be expanded again. The terminal summary is a
+  mouse-only control.
 - Overflowing web tool rows can be expanded to reveal their complete command,
   path, query, or other recorded detail.
 - Concise progress messages appear in the same language as the user's latest
