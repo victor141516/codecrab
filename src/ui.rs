@@ -743,6 +743,7 @@ struct App {
     should_quit: bool,
     project: String,
     project_root: PathBuf,
+    provider: String,
     model: String,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
@@ -775,6 +776,7 @@ impl App {
     ) -> Result<Self> {
         let project_root = agent.project_root().to_path_buf();
         let project = project_root.display().to_string();
+        let provider = agent.session().provider.clone();
         let model = agent.session().model.clone();
         let reasoning_effort = agent.session().reasoning_effort.clone();
         let service_tier = agent.session().service_tier.clone();
@@ -856,6 +858,7 @@ impl App {
             should_quit: false,
             project,
             project_root,
+            provider,
             model,
             reasoning_effort,
             service_tier,
@@ -962,7 +965,7 @@ impl App {
     }
 
     fn session_provider(&self) -> String {
-        self.conversation.snapshot().session.provider
+        self.provider.clone()
     }
 
     fn dictation_available(&self) -> bool {
@@ -1452,6 +1455,7 @@ impl App {
         self.session_id = snapshot.session.id;
         self.project_root = snapshot.project_root;
         self.project = self.project_root.display().to_string();
+        self.provider.clone_from(&snapshot.session.provider);
         self.model.clone_from(&snapshot.session.model);
         self.reasoning_effort
             .clone_from(&snapshot.session.reasoning_effort);
@@ -3264,22 +3268,32 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let status = app.status();
     let thinking = app.reasoning_effort.as_deref().unwrap_or("default");
     let fast = app.uses_fast_service_tier();
+    let provider = (app.config.providers.len() > 1).then(|| app.session_provider());
     let separator = "  │  ";
-    let fixed_width = status.chars().count()
+    let model_section_width = provider
+        .as_ref()
+        .map_or(0, |provider| provider.chars().count() + 1)
         + app.model.chars().count()
         + thinking.chars().count()
-        + separator.chars().count() * 3
+        + 1
         + if fast { 2 } else { 0 };
+    let fixed_width = status.chars().count() + model_section_width + separator.chars().count() * 2;
     let mut spans = vec![
         Span::styled(status, Style::default().fg(status_color)),
-        Span::styled("  │  ", Style::default().fg(MUTED)),
-        Span::styled(&app.model, Style::default().fg(Color::White)),
+        Span::styled(separator, Style::default().fg(MUTED)),
     ];
+    if let Some(provider) = provider {
+        spans.extend([
+            Span::styled(provider, Style::default().fg(MUTED)),
+            Span::raw(" "),
+        ]);
+    }
+    spans.push(Span::styled(&app.model, Style::default().fg(Color::White)));
     if fast {
         spans.push(Span::styled(" ⚡", Style::default().fg(Color::Yellow)));
     }
     spans.extend([
-        Span::styled(separator, Style::default().fg(MUTED)),
+        Span::raw(" "),
         Span::styled(thinking, Style::default().fg(AQUA)),
         Span::styled(separator, Style::default().fg(MUTED)),
         Span::styled(
@@ -6778,11 +6792,53 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("future-9-sol"));
         assert!(text.contains("deep"));
+        assert!(!text.contains("openai future-9-sol"));
         let after_model = text.split_once("future-9-sol").unwrap().1;
         let (before_fast, after_fast) = after_model.split_once('⚡').unwrap();
         assert!(!before_fast.contains('│'));
         let before_thinking = after_fast.split_once("deep").unwrap().0;
-        assert_eq!(before_thinking.matches('│').count(), 1);
+        assert!(!before_thinking.contains('│'));
+    }
+
+    #[test]
+    fn header_prefixes_the_unified_model_section_when_multiple_providers_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.config
+            .providers
+            .insert("local".into(), ProviderConfig::default());
+        app.model = "future-model".into();
+        app.reasoning_effort = Some("high".into());
+        app.service_tier = Some("standard".into());
+        app.model_catalog = vec![ModelCatalogEntry {
+            service_tiers: vec![ServiceTierOption {
+                id: "standard".into(),
+                name: "Standard".into(),
+                description: "Normal priority".into(),
+            }],
+            ..ModelCatalogEntry::from_id(app.model.clone())
+        }];
+
+        let backend = TestBackend::new(100, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_header(frame, &app, area);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("openai future-model high"));
+        let model_section = text.split_once("openai").unwrap().1;
+        let model_section = model_section.split_once('│').unwrap().0;
+        assert!(!model_section.contains('⚡'));
     }
 
     #[tokio::test]
