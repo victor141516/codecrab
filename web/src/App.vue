@@ -52,6 +52,7 @@ import {
 import {
   branchEdgePath,
   layoutBranchGraph,
+  projectEditedSession,
   routeContainsEdge
 } from "./branches.js";
 
@@ -85,6 +86,9 @@ const branchesOpen = ref(false);
 const selectedBranchNode = ref(null);
 const branchSelecting = ref(false);
 const branchOriginalPath = ref(new Set());
+const editingMessageNode = ref(null);
+const messageEditDraft = ref("");
+const messageEditor = ref(null);
 let autocompleteRequest = 0;
 let autocompleteController = null;
 let copiedMessageTimer = null;
@@ -212,7 +216,10 @@ const activeBranchPath = computed(
 watch(
   () => session.value?.id,
   (current, previous) => {
-    if (previous && current !== previous) resetBranchNavigator();
+    if (previous && current !== previous) {
+      resetBranchNavigator();
+      cancelMessageEdit();
+    }
   }
 );
 
@@ -733,6 +740,10 @@ function resetBranchNavigator() {
 }
 
 function openBranchNavigator() {
+  if (editingMessageNode.value) {
+    error.value = "Save or cancel the message edit before browsing branches.";
+    return;
+  }
   if (sending.value) {
     error.value = "Wait for the active operation before browsing branches.";
     return;
@@ -834,8 +845,74 @@ function branchNodeClasses(node) {
   };
 }
 
+async function beginMessageEdit(item) {
+  if (
+    sending.value ||
+    branchesOpen.value ||
+    !item.nodeId ||
+    editingMessageNode.value
+  ) {
+    return;
+  }
+  editingMessageNode.value = item.nodeId;
+  messageEditDraft.value = item.message.content ?? "";
+  closeAutocomplete();
+  error.value = "";
+  await nextTick();
+  messageEditor.value?.focus();
+  messageEditor.value?.setSelectionRange(
+    messageEditDraft.value.length,
+    messageEditDraft.value.length
+  );
+}
+
+function cancelMessageEdit() {
+  editingMessageNode.value = null;
+  messageEditDraft.value = "";
+}
+
+function projectEditedMessage(nodeId, content) {
+  const sessionId = session.value?.id;
+  const current = targetState(sessionId)?.session;
+  const projected = projectEditedSession(
+    current,
+    nodeId,
+    content,
+    new Date().toISOString()
+  );
+  if (!projected) return false;
+  updateTargetSession(sessionId, () => projected);
+  return true;
+}
+
+async function saveMessageEdit() {
+  const nodeId = editingMessageNode.value;
+  const prompt = messageEditDraft.value.trim();
+  if (!nodeId || !prompt || sending.value) return;
+  if (!projectEditedMessage(nodeId, prompt)) {
+    error.value = "The message is no longer on the visible branch.";
+    return;
+  }
+  cancelMessageEdit();
+  await runPrompt(prompt, { editNodeId: nodeId });
+}
+
+function handleMessageEditorKey(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelMessageEdit();
+  } else if (
+    event.key === "Enter" &&
+    !event.shiftKey &&
+    !event.altKey
+  ) {
+    event.preventDefault();
+    void saveMessageEdit();
+  }
+}
+
 async function clearSession() {
-  if (branchesOpen.value) return;
+  if (branchesOpen.value || editingMessageNode.value) return;
   const sessionId = session.value?.id;
   if (!sessionId) return;
   error.value = "";
@@ -1169,7 +1246,7 @@ async function toggleDictation() {
 }
 
 async function updateModel(patch) {
-  if (!session.value || branchesOpen.value) return;
+  if (!session.value || branchesOpen.value || editingMessageNode.value) return;
   const sessionId = session.value.id;
   const currentSession = session.value;
   error.value = "";
@@ -1240,6 +1317,19 @@ function applyAssistantMessage(sessionId, message) {
   }));
 }
 
+function applyEditedUserMessage(sessionId, message) {
+  const messages = [...(targetState(sessionId)?.session?.messages ?? [])];
+  if (messages.at(-1)?.role === "user") {
+    messages[messages.length - 1] = message;
+  } else {
+    messages.push(message);
+  }
+  updateTargetSession(sessionId, (targetSession) => ({
+    ...targetSession,
+    messages
+  }));
+}
+
 function applyAssistantTextDelta(sessionId, delta, start, sequence, createdAt) {
   const messages = [...(targetState(sessionId)?.session?.messages ?? [])];
   if (start || messages.at(-1)?.role !== "assistant") {
@@ -1285,9 +1375,14 @@ function applyAssistantMessageCompleted(sessionId, message) {
   }));
 }
 
-async function handleChatStreamEvent(sessionId, event) {
+async function handleChatStreamEvent(
+  sessionId,
+  event,
+  { editing = false } = {}
+) {
   if (event.type === "user_message") {
-    applyAssistantMessage(sessionId, event.message);
+    if (editing) applyEditedUserMessage(sessionId, event.message);
+    else applyAssistantMessage(sessionId, event.message);
     if (session.value?.id === sessionId) await scrollToBottom();
     return false;
   }
@@ -1336,13 +1431,22 @@ async function handleChatStreamEvent(sessionId, event) {
 
 async function streamChat(
   prompt,
-  { continuation = false, sessionId = session.value?.id } = {}
+  {
+    continuation = false,
+    sessionId = session.value?.id,
+    editNodeId = null
+  } = {}
 ) {
   if (!sessionId) throw new Error("Create or resume a session first");
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, prompt, continuation })
+    body: JSON.stringify({
+      session_id: sessionId,
+      prompt,
+      continuation,
+      edit_node_id: editNodeId
+    })
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -1364,14 +1468,18 @@ async function streamChat(
     for (const line of lines) {
       if (line.trim()) {
         completed =
-          (await handleChatStreamEvent(sessionId, JSON.parse(line))) || completed;
+          (await handleChatStreamEvent(sessionId, JSON.parse(line), {
+            editing: Boolean(editNodeId)
+          })) || completed;
       }
     }
     if (done) break;
   }
   if (buffer.trim()) {
     completed =
-      (await handleChatStreamEvent(sessionId, JSON.parse(buffer))) || completed;
+      (await handleChatStreamEvent(sessionId, JSON.parse(buffer), {
+        editing: Boolean(editNodeId)
+      })) || completed;
   }
   if (!completed) {
     throw new Error("The agent stream ended before returning its final state");
@@ -1379,6 +1487,10 @@ async function streamChat(
 }
 
 async function sendPrompt() {
+  if (editingMessageNode.value) {
+    error.value = "Save or cancel the message edit first.";
+    return;
+  }
   if (branchesOpen.value) {
     error.value = "Keep or cancel the branch preview before writing.";
     return;
@@ -1437,7 +1549,11 @@ function activeGoalFor(sessionId) {
 
 async function runPrompt(
   prompt,
-  { continuation = false, sessionId = session.value?.id } = {}
+  {
+    continuation = false,
+    sessionId = session.value?.id,
+    editNodeId = null
+  } = {}
 ) {
   if (!sessionId) return;
   const runtime = runtimeFor(sessionId);
@@ -1450,7 +1566,7 @@ async function runPrompt(
 
   let completed = false;
   try {
-    await streamChat(prompt, { continuation, sessionId });
+    await streamChat(prompt, { continuation, sessionId, editNodeId });
     completed = true;
     runtime.error = "";
   } catch (cause) {
@@ -1514,6 +1630,11 @@ function handleGlobalKeydown(event) {
   if (event.repeat) return;
   if (event.key !== "Escape") {
     lastEscapeAt = 0;
+    return;
+  }
+  if (editingMessageNode.value) {
+    event.preventDefault();
+    cancelMessageEdit();
     return;
   }
   if (branchesOpen.value) {
@@ -2494,7 +2615,7 @@ onBeforeUnmount(() => {
             v-if="session"
             class="grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-30"
             :class="branchesOpen ? 'text-coral' : 'text-zinc-600'"
-            :disabled="sending || !branchNodes.length"
+            :disabled="sending || Boolean(editingMessageNode) || !branchNodes.length"
             title="Browse conversation branches"
             aria-label="Browse conversation branches"
             :aria-pressed="branchesOpen"
@@ -2507,7 +2628,7 @@ onBeforeUnmount(() => {
             v-if="session"
             class="control max-w-44"
             :value="session.model"
-            :disabled="branchesOpen"
+            :disabled="branchesOpen || Boolean(editingMessageNode)"
             aria-label="Model"
             @change="chooseModel"
           >
@@ -2519,7 +2640,7 @@ onBeforeUnmount(() => {
             v-if="reasoningOptions.length"
             class="control hidden sm:block"
             :value="session?.reasoning_effort ?? ''"
-            :disabled="branchesOpen"
+            :disabled="branchesOpen || Boolean(editingMessageNode)"
             aria-label="Thinking level"
             @change="updateModel({ reasoning_effort: $event.target.value || null })"
           >
@@ -2535,7 +2656,7 @@ onBeforeUnmount(() => {
             v-if="speedOptions.length"
             class="control hidden sm:block"
             :value="session?.service_tier ?? ''"
-            :disabled="branchesOpen"
+            :disabled="branchesOpen || Boolean(editingMessageNode)"
             aria-label="Service speed"
             @change="updateModel({ service_tier: $event.target.value || null })"
           >
@@ -2547,7 +2668,7 @@ onBeforeUnmount(() => {
           <button
             v-if="session"
             class="grid size-8 place-items-center rounded-md text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
-            :disabled="branchesOpen"
+            :disabled="branchesOpen || Boolean(editingMessageNode)"
             title="Clear conversation"
             aria-label="Clear conversation"
             @click="clearSession"
@@ -2596,32 +2717,79 @@ onBeforeUnmount(() => {
                 U
               </div>
               <div class="min-w-0 flex-1">
-                <div
-                  class="message-content"
-                  :title="formatEventTimestamp(item.message.created_at)"
-                >
-                  {{ item.message.content }}
-                </div>
-                <button
-                  type="button"
-                  class="ml-auto mt-1 grid size-3 place-items-center text-zinc-600 transition hover:text-zinc-300"
-                  :aria-label="
-                    copiedMessageKey === item.key
-                      ? 'Message copied'
-                      : 'Copy message'
-                  "
-                  :title="
-                    copiedMessageKey === item.key ? 'Copied' : 'Copy message'
-                  "
-                  @click="copyMessage(item.message.content, item.key)"
-                >
-                  <Check
-                    v-if="copiedMessageKey === item.key"
-                    class="size-3 text-emerald-400"
-                    aria-hidden="true"
+                <template v-if="editingMessageNode === item.nodeId">
+                  <textarea
+                    ref="messageEditor"
+                    v-model="messageEditDraft"
+                    class="message-editor"
+                    rows="3"
+                    aria-label="Edit message"
+                    @keydown="handleMessageEditorKey"
                   />
-                  <Copy v-else class="size-3" aria-hidden="true" />
-                </button>
+                  <div class="mt-2 flex justify-end gap-1">
+                    <button
+                      type="button"
+                      class="grid size-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"
+                      title="Cancel edit"
+                      aria-label="Cancel edit"
+                      @click="cancelMessageEdit"
+                    >
+                      <X class="size-3.5" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      class="grid size-7 place-items-center rounded-md bg-coral/12 text-coral transition hover:bg-coral/20 disabled:opacity-30"
+                      :disabled="!messageEditDraft.trim()"
+                      title="Create branch from edited message"
+                      aria-label="Create branch from edited message"
+                      @click="saveMessageEdit"
+                    >
+                      <Check class="size-3.5" aria-hidden="true" />
+                    </button>
+                  </div>
+                </template>
+                <template v-else>
+                  <div
+                    class="message-content"
+                    :title="formatEventTimestamp(item.message.created_at)"
+                  >
+                    {{ item.message.content }}
+                  </div>
+                  <div class="mt-1 flex justify-end gap-1">
+                    <button
+                      type="button"
+                      class="grid size-5 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
+                      :disabled="sending || branchesOpen"
+                      title="Edit message"
+                      aria-label="Edit message"
+                      @click="beginMessageEdit(item)"
+                    >
+                      <Pencil class="size-3" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      class="grid size-5 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
+                      :aria-label="
+                        copiedMessageKey === item.key
+                          ? 'Message copied'
+                          : 'Copy message'
+                      "
+                      :title="
+                        copiedMessageKey === item.key
+                          ? 'Copied'
+                          : 'Copy message'
+                      "
+                      @click="copyMessage(item.message.content, item.key)"
+                    >
+                      <Check
+                        v-if="copiedMessageKey === item.key"
+                        class="size-3 text-emerald-400"
+                        aria-hidden="true"
+                      />
+                      <Copy v-else class="size-3" aria-hidden="true" />
+                    </button>
+                  </div>
+                </template>
               </div>
             </article>
 
@@ -3052,7 +3220,7 @@ onBeforeUnmount(() => {
                 v-model="draft"
                 rows="1"
                 class="max-h-48 min-h-11 w-full resize-none bg-transparent px-3 py-3 text-sm leading-5 text-zinc-200 outline-none placeholder:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-                :disabled="branchesOpen"
+                :disabled="branchesOpen || Boolean(editingMessageNode)"
                 placeholder="Message CodeCrab…"
                 aria-label="Message CodeCrab"
                 :aria-activedescendant="
@@ -3082,7 +3250,12 @@ onBeforeUnmount(() => {
                         ? 'animate-pulse bg-red-500/15 text-red-400 hover:bg-red-500/25'
                         : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
                     "
-                    :disabled="branchesOpen || transcribing || !dictationAvailable"
+                    :disabled="
+                      branchesOpen ||
+                      Boolean(editingMessageNode) ||
+                      transcribing ||
+                      !dictationAvailable
+                    "
                     :title="
                       dictationAvailable
                         ? recording
@@ -3103,7 +3276,7 @@ onBeforeUnmount(() => {
                   <button
                     class="grid size-7 place-items-center rounded-md bg-zinc-100 text-sm text-zinc-950 transition hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-600"
                     :disabled="
-                      branchesOpen
+                      branchesOpen || Boolean(editingMessageNode)
                         ? true
                         : recording
                         ? false

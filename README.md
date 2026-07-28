@@ -181,7 +181,7 @@ The initial API surface is:
 | `GET` | `/api/state` | Current session, grouped projects/sessions, models, and skills |
 | `POST` | `/api/completions` | Shared slash, skill, and filesystem suggestions for `session_id` |
 | `POST` | `/api/completions/recursive` | Progressive NDJSON batches for the same identified filesystem query |
-| `POST` | `/api/chat` | Run a prompt for `session_id` as an ordered NDJSON stream |
+| `POST` | `/api/chat` | Run a prompt for `session_id` as an ordered NDJSON stream; optional `edit_node_id` branches from an existing user message |
 | `POST` | `/api/chat/cancel` | Cancel only `session_id` and its in-flight provider/tool operation |
 | `POST` | `/api/transcribe` | Transcribe audio for the `X-CodeCrab-Session` session |
 | `PUT` | `/api/model` | Change model, thinking, and service tier for `session_id` |
@@ -351,12 +351,17 @@ reasoning or speed options.
 `/branches` opens the conversation tree only when requested. Each visible user
 message is a node; selecting any node previews the complete path through the
 oldest descendant leaf and keeps that message in view. In the terminal, arrows
-move between nodes, `Enter` keeps the preview, and `Esc` restores the original
-branch and scroll position. The web panel uses the same semantics with clickable
-nodes, a check action, and a cancel action. The previewed route is coral, while
-the route that was active when the panel opened remains cyan where it diverges.
-The composer is disabled during preview so a prompt cannot be sent to a branch
-other than the one currently shown.
+move between nodes, `E` loads the selected user message into the composer,
+`Enter` keeps the preview, and `Esc` restores the original branch and scroll
+position. The web panel uses the same branch-selection semantics with clickable
+nodes, a check action, and a cancel action. Each web user message also has a
+pencil action that opens an inline editor. Submitting an edit creates and
+activates a new sibling node, runs the agent from the edited prompt, and keeps
+the original message plus its complete continuation available in the tree. The
+previewed route is coral, while the route that was active when the panel opened
+remains cyan where it diverges. The normal composer is disabled during preview
+or inline editing so a prompt cannot be sent to a branch other than the one
+currently shown.
 
 New conversations default to GPT-5.6 Sol with `high` reasoning and Fast speed.
 CodeCrab resolves the reasoning and Fast service-tier identifiers from the live

@@ -154,6 +154,25 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.message-editor {
+  width: 100%;
+  min-height: 5rem;
+  resize: vertical;
+  border: 1px solid rgb(244 99 86 / 0.3);
+  border-radius: 0.5rem;
+  background: rgb(255 255 255 / 0.025);
+  padding: 0.65rem 0.75rem;
+  color: #e4e4e7;
+  font-size: 0.8125rem;
+  line-height: 1.65;
+  outline: none;
+}
+
+.message-editor:focus {
+  border-color: rgb(244 99 86 / 0.55);
+  box-shadow: 0 0 0 2px rgb(244 99 86 / 0.08);
+}
+
 .turn-summary {
   display: flex;
   min-height: 2rem;

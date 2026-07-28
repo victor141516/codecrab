@@ -66,3 +66,30 @@ export function branchEdgePath(edge) {
 export function routeContainsEdge(route, edge) {
   return route.has(edge.parent.id) && route.has(edge.child.id);
 }
+
+export function projectEditedSession(session, nodeId, content, createdAt) {
+  const messageIndex = session?.active_message_ids?.indexOf(nodeId) ?? -1;
+  if (!session || messageIndex < 0) return null;
+  return {
+    ...session,
+    title: messageIndex === 0 ? content.slice(0, 72) : session.title,
+    messages: [
+      ...(session.messages ?? []).slice(0, messageIndex),
+      {
+        role: "user",
+        content,
+        created_at: createdAt
+      }
+    ],
+    active_message_ids: [
+      ...(session.active_message_ids ?? []).slice(0, messageIndex),
+      `editing-${nodeId}`
+    ],
+    activities: (session.activities ?? []).filter(
+      (activity) => activity.turn_message_index < messageIndex
+    ),
+    turns: (session.turns ?? []).filter(
+      (turn) => turn.message_index < messageIndex
+    )
+  };
+}

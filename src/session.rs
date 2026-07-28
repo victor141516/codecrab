@@ -96,6 +96,13 @@ impl ConversationTree {
         self.active_node_ids.get(message_index).copied()
     }
 
+    pub(crate) fn message(&self, id: Uuid) -> Option<&Message> {
+        self.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| &node.message)
+    }
+
     pub(crate) fn visible_user_nodes(&self) -> Vec<ConversationGraphNode> {
         let visible = self
             .nodes
@@ -195,6 +202,19 @@ impl ConversationTree {
         self.active_leaf_id = Some(leaf_id);
         self.rebuild_active_path().map_err(anyhow::Error::msg)?;
         Ok(leaf_id)
+    }
+
+    fn branch_from_edited_user_message(&mut self, id: Uuid, content: String) -> Result<Uuid> {
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .context(format!("conversation node {id} does not exist"))?;
+        if !matches!(node.message.role, Role::User) || node.message.hidden {
+            anyhow::bail!("only visible user messages can be edited");
+        }
+        let parent_id = node.parent_id;
+        self.branch_from(parent_id, Message::text(Role::User, content))
     }
 
     fn rebuild_active_path(&mut self) -> std::result::Result<(), String> {
@@ -568,6 +588,28 @@ impl Session {
         Ok(leaf_id)
     }
 
+    pub(crate) fn edit_user_message(&mut self, node_id: Uuid, content: String) -> Result<Uuid> {
+        if content.trim().is_empty() {
+            anyhow::bail!("edited message is empty");
+        }
+        let editing_root = self.messages.message(node_id).is_some_and(|_| {
+            self.messages
+                .nodes
+                .iter()
+                .find(|node| node.id == node_id)
+                .is_some_and(|node| node.parent_id.is_none())
+        });
+        let edited_id = self
+            .messages
+            .branch_from_edited_user_message(node_id, content.clone())?;
+        self.refresh_active_indexes();
+        if editing_root {
+            self.title = content.chars().take(72).collect();
+        }
+        self.updated_at = Utc::now();
+        Ok(edited_id)
+    }
+
     pub(crate) fn latest_compaction(&self) -> Option<&CompactionCheckpoint> {
         let active_leaf_id = self.messages.active_leaf_id();
         self.compaction_checkpoints.iter().rev().find(|checkpoint| {
@@ -897,6 +939,68 @@ mod tests {
         assert_eq!(graph[1].parent_id, Some(root));
         assert_eq!(graph[2].id, alternate);
         assert_eq!(graph[2].parent_id, Some(root));
+    }
+
+    #[test]
+    fn editing_a_user_message_creates_a_new_branch_and_preserves_the_original_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let root = session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "root"));
+        let answer = session.messages.push(Message::text(
+            crate::provider::Role::Assistant,
+            "original answer",
+        ));
+        let original_message = session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "original follow-up",
+        ));
+        let original_leaf = session.messages.push(Message::text(
+            crate::provider::Role::Assistant,
+            "original continuation",
+        ));
+
+        let edited_message = session
+            .edit_user_message(original_message, "edited follow-up".into())
+            .unwrap();
+
+        assert_eq!(
+            session.messages.active_node_ids(),
+            &[root, answer, edited_message]
+        );
+        assert_eq!(
+            session
+                .messages
+                .last()
+                .and_then(|message| message.content.as_deref()),
+            Some("edited follow-up")
+        );
+        assert_eq!(session.messages.nodes.len(), 5);
+        assert_eq!(
+            session
+                .messages
+                .message(original_leaf)
+                .and_then(|message| message.content.as_deref()),
+            Some("original continuation")
+        );
+    }
+
+    #[test]
+    fn editing_the_first_message_updates_the_session_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let root = session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "old title"));
+
+        session
+            .edit_user_message(root, "A clearer edited request".into())
+            .unwrap();
+
+        assert_eq!(session.title, "A clearer edited request");
     }
 
     #[test]

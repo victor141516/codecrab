@@ -157,6 +157,7 @@ struct ChatRequest {
     prompt: String,
     #[serde(default)]
     continuation: bool,
+    edit_node_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -713,6 +714,12 @@ async fn chat(
             "prompt is empty",
         ));
     }
+    if request.continuation && request.edit_node_id.is_some() {
+        return Err(ApiError::message(
+            StatusCode::BAD_REQUEST,
+            "goal continuation cannot edit a message",
+        ));
+    }
     let conversation = selected_conversation(&state, request.session_id)
         .await
         .ok_or_else(|| {
@@ -723,7 +730,9 @@ async fn chat(
         })?;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let session_id = conversation.snapshot().session.id;
-    let turn = if request.continuation {
+    let turn = if let Some(node_id) = request.edit_node_id {
+        conversation.start_edit_turn(node_id, prompt, Some(event_tx))
+    } else if request.continuation {
         conversation.start_goal_continuation(Some(event_tx))
     } else {
         conversation.start_turn(prompt, Some(event_tx))
@@ -1903,6 +1912,7 @@ mod tests {
                 session_id: None,
                 prompt: "Read the note".into(),
                 continuation: false,
+                edit_node_id: None,
             }),
         )
         .await
@@ -1934,6 +1944,124 @@ mod tests {
                 .last()
                 .unwrap()["content"],
             "**Finished** reading."
+        );
+        provider_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn editing_a_web_message_streams_a_new_branch_without_discarding_the_original() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Answer to the edited request."
+                }
+            }]
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16_384];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config {
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
+            request_timeout_seconds: 5,
+            session_directories: Vec::new(),
+            ..Config::default()
+        };
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "Root request"));
+        session.messages.push(Message::text(
+            crate::provider::Role::Assistant,
+            "First answer",
+        ));
+        let edited_node = session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "Original follow-up",
+        ));
+        let original_leaf = session.messages.push(Message::text(
+            crate::provider::Role::Assistant,
+            "Original continuation",
+        ));
+        let session_id = session.id;
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let conversation = test_conversation(agent);
+        let state = test_state(config, root, conversation.clone(), false);
+
+        let response = chat(
+            State(state),
+            Json(ChatRequest {
+                session_id: Some(session_id),
+                prompt: "Edited follow-up".into(),
+                continuation: false,
+                edit_node_id: Some(edited_node),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let events = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(events[0]["type"], "user_message");
+        assert_eq!(events[0]["message"]["content"], "Edited follow-up");
+        assert_eq!(events.last().unwrap()["type"], "done");
+        let messages = events.last().unwrap()["state"]["session"]["messages"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Root request",
+                "First answer",
+                "Edited follow-up",
+                "Answer to the edited request."
+            ]
+        );
+        let saved = conversation.snapshot().session;
+        assert!(
+            saved
+                .messages
+                .active_node_ids()
+                .iter()
+                .all(|id| *id != edited_node)
+        );
+        assert_eq!(
+            saved
+                .messages
+                .message(original_leaf)
+                .and_then(|message| message.content.as_deref()),
+            Some("Original continuation")
         );
         provider_server.await.unwrap();
     }
@@ -1996,6 +2124,7 @@ mod tests {
                 session_id: Some(first_id),
                 prompt: "First".into(),
                 continuation: false,
+                edit_node_id: None,
             }),
         )
         .await
@@ -2007,6 +2136,7 @@ mod tests {
                 session_id: Some(second_id),
                 prompt: "Second".into(),
                 continuation: false,
+                edit_node_id: None,
             }),
         )
         .await

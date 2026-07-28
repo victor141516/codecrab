@@ -161,7 +161,7 @@ impl Agent {
     #[cfg(test)]
     pub(crate) async fn turn(&mut self, prompt: &str) -> Result<String> {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        self.turn_inner(prompt, false, None, cancel_rx).await
+        self.turn_inner(prompt, false, None, None, cancel_rx).await
     }
 
     #[cfg(test)]
@@ -181,7 +181,19 @@ impl Agent {
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         cancellation: watch::Receiver<bool>,
     ) -> Result<String> {
-        self.turn_inner(prompt, false, events, cancellation).await
+        self.turn_inner(prompt, false, None, events, cancellation)
+            .await
+    }
+
+    pub(crate) async fn edit_turn_controlled(
+        &mut self,
+        node_id: Uuid,
+        prompt: &str,
+        events: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<String> {
+        self.turn_inner(prompt, false, Some(node_id), events, cancellation)
+            .await
     }
 
     pub(crate) async fn continue_goal_with_events(
@@ -201,7 +213,7 @@ impl Agent {
         if self.session.active_goal().is_none() {
             anyhow::bail!("there is no active goal to continue");
         }
-        self.turn_inner(GOAL_CONTINUATION_PROMPT, true, events, cancellation)
+        self.turn_inner(GOAL_CONTINUATION_PROMPT, true, None, events, cancellation)
             .await
     }
 
@@ -233,6 +245,7 @@ impl Agent {
         &mut self,
         prompt: &str,
         hidden_prompt: bool,
+        edit_node_id: Option<Uuid>,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         mut cancellation: watch::Receiver<bool>,
     ) -> Result<String> {
@@ -248,10 +261,14 @@ impl Agent {
         } else {
             Message::text(Role::User, prompt)
         };
-        if self.session.messages.is_empty() && !hidden_prompt {
+        if self.session.messages.is_empty() && !hidden_prompt && edit_node_id.is_none() {
             self.session.title = prompt.chars().take(72).collect();
         }
-        let turn_message_id = self.session.messages.push(user_message.clone());
+        let turn_message_id = if let Some(node_id) = edit_node_id {
+            self.session.edit_user_message(node_id, prompt.to_owned())?
+        } else {
+            self.session.messages.push(user_message.clone())
+        };
         if !hidden_prompt && let Some(events) = &events {
             let _ = events.send(AgentEvent::UserMessage(user_message));
         }

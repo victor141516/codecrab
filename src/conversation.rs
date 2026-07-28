@@ -83,6 +83,7 @@ enum ConversationCommand {
     Turn {
         prompt: String,
         hidden: bool,
+        edit_node_id: Option<Uuid>,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         cancellation: watch::Receiver<bool>,
         reply: oneshot::Sender<ConversationTurn>,
@@ -183,20 +184,30 @@ impl ConversationHandle {
         prompt: String,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(prompt, false, events)
+        self.start_turn_kind(prompt, false, None, events)
+    }
+
+    pub(crate) fn start_edit_turn(
+        &self,
+        node_id: Uuid,
+        prompt: String,
+        events: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<JoinHandle<Result<ConversationTurn>>> {
+        self.start_turn_kind(prompt, false, Some(node_id), events)
     }
 
     pub(crate) fn start_goal_continuation(
         &self,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(String::new(), true, events)
+        self.start_turn_kind(String::new(), true, None, events)
     }
 
     fn start_turn_kind(
         &self,
         prompt: String,
         hidden: bool,
+        edit_node_id: Option<Uuid>,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
         let _gate = self
@@ -222,6 +233,7 @@ impl ConversationHandle {
         if let Err(error) = self.send_unchecked(ConversationCommand::Turn {
             prompt,
             hidden,
+            edit_node_id,
             events,
             cancellation,
             reply,
@@ -432,11 +444,16 @@ async fn run_worker(
             ConversationCommand::Turn {
                 prompt,
                 hidden,
+                edit_node_id,
                 events,
                 cancellation,
                 reply,
             } => {
-                let result = if hidden {
+                let result = if let Some(node_id) = edit_node_id {
+                    agent
+                        .edit_turn_controlled(node_id, &prompt, events, cancellation)
+                        .await
+                } else if hidden {
                     match events {
                         Some(events) => agent.continue_goal_with_events(events, cancellation).await,
                         None => agent.continue_goal_controlled(None, cancellation).await,

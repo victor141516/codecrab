@@ -229,6 +229,12 @@ struct BranchRow {
     is_last: bool,
 }
 
+struct MessageEdit {
+    node_id: Uuid,
+    previous_input: String,
+    previous_cursor: usize,
+}
+
 impl ConversationView {
     fn contains(&self, column: u16, row: u16) -> bool {
         column >= self.area.x
@@ -712,6 +718,7 @@ struct App {
     pending_goal_action: Option<PendingGoalAction>,
     editing_goal_id: Option<Uuid>,
     editing_goal_resume: bool,
+    editing_message: Option<MessageEdit>,
     goal_buttons: GoalButtons,
     last_escape: Option<Instant>,
     steer_button: Option<Rect>,
@@ -824,6 +831,7 @@ impl App {
             pending_goal_action: None,
             editing_goal_id: None,
             editing_goal_resume: false,
+            editing_message: None,
             goal_buttons: GoalButtons::default(),
             last_escape: None,
             steer_button: None,
@@ -1580,6 +1588,52 @@ impl App {
         Ok(())
     }
 
+    fn begin_selected_message_edit(&mut self) {
+        let Some(navigator) = self.branch_navigator.as_ref() else {
+            return;
+        };
+        let node_id = navigator.nodes[navigator.selected].id;
+        let snapshot = self.conversation.snapshot();
+        let Some(content) = snapshot
+            .session
+            .messages
+            .message(node_id)
+            .and_then(visible_message_content)
+            .map(str::to_owned)
+        else {
+            self.error = Some("Only visible user messages can be edited.".into());
+            return;
+        };
+        let previous_input = std::mem::take(&mut self.input);
+        let previous_cursor = self.cursor;
+        self.branch_navigator = None;
+        self.pending_branch_node = None;
+        self.input = content;
+        self.cursor = self.input.len();
+        self.preferred_column = None;
+        self.close_completion();
+        self.editing_message = Some(MessageEdit {
+            node_id,
+            previous_input,
+            previous_cursor,
+        });
+        self.error = None;
+    }
+
+    fn cancel_message_edit(&mut self) {
+        let Some(edit) = self.editing_message.take() else {
+            return;
+        };
+        self.input = edit.previous_input;
+        self.cursor = edit.previous_cursor.min(self.input.len());
+        self.preferred_column = None;
+        self.close_completion();
+        let snapshot = self.conversation.snapshot();
+        self.apply_branch_session(&snapshot.session);
+        self.auto_scroll = true;
+        self.error = None;
+    }
+
     fn visible_goal(&self) -> Option<&Goal> {
         self.visible_goal_id
             .and_then(|id| self.goals.iter().find(|goal| goal.id == id))
@@ -2003,6 +2057,7 @@ impl App {
         self.pending_goal_action = None;
         self.editing_goal_id = None;
         self.editing_goal_resume = false;
+        self.editing_message = None;
         self.goal_buttons = GoalButtons::default();
         self.last_escape = None;
         self.steer_button = None;
@@ -2385,6 +2440,9 @@ impl App {
         if prompt.is_empty() {
             return Ok(());
         }
+        if let Some(edit) = self.editing_message.take() {
+            return self.start_message_edit_turn(edit.node_id, prompt);
+        }
         if let Some(id) = self.editing_goal_id.take() {
             if prompt.chars().count() > 4_000 {
                 self.editing_goal_id = Some(id);
@@ -2471,6 +2529,37 @@ impl App {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_rx = Some(event_rx);
         self.running = Some(self.conversation.start_turn(prompt, Some(event_tx))?);
+        Ok(())
+    }
+
+    fn start_message_edit_turn(&mut self, node_id: Uuid, prompt: String) -> Result<()> {
+        let Some(message_index) = self
+            .transcript_node_ids
+            .iter()
+            .position(|candidate| *candidate == node_id)
+        else {
+            self.error = Some("The message is no longer on the visible branch.".into());
+            return Ok(());
+        };
+        self.transcript.truncate(message_index);
+        self.transcript_node_ids.truncate(message_index);
+        self.activities
+            .retain(|activity| activity.turn_message_index < message_index);
+        self.turns.retain(|turn| turn.message_index < message_index);
+        self.input.clear();
+        self.cursor = 0;
+        self.preferred_column = None;
+        self.close_completion();
+        self.error = None;
+        self.pending_user = Some(prompt.clone());
+        self.live_messages.clear();
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        self.event_rx = Some(event_rx);
+        self.running = Some(
+            self.conversation
+                .start_edit_turn(node_id, prompt, Some(event_tx))?,
+        );
         Ok(())
     }
 
@@ -2603,6 +2692,7 @@ impl App {
                 KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                     self.move_branch_selection(key.code)?
                 }
+                KeyCode::Char('e' | 'E') => self.begin_selected_message_edit(),
                 KeyCode::Enter => self.confirm_branch_selection().await?,
                 KeyCode::Esc => self.cancel_branch_navigator(),
                 _ => {}
@@ -2706,6 +2796,10 @@ impl App {
                 self.apply_snapshot(snapshot);
                 self.start_goal_continuation()?;
             }
+            return Ok(());
+        }
+        if self.editing_message.is_some() && key.code == KeyCode::Esc {
+            self.cancel_message_edit();
             return Ok(());
         }
 
@@ -3443,7 +3537,7 @@ fn render_branch_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         lines.push(Line::default());
     }
     lines.push(Line::from(Span::styled(
-        " arrows · ↵ · esc",
+        " arrows · e edit · ↵ · esc",
         Style::default().fg(MUTED),
     )));
     frame.render_widget(Paragraph::new(lines), area);
@@ -3832,6 +3926,8 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         " Transcribing voice… "
     } else if app.is_running() {
         " Queue next message "
+    } else if app.editing_message.is_some() {
+        " Edit message · Enter branch · Esc cancel "
     } else if app.editing_goal_id.is_some() {
         " Edit goal · Enter save · Esc cancel "
     } else {
@@ -4916,6 +5012,33 @@ mod tests {
         app.cancel_branch_navigator();
 
         assert!(app.branch_navigator.is_none());
+        assert!(app.transcript_node_ids.contains(&newer_leaf));
+        assert!(!app.transcript_node_ids.contains(&original_leaf));
+    }
+
+    #[test]
+    fn branch_navigator_can_load_a_selected_message_into_the_editor_and_cancel_cleanly() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, original_leaf, newer_leaf) = branching_test_app(root.path());
+        app.input = "preserved draft".into();
+        app.cursor = app.input.len();
+        app.open_branch_navigator();
+        app.move_branch_selection(KeyCode::Up).unwrap();
+
+        app.begin_selected_message_edit();
+
+        assert!(app.branch_navigator.is_none());
+        assert_eq!(
+            app.editing_message.as_ref().map(|edit| edit.node_id),
+            Some(original_leaf)
+        );
+        assert_eq!(app.input, "original follow-up");
+        assert!(app.transcript_node_ids.contains(&original_leaf));
+
+        app.cancel_message_edit();
+
+        assert!(app.editing_message.is_none());
+        assert_eq!(app.input, "preserved draft");
         assert!(app.transcript_node_ids.contains(&newer_leaf));
         assert!(!app.transcript_node_ids.contains(&original_leaf));
     }
