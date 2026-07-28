@@ -22,6 +22,12 @@ import {
   X
 } from "@lucide/vue";
 import { renderMarkdown } from "./markdown.js";
+import { isScrolledToBottom } from "./scroll.js";
+import {
+  activityEventTimestamp,
+  formatEventTimestamp
+} from "./timestamps.js";
+import { sortChronologically } from "./timeline.js";
 
 const state = ref(null);
 const draft = ref("");
@@ -35,6 +41,7 @@ const error = ref("");
 const sidebarOpen = ref(false);
 const composer = ref(null);
 const conversation = ref(null);
+const autoScroll = ref(true);
 const waveformCanvas = ref(null);
 const autocomplete = ref(null);
 const autocompleteSelection = ref(0);
@@ -141,7 +148,7 @@ function assistantTurnEvents(messages, activities, turnMessageIndex) {
       });
     }
   }
-  return events;
+  return sortChronologically(events);
 }
 
 function assistantTurnItem(key, events, turn = null) {
@@ -377,6 +384,7 @@ async function loadState({ resumeGoal = false } = {}) {
     error.value = cause.message;
   } finally {
     loading.value = false;
+    await scrollToBottom();
   }
 }
 
@@ -461,6 +469,9 @@ async function deleteSession(project, id) {
 }
 
 function applyServerState(nextState, { selectActiveProject = false } = {}) {
+  if (nextState.session?.id !== session.value?.id) {
+    autoScroll.value = true;
+  }
   state.value = nextState;
   if (selectActiveProject || !selectedProjectRoot.value) {
     selectedProjectRoot.value = nextState.project;
@@ -885,14 +896,20 @@ function applyAssistantMessage(message) {
   };
 }
 
-function applyAssistantTextDelta(delta, start) {
+function applyAssistantTextDelta(delta, start, sequence, createdAt) {
   const messages = [...(session.value?.messages ?? [])];
   if (start || messages.at(-1)?.role !== "assistant") {
-    messages.push({ role: "assistant", content: delta });
+    messages.push({
+      role: "assistant",
+      content: delta,
+      sequence,
+      created_at: createdAt
+    });
   } else {
     const last = messages.at(-1);
     messages[messages.length - 1] = {
       ...last,
+      sequence,
       content: (last.content ?? "") + delta
     };
   }
@@ -934,13 +951,23 @@ function applyAssistantMessageCompleted(message) {
 }
 
 async function handleChatStreamEvent(event) {
+  if (event.type === "user_message") {
+    applyAssistantMessage(event.message);
+    await scrollToBottom();
+    return false;
+  }
   if (event.type === "assistant_message") {
     applyAssistantMessage(event.message);
     await scrollToBottom();
     return false;
   }
   if (event.type === "assistant_text_delta") {
-    applyAssistantTextDelta(event.delta, event.start);
+    applyAssistantTextDelta(
+      event.delta,
+      event.start,
+      event.sequence,
+      event.created_at
+    );
     await scrollToBottom();
     return false;
   }
@@ -1054,19 +1081,6 @@ async function runPrompt(prompt, { continuation = false } = {}) {
   cancelling.value = false;
   error.value = "";
 
-  if (!continuation) {
-    const optimistic = {
-      ...state.value,
-      session: {
-        ...session.value,
-        messages: [
-          ...(session.value?.messages ?? []),
-          { role: "user", content: prompt, hidden: false }
-        ]
-      }
-    };
-    state.value = optimistic;
-  }
   await scrollToBottom();
 
   let completed = false;
@@ -1303,9 +1317,16 @@ async function clearComposer() {
   resizeComposer();
 }
 
-async function scrollToBottom() {
-  await nextTick();
+function handleConversationScroll() {
   if (conversation.value) {
+    autoScroll.value = isScrolledToBottom(conversation.value);
+  }
+}
+
+async function scrollToBottom() {
+  if (!autoScroll.value) return;
+  await nextTick();
+  if (autoScroll.value && conversation.value) {
     conversation.value.scrollTop = conversation.value.scrollHeight;
   }
 }
@@ -1767,7 +1788,7 @@ onBeforeUnmount(() => {
               :key="option.effort"
               :value="option.effort"
             >
-              {{ option.effort }}
+              {{ option.name }}
             </option>
           </select>
           <select
@@ -1796,7 +1817,8 @@ onBeforeUnmount(() => {
 
       <div
         ref="conversation"
-        class="min-h-0 flex-1 overflow-y-auto scroll-smooth"
+        class="min-h-0 flex-1 overflow-y-auto"
+        @scroll.passive="handleConversationScroll"
       >
         <div v-if="loading" class="grid h-full place-items-center">
           <div class="flex items-center gap-2 text-xs text-zinc-600">
@@ -1816,7 +1838,10 @@ onBeforeUnmount(() => {
                 U
               </div>
               <div class="min-w-0 flex-1">
-                <div class="message-content">
+                <div
+                  class="message-content"
+                  :title="formatEventTimestamp(item.message.created_at)"
+                >
                   {{ item.message.content }}
                 </div>
                 <button
@@ -1900,6 +1925,11 @@ onBeforeUnmount(() => {
                   >
                     <span
                       class="activity-status"
+                      :title="
+                        formatEventTimestamp(
+                          activityEventTimestamp(event.activity)
+                        )
+                      "
                       :class="{
                         'text-emerald-400':
                           event.activity.status === 'completed',
@@ -1975,6 +2005,7 @@ onBeforeUnmount(() => {
                   >
                     <div
                       class="markdown-body"
+                      :title="formatEventTimestamp(event.message.created_at)"
                       v-html="renderMarkdown(event.message.content)"
                     />
                     <button

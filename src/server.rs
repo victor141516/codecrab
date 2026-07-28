@@ -155,14 +155,34 @@ struct CompletionResponse {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ChatStreamMessage {
-    AssistantMessage { message: Message },
-    AssistantTextDelta { delta: String, start: bool },
+    UserMessage {
+        message: Message,
+    },
+    AssistantMessage {
+        message: Message,
+    },
+    AssistantTextDelta {
+        delta: String,
+        start: bool,
+        sequence: u64,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
     AssistantStreamReset,
-    AssistantMessageCompleted { message: Message },
-    Activity { activity: AgentActivity },
-    Done { state: StateResponse },
-    Cancelled { state: StateResponse },
-    Error { error: String },
+    AssistantMessageCompleted {
+        message: Message,
+    },
+    Activity {
+        activity: AgentActivity,
+    },
+    Done {
+        state: StateResponse,
+    },
+    Cancelled {
+        state: StateResponse,
+    },
+    Error {
+        error: String,
+    },
 }
 
 pub(crate) async fn serve(
@@ -454,12 +474,21 @@ async fn chat(
         let forward_events = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 let message = match event {
+                    AgentEvent::UserMessage(message) => ChatStreamMessage::UserMessage { message },
                     AgentEvent::AssistantMessage(message) => {
                         ChatStreamMessage::AssistantMessage { message }
                     }
-                    AgentEvent::AssistantTextDelta { delta, start } => {
-                        ChatStreamMessage::AssistantTextDelta { delta, start }
-                    }
+                    AgentEvent::AssistantTextDelta {
+                        delta,
+                        start,
+                        sequence,
+                        created_at,
+                    } => ChatStreamMessage::AssistantTextDelta {
+                        delta,
+                        start,
+                        sequence,
+                        created_at,
+                    },
                     AgentEvent::AssistantStreamReset => ChatStreamMessage::AssistantStreamReset,
                     AgentEvent::AssistantMessageCompleted(message) => {
                         ChatStreamMessage::AssistantMessageCompleted { message }
@@ -631,6 +660,7 @@ async fn save_provider(
             base_url: request.base_url.context("base_url is required")?,
             auth: request.auth.unwrap_or_else(|| "api_key".into()),
             api_key,
+            ..existing.cloned().unwrap_or_default()
         };
         provider.validate(&request.name)?;
         config.providers.insert(request.name, provider);
@@ -1222,12 +1252,15 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_serializes_deltas_and_activity_as_ndjson() {
         let (sender, mut receiver) = mpsc::channel(1);
+        let created_at = chrono::Utc::now();
         assert!(
             send_stream_message(
                 &sender,
                 ChatStreamMessage::AssistantTextDelta {
                     delta: "hello".into(),
                     start: true,
+                    sequence: 12,
+                    created_at,
                 },
             )
             .await
@@ -1237,6 +1270,11 @@ mod tests {
         assert_eq!(value["type"], "assistant_text_delta");
         assert_eq!(value["delta"], "hello");
         assert_eq!(value["start"], true);
+        assert_eq!(value["sequence"], 12);
+        assert_eq!(
+            value["created_at"],
+            serde_json::to_value(created_at).unwrap()
+        );
 
         assert!(send_stream_message(&sender, ChatStreamMessage::AssistantStreamReset).await);
         let bytes = receiver.recv().await.unwrap().unwrap();
@@ -1246,6 +1284,9 @@ mod tests {
         let activity = AgentActivity {
             id: "call-1".into(),
             turn_message_index: 0,
+            sequence: Some(13),
+            started_at: Some(created_at),
+            completed_at: None,
             tool: "read_file".into(),
             kind: ActivityKind::Read,
             status: ActivityStatus::Running,
@@ -1258,6 +1299,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["type"], "activity");
         assert_eq!(value["activity"]["detail"], "src/main.rs");
+        assert_eq!(
+            value["activity"]["started_at"],
+            serde_json::to_value(created_at).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1366,16 +1411,19 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(events[0]["type"], "assistant_message");
-        assert_eq!(events[0]["message"]["content"], "I’ll read the note first.");
-        assert_eq!(events[1]["type"], "activity");
-        assert_eq!(events[1]["activity"]["status"], "running");
-        assert_eq!(events[2]["activity"]["status"], "completed");
-        assert_eq!(events[3]["type"], "assistant_message");
-        assert_eq!(events[3]["message"]["content"], "**Finished** reading.");
-        assert_eq!(events[4]["type"], "done");
+        assert_eq!(events[0]["type"], "user_message");
+        assert_eq!(events[0]["message"]["content"], "Read the note");
+        assert!(events[0]["message"]["created_at"].is_string());
+        assert_eq!(events[1]["type"], "assistant_message");
+        assert_eq!(events[1]["message"]["content"], "I’ll read the note first.");
+        assert_eq!(events[2]["type"], "activity");
+        assert_eq!(events[2]["activity"]["status"], "running");
+        assert_eq!(events[3]["activity"]["status"], "completed");
+        assert_eq!(events[4]["type"], "assistant_message");
+        assert_eq!(events[4]["message"]["content"], "**Finished** reading.");
+        assert_eq!(events[5]["type"], "done");
         assert_eq!(
-            events[4]["state"]["session"]["messages"]
+            events[5]["state"]["session"]["messages"]
                 .as_array()
                 .unwrap()
                 .last()

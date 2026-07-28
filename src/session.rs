@@ -55,6 +55,8 @@ pub(crate) struct Session {
     pub messages: Vec<Message>,
     pub activities: Vec<AgentActivity>,
     #[serde(default)]
+    next_event_sequence: u64,
+    #[serde(default)]
     pub turns: Vec<AgentTurn>,
     #[serde(default)]
     pub goals: Vec<Goal>,
@@ -67,6 +69,16 @@ fn default_provider() -> String {
 }
 
 impl Session {
+    pub(crate) fn reserve_event_sequence(&mut self) -> u64 {
+        let sequence = self.next_event_sequence;
+        self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+        sequence
+    }
+
+    pub(crate) fn reset_event_sequence(&mut self) {
+        self.next_event_sequence = 0;
+    }
+
     pub(crate) fn start_turn(&mut self, message_index: usize, started_at: DateTime<Utc>) {
         self.turns.push(AgentTurn {
             message_index,
@@ -248,6 +260,7 @@ impl SessionStore {
             title: "New session".into(),
             messages: Vec::new(),
             activities: Vec::new(),
+            next_event_sequence: 0,
             turns: Vec::new(),
             goals: Vec::new(),
             visible_goal_id: None,
@@ -404,21 +417,52 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_timing_is_persisted_with_the_session() {
+    fn event_timestamps_are_persisted_with_the_session() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
         let mut session = store.create("test-model".into()).unwrap();
         let started_at = Utc::now();
         let completed_at = started_at + chrono::Duration::seconds(7);
-        session.start_turn(3, started_at);
-        session.complete_turn(3, completed_at);
+        let mut message = Message::text(crate::provider::Role::User, "Inspect timestamps");
+        message.created_at = Some(started_at);
+        session.messages.push(message);
+        session.activities.push(AgentActivity {
+            id: "call-timestamp".into(),
+            turn_message_index: 0,
+            sequence: Some(1),
+            started_at: Some(started_at),
+            completed_at: Some(completed_at),
+            tool: "read_file".into(),
+            kind: ActivityKind::Read,
+            status: ActivityStatus::Completed,
+            title: "Read".into(),
+            detail: "src/main.rs".into(),
+        });
+        session.start_turn(0, started_at);
+        session.complete_turn(0, completed_at);
         store.save(&session).unwrap();
 
         let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.messages[0].created_at, Some(started_at));
+        assert_eq!(loaded.activities[0].started_at, Some(started_at));
+        assert_eq!(loaded.activities[0].completed_at, Some(completed_at));
         assert_eq!(loaded.turns.len(), 1);
-        assert_eq!(loaded.turns[0].message_index, 3);
+        assert_eq!(loaded.turns[0].message_index, 0);
         assert_eq!(loaded.turns[0].started_at, started_at);
         assert_eq!(loaded.turns[0].completed_at, Some(completed_at));
+    }
+
+    #[test]
+    fn event_sequence_continues_after_resuming_a_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        assert_eq!(session.reserve_event_sequence(), 0);
+        assert_eq!(session.reserve_event_sequence(), 1);
+        store.save(&session).unwrap();
+
+        let mut loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.reserve_event_sequence(), 2);
     }
 
     #[test]
@@ -429,6 +473,9 @@ mod tests {
         session.activities.push(AgentActivity {
             id: "call-1".into(),
             turn_message_index: 0,
+            sequence: None,
+            started_at: None,
+            completed_at: None,
             tool: "read_file".into(),
             kind: ActivityKind::Read,
             status: ActivityStatus::Completed,

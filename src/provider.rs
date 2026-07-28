@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -8,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{OAuthCredentials, OAuthStore},
-    config::Config,
+    config::{CatalogOptionConfig, Config, ModelCapabilitiesConfig},
     http_debug,
 };
 
@@ -24,6 +25,9 @@ const PREFERRED_DEFAULT_SPEED: &str = "fast";
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ReasoningOption {
     pub effort: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
     pub description: String,
 }
 
@@ -49,6 +53,10 @@ pub(crate) struct ModelCatalogEntry {
     pub service_tiers: Vec<ServiceTierOption>,
     #[serde(default)]
     pub default_service_tier: Option<String>,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub output_modalities: Vec<String>,
 }
 
 impl ModelCatalogEntry {
@@ -64,6 +72,8 @@ impl ModelCatalogEntry {
             priority: 0,
             service_tiers: Vec::new(),
             default_service_tier: None,
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
         }
     }
 
@@ -156,6 +166,10 @@ pub(crate) enum Role {
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Message {
     pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,6 +184,8 @@ impl Message {
     pub(crate) fn text(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
+            sequence: None,
+            created_at: Some(Utc::now()),
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
@@ -180,6 +196,8 @@ impl Message {
     pub(crate) fn hidden_text(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
+            sequence: None,
+            created_at: Some(Utc::now()),
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
@@ -212,6 +230,7 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     tools: &'a [Value],
     tool_choice: &'static str,
+    parallel_tool_calls: bool,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
@@ -270,6 +289,9 @@ pub(crate) struct OpenAiCompatible {
     service_tier: Option<String>,
     session_id: Uuid,
     debug_openai: bool,
+    fetch_models: bool,
+    allowed_models: Option<Vec<String>>,
+    model_capabilities: BTreeMap<String, ModelCapabilitiesConfig>,
 }
 
 impl OpenAiCompatible {
@@ -330,6 +352,9 @@ impl OpenAiCompatible {
             service_tier: None,
             session_id: Uuid::new_v4(),
             debug_openai: false,
+            fetch_models: provider.fetch_models,
+            allowed_models: provider.allowed_models.clone(),
+            model_capabilities: provider.model_capabilities.clone(),
         })
     }
 
@@ -347,39 +372,65 @@ impl OpenAiCompatible {
         self.service_tier.clone_from(&selection.service_tier);
     }
 
+    fn selected_model_is_allowed(&self) -> Result<()> {
+        if let Some(allowed) = &self.allowed_models
+            && self.model != "auto"
+            && !allowed.contains(&self.model)
+        {
+            anyhow::bail!(
+                "model {:?} is not present in this provider's allowed_models",
+                self.model
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) async fn fetch_models(&self) -> Result<Vec<ModelCatalogEntry>> {
-        match &self.backend {
-            Backend::ChatCompletions {
-                base_url, api_key, ..
-            } => {
-                let url = format!("{base_url}/models");
-                let response = self
-                    .send_models_request(&url, api_key.as_deref(), None)
-                    .await?;
-                parse_models_response(response, false, self.debug_openai).await
-            }
-            Backend::ChatGptSubscription { auth } => {
-                let url = format!("{CHATGPT_CODEX_BASE}/models");
-                let credentials = auth.credentials().await?;
-                let mut response = self
-                    .send_models_request(&url, Some(&credentials.access_token), Some(&credentials))
-                    .await?;
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    if self.debug_openai {
-                        log_discarded_response(response, Duration::from_secs(8)).await?;
-                    }
-                    let credentials = auth.refresh_credentials().await?;
-                    response = self
+        let models = if !self.fetch_models {
+            Vec::new()
+        } else {
+            match &self.backend {
+                Backend::ChatCompletions {
+                    base_url, api_key, ..
+                } => {
+                    let url = format!("{base_url}/models");
+                    let response = self
+                        .send_models_request(&url, api_key.as_deref(), None)
+                        .await?;
+                    parse_models_response(response, false, self.debug_openai).await?
+                }
+                Backend::ChatGptSubscription { auth } => {
+                    let url = format!("{CHATGPT_CODEX_BASE}/models");
+                    let credentials = auth.credentials().await?;
+                    let mut response = self
                         .send_models_request(
                             &url,
                             Some(&credentials.access_token),
                             Some(&credentials),
                         )
                         .await?;
+                    if response.status() == StatusCode::UNAUTHORIZED {
+                        if self.debug_openai {
+                            log_discarded_response(response, Duration::from_secs(8)).await?;
+                        }
+                        let credentials = auth.refresh_credentials().await?;
+                        response = self
+                            .send_models_request(
+                                &url,
+                                Some(&credentials.access_token),
+                                Some(&credentials),
+                            )
+                            .await?;
+                    }
+                    parse_models_response(response, true, self.debug_openai).await?
                 }
-                parse_models_response(response, true, self.debug_openai).await
             }
-        }
+        };
+        merge_model_catalog(
+            models,
+            &self.model_capabilities,
+            self.allowed_models.as_deref(),
+        )
     }
 
     async fn send_models_request(
@@ -425,6 +476,7 @@ impl OpenAiCompatible {
         tools: &[Value],
         mut on_text_delta: impl FnMut(&str),
     ) -> Result<Message> {
+        self.selected_model_is_allowed()?;
         match &self.backend {
             Backend::ChatCompletions { base_url, api_key } => {
                 self.complete_chat(
@@ -459,6 +511,7 @@ impl OpenAiCompatible {
                 messages: messages.iter().map(ChatMessage::from).collect(),
                 tools,
                 tool_choice: "auto",
+                parallel_tool_calls: true,
                 stream: true,
                 reasoning_effort: self.reasoning_effort.as_deref(),
                 service_tier: self.service_tier.as_deref(),
@@ -677,7 +730,7 @@ fn responses_payload(
         "input": input,
         "tools": response_tools,
         "tool_choice": "auto",
-        "parallel_tool_calls": false,
+        "parallel_tool_calls": true,
         "reasoning": {"summary": "auto"},
         "store": false,
         "stream": true,
@@ -694,6 +747,173 @@ fn responses_payload(
         payload["service_tier"] = json!(tier);
     }
     payload
+}
+
+fn merge_model_catalog(
+    mut models: Vec<ModelCatalogEntry>,
+    configured: &BTreeMap<String, ModelCapabilitiesConfig>,
+    allowed_models: Option<&[String]>,
+) -> Result<Vec<ModelCatalogEntry>> {
+    for model in &mut models {
+        normalize_catalog_options(model);
+        if let Some(capabilities) = configured.get(&model.slug) {
+            merge_model_capabilities(model, capabilities);
+        }
+    }
+    for (id, capabilities) in configured {
+        if models.iter().any(|model| model.slug == *id) {
+            continue;
+        }
+        let mut model = ModelCatalogEntry::from_id(id.clone());
+        merge_model_capabilities(&mut model, capabilities);
+        models.push(model);
+    }
+
+    if let Some(allowed) = allowed_models {
+        let missing = allowed
+            .iter()
+            .filter(|id| !models.iter().any(|model| model.slug == id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "allowed_models references models that were neither returned by the provider nor declared in model_capabilities: {}",
+                missing.join(", ")
+            );
+        }
+        models.retain(|model| allowed.contains(&model.slug));
+        models.sort_by_key(|model| allowed.iter().position(|id| id == &model.slug));
+    }
+
+    for model in &models {
+        if let Some(capabilities) = configured.get(&model.slug) {
+            validate_configured_defaults(model, capabilities)?;
+        }
+    }
+    if models.is_empty() {
+        anyhow::bail!("the provider catalog contains no configured models");
+    }
+    Ok(models)
+}
+
+fn merge_model_capabilities(model: &mut ModelCatalogEntry, configured: &ModelCapabilitiesConfig) {
+    if let Some(display_name) = &configured.display_name {
+        model.display_name.clone_from(display_name);
+    }
+    if let Some(description) = &configured.description {
+        model.description = Some(description.clone());
+    }
+    if let Some(default) = &configured.default_reasoning_level {
+        model.default_reasoning_level = Some(default.clone());
+    }
+    merge_reasoning_options(
+        &mut model.supported_reasoning_levels,
+        &configured.reasoning_levels,
+    );
+    if let Some(default) = &configured.default_service_tier {
+        model.default_service_tier = Some(default.clone());
+    }
+    merge_service_tiers(&mut model.service_tiers, &configured.service_tiers);
+    merge_strings(&mut model.input_modalities, &configured.input_modalities);
+    merge_strings(&mut model.output_modalities, &configured.output_modalities);
+    normalize_catalog_options(model);
+}
+
+fn merge_reasoning_options(
+    existing: &mut Vec<ReasoningOption>,
+    configured: &[CatalogOptionConfig],
+) {
+    for option in configured {
+        if let Some(current) = existing
+            .iter_mut()
+            .find(|current| current.effort == option.id)
+        {
+            if let Some(name) = &option.name {
+                current.name.clone_from(name);
+            }
+            if let Some(description) = &option.description {
+                current.description.clone_from(description);
+            }
+        } else {
+            existing.push(ReasoningOption {
+                effort: option.id.clone(),
+                name: option.name.clone().unwrap_or_else(|| option.id.clone()),
+                description: option.description.clone().unwrap_or_default(),
+            });
+        }
+    }
+}
+
+fn merge_service_tiers(existing: &mut Vec<ServiceTierOption>, configured: &[CatalogOptionConfig]) {
+    for option in configured {
+        if let Some(current) = existing.iter_mut().find(|current| current.id == option.id) {
+            if let Some(name) = &option.name {
+                current.name.clone_from(name);
+            }
+            if let Some(description) = &option.description {
+                current.description.clone_from(description);
+            }
+        } else {
+            existing.push(ServiceTierOption {
+                id: option.id.clone(),
+                name: option.name.clone().unwrap_or_else(|| option.id.clone()),
+                description: option.description.clone().unwrap_or_default(),
+            });
+        }
+    }
+}
+
+fn merge_strings(existing: &mut Vec<String>, configured: &[String]) {
+    for value in configured {
+        if !existing.contains(value) {
+            existing.push(value.clone());
+        }
+    }
+}
+
+fn normalize_catalog_options(model: &mut ModelCatalogEntry) {
+    for option in &mut model.supported_reasoning_levels {
+        if option.name.is_empty() {
+            option.name.clone_from(&option.effort);
+        }
+    }
+    for option in &mut model.service_tiers {
+        if option.name.is_empty() {
+            option.name.clone_from(&option.id);
+        }
+    }
+}
+
+fn validate_configured_defaults(
+    model: &ModelCatalogEntry,
+    configured: &ModelCapabilitiesConfig,
+) -> Result<()> {
+    if let Some(default) = &configured.default_reasoning_level
+        && !model
+            .supported_reasoning_levels
+            .iter()
+            .any(|option| option.effort == *default)
+    {
+        anyhow::bail!(
+            "model {:?} configures default_reasoning_level {:?}, but that reasoning level does not exist in the merged catalog",
+            model.slug,
+            default
+        );
+    }
+    if let Some(default) = &configured.default_service_tier
+        && default != "default"
+        && !model
+            .service_tiers
+            .iter()
+            .any(|option| option.id == *default)
+    {
+        anyhow::bail!(
+            "model {:?} configures default_service_tier {:?}, but that service tier does not exist in the merged catalog",
+            model.slug,
+            default
+        );
+    }
+    Ok(())
 }
 
 async fn parse_models_response(
@@ -1051,6 +1271,8 @@ fn completed_message(text: String, calls: Vec<ToolCall>, empty_error: &str) -> R
     }
     Ok(Message {
         role: Role::Assistant,
+        sequence: None,
+        created_at: None,
         content: (!text.is_empty()).then_some(text),
         tool_calls: (!calls.is_empty()).then_some(calls),
         tool_call_id: None,
@@ -1082,12 +1304,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_completions_payload_enables_parallel_tool_calls() {
+        let request = ChatRequest {
+            model: "gpt-test",
+            messages: Vec::new(),
+            tools: &[],
+            tool_choice: "auto",
+            parallel_tool_calls: true,
+            stream: true,
+            reasoning_effort: None,
+            service_tier: None,
+        };
+
+        let payload = serde_json::to_value(request).unwrap();
+        assert_eq!(payload["parallel_tool_calls"], true);
+    }
+
+    #[test]
     fn converts_chat_history_to_responses_tool_items() {
         let messages = vec![
             Message::text(Role::System, "system"),
             Message::text(Role::User, "inspect"),
             Message {
                 role: Role::Assistant,
+                sequence: None,
+                created_at: None,
                 content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".into(),
@@ -1102,6 +1343,8 @@ mod tests {
             },
             Message {
                 role: Role::Tool,
+                sequence: None,
+                created_at: None,
                 content: Some("file contents".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
@@ -1119,6 +1362,7 @@ mod tests {
         assert_eq!(payload["instructions"], "system");
         assert_eq!(payload["input"][1]["type"], "function_call");
         assert_eq!(payload["input"][2]["type"], "function_call_output");
+        assert_eq!(payload["parallel_tool_calls"], true);
         assert_eq!(payload["reasoning"]["effort"], "high");
         assert_eq!(payload["service_tier"], "fast");
     }
@@ -1134,6 +1378,8 @@ mod tests {
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
             "event: response.output_item.done\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"b.rs\\\"}\"}}\n\n",
             "event: response.completed\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
         );
@@ -1148,10 +1394,10 @@ mod tests {
         let message = stream.finish().unwrap();
         assert_eq!(message.content.as_deref(), Some("hello"));
         assert_eq!(deltas, ["hel", "lo"]);
-        assert_eq!(
-            message.tool_calls.as_ref().unwrap()[0].function.name,
-            "read_file"
-        );
+        let calls = message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[1].id, "call_2");
     }
 
     #[test]
@@ -1327,6 +1573,125 @@ mod tests {
     }
 
     #[test]
+    fn manual_catalog_adds_merges_and_filters_models() {
+        let remote = ModelCatalogEntry {
+            display_name: "Remote name".into(),
+            supported_reasoning_levels: vec![ReasoningOption {
+                effort: "low".into(),
+                name: String::new(),
+                description: "Remote low".into(),
+            }],
+            input_modalities: vec!["text".into()],
+            ..ModelCatalogEntry::from_id("remote-model".into())
+        };
+        let configured = BTreeMap::from([
+            (
+                "remote-model".into(),
+                ModelCapabilitiesConfig {
+                    display_name: Some("Configured name".into()),
+                    reasoning_levels: vec![CatalogOptionConfig {
+                        id: "high".into(),
+                        name: Some("Deep".into()),
+                        description: None,
+                    }],
+                    input_modalities: vec!["image".into()],
+                    ..ModelCapabilitiesConfig::default()
+                },
+            ),
+            (
+                "manual-model".into(),
+                ModelCapabilitiesConfig {
+                    reasoning_levels: vec![CatalogOptionConfig {
+                        id: "medium".into(),
+                        name: None,
+                        description: None,
+                    }],
+                    service_tiers: vec![CatalogOptionConfig {
+                        id: "priority".into(),
+                        name: None,
+                        description: None,
+                    }],
+                    ..ModelCapabilitiesConfig::default()
+                },
+            ),
+        ]);
+
+        let models = merge_model_catalog(
+            vec![remote],
+            &configured,
+            Some(&["manual-model".into(), "remote-model".into()]),
+        )
+        .unwrap();
+
+        assert_eq!(models[0].slug, "manual-model");
+        assert_eq!(models[0].supported_reasoning_levels[0].name, "medium");
+        assert_eq!(models[0].service_tiers[0].name, "priority");
+        assert_eq!(models[1].display_name, "Configured name");
+        assert_eq!(models[1].supported_reasoning_levels[0].name, "low");
+        assert_eq!(models[1].supported_reasoning_levels[1].name, "Deep");
+        assert_eq!(models[1].input_modalities, ["text", "image"]);
+    }
+
+    #[test]
+    fn configured_default_must_exist_after_merge() {
+        let configured = BTreeMap::from([(
+            "manual".into(),
+            ModelCapabilitiesConfig {
+                default_reasoning_level: Some("missing".into()),
+                ..ModelCapabilitiesConfig::default()
+            },
+        )]);
+
+        let result = merge_model_catalog(Vec::new(), &configured, None);
+
+        assert!(format!("{:#}", result.err().unwrap()).contains("merged catalog"));
+    }
+
+    #[test]
+    fn allowed_models_rejects_unknown_model() {
+        let result = merge_model_catalog(
+            vec![ModelCatalogEntry::from_id("known".into())],
+            &BTreeMap::new(),
+            Some(&["missing".into()]),
+        );
+
+        assert!(format!("{:#}", result.err().unwrap()).contains("missing"));
+    }
+
+    #[test]
+    fn selected_model_must_remain_in_allowed_models() {
+        let mut config = Config::test("auto", "http://127.0.0.1:1/v1");
+        config.providers.get_mut("openai").unwrap().allowed_models = Some(vec!["allowed".into()]);
+        let mut provider = OpenAiCompatible::new(&config, "openai").unwrap();
+        provider.set_selection(&ModelSelection {
+            model: "old-session-model".into(),
+            reasoning_effort: None,
+            service_tier: None,
+        });
+
+        assert!(
+            format!("{:#}", provider.selected_model_is_allowed().unwrap_err())
+                .contains("allowed_models")
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_models_endpoint_uses_only_manual_catalog() {
+        let mut config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let provider = config.providers.get_mut("openai").unwrap();
+        provider.fetch_models = false;
+        provider
+            .model_capabilities
+            .insert("manual-model".into(), ModelCapabilitiesConfig::default());
+        let provider = OpenAiCompatible::new(&config, "openai").unwrap();
+
+        let models = provider.fetch_models().await.unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].slug, "manual-model");
+    }
+
+    #[test]
     fn default_service_tier_is_not_shown_as_a_separate_speed() {
         let model = ModelCatalogEntry {
             service_tiers: vec![
@@ -1362,10 +1727,12 @@ mod tests {
                 supported_reasoning_levels: vec![
                     ReasoningOption {
                         effort: "low".into(),
+                        name: "low".into(),
                         description: "Quick".into(),
                     },
                     ReasoningOption {
                         effort: "high".into(),
+                        name: "high".into(),
                         description: "Deep".into(),
                     },
                 ],

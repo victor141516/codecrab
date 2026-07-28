@@ -1704,14 +1704,21 @@ impl App {
                 pending.push(event);
             }
         }
-        let received_events = !pending.is_empty();
         for event in pending {
             match event {
+                AgentEvent::UserMessage(_) => {}
                 AgentEvent::AssistantMessage(message) => self.live_messages.push(message),
-                AgentEvent::AssistantTextDelta { delta, start } => {
+                AgentEvent::AssistantTextDelta {
+                    delta,
+                    start,
+                    sequence,
+                    created_at,
+                } => {
                     if start {
-                        self.live_messages
-                            .push(Message::text(Role::Assistant, delta));
+                        let mut message = Message::text(Role::Assistant, delta);
+                        message.sequence = Some(sequence);
+                        message.created_at = Some(created_at);
+                        self.live_messages.push(message);
                     } else if let Some(message) = self.live_messages.last_mut() {
                         message.content.get_or_insert_default().push_str(&delta);
                     }
@@ -1748,14 +1755,6 @@ impl App {
                     }
                 }
             }
-        }
-        if received_events
-            && !self
-                .text_selection
-                .as_ref()
-                .is_some_and(|selection| selection.dragging)
-        {
-            self.auto_scroll = true;
         }
     }
 
@@ -2018,7 +2017,6 @@ impl App {
         self.last_escape = None;
         self.live_messages.clear();
         self.pending_user = None;
-        self.auto_scroll = true;
         let turn_succeeded = match result {
             Ok(_) => {
                 self.error = None;
@@ -2143,7 +2141,6 @@ impl App {
         self.error = None;
         self.pending_user = Some(prompt.clone());
         self.live_messages.clear();
-        self.auto_scroll = true;
 
         let mut agent = self.agent.take().context("agent is unavailable")?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -2163,7 +2160,6 @@ impl App {
         self.error = None;
         self.pending_user = None;
         self.live_messages.clear();
-        self.auto_scroll = true;
 
         let mut agent = self.agent.take().context("agent is unavailable")?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -2252,6 +2248,7 @@ impl App {
                     base_url: (*base_url).into(),
                     auth: (*auth).into(),
                     api_key: api_key.join(" "),
+                    ..persisted.providers.get(*name).cloned().unwrap_or_default()
                 };
                 provider.validate(name)?;
                 persisted.providers.insert((*name).into(), provider);
@@ -3023,31 +3020,20 @@ fn push_turn_lines(
     messages: &[Message],
 ) {
     let mut matched_activities = Vec::new();
-    let mut emitted_any = false;
-    let mut last_was_message = false;
+    let mut events = Vec::new();
     for message in messages
         .iter()
         .filter(|message| matches!(message.role, Role::Assistant))
     {
-        if let Some(content) = visible_message_content(message) {
-            if emitted_any {
-                source.lines.push(Line::default());
-            }
-            push_message_lines(source, content, true, Some(&app.markdown));
-            emitted_any = true;
-            last_was_message = true;
+        if visible_message_content(message).is_some() {
+            events.push(TurnDisplayEvent::Message(message));
         }
         for call in message.tool_calls.iter().flatten() {
             if let Some(activity) = app.activities.iter().find(|activity| {
                 activity.turn_message_index == turn_message_index && activity.id == call.id
             }) {
-                if last_was_message {
-                    source.lines.push(Line::default());
-                }
-                push_activity_line(source, app, activity);
+                events.push(TurnDisplayEvent::Activity(activity));
                 matched_activities.push(activity.id.as_str());
-                emitted_any = true;
-                last_was_message = false;
             }
         }
     }
@@ -3055,11 +3041,50 @@ fn push_turn_lines(
         activity.turn_message_index == turn_message_index
             && !matched_activities.contains(&activity.id.as_str())
     }) {
-        if last_was_message {
-            source.lines.push(Line::default());
+        events.push(TurnDisplayEvent::Activity(activity));
+    }
+    if events.iter().all(|event| event.sequence().is_some()) {
+        events.sort_by_key(|event| event.sequence());
+    }
+
+    let mut emitted_any = false;
+    let mut last_was_message = false;
+    for event in events {
+        match event {
+            TurnDisplayEvent::Message(message) => {
+                let content =
+                    visible_message_content(message).expect("visible messages were filtered");
+                if emitted_any {
+                    source.lines.push(Line::default());
+                }
+                push_message_lines(source, content, true, Some(&app.markdown));
+                emitted_any = true;
+                last_was_message = true;
+            }
+            TurnDisplayEvent::Activity(activity) => {
+                if last_was_message {
+                    source.lines.push(Line::default());
+                }
+                push_activity_line(source, app, activity);
+                emitted_any = true;
+                last_was_message = false;
+            }
         }
-        push_activity_line(source, app, activity);
-        last_was_message = false;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TurnDisplayEvent<'a> {
+    Message(&'a Message),
+    Activity(&'a AgentActivity),
+}
+
+impl TurnDisplayEvent<'_> {
+    fn sequence(self) -> Option<u64> {
+        match self {
+            Self::Message(message) => message.sequence,
+            Self::Activity(activity) => activity.sequence,
+        }
     }
 }
 
@@ -3558,7 +3583,7 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
             model
                 .supported_reasoning_levels
                 .iter()
-                .map(|option| (option.effort.clone(), option.description.clone()))
+                .map(|option| (option.name.clone(), option.description.clone()))
                 .collect(),
         ),
         ModelPickerStep::Speed => {
@@ -4271,12 +4296,16 @@ mod tests {
             .send(AgentEvent::AssistantTextDelta {
                 delta: "A long ".into(),
                 start: true,
+                sequence: 5,
+                created_at: chrono::Utc::now(),
             })
             .unwrap();
         event_tx
             .send(AgentEvent::AssistantTextDelta {
                 delta: "answer".into(),
                 start: false,
+                sequence: 5,
+                created_at: chrono::Utc::now(),
             })
             .unwrap();
 
@@ -4300,6 +4329,8 @@ mod tests {
             .send(AgentEvent::AssistantTextDelta {
                 delta: "incomplete".into(),
                 start: true,
+                sequence: 8,
+                created_at: chrono::Utc::now(),
             })
             .unwrap();
         event_tx.send(AgentEvent::AssistantStreamReset).unwrap();
@@ -4473,6 +4504,8 @@ mod tests {
             .push(Message::text(Role::User, "Run the checks"));
         app.transcript.push(Message {
             role: Role::Assistant,
+            sequence: None,
+            created_at: None,
             content: Some("I’ll run the checks and update the file.".into()),
             tool_calls: Some(vec![
                 ToolCall {
@@ -4499,6 +4532,9 @@ mod tests {
             AgentActivity {
                 id: "shell-1".into(),
                 turn_message_index: 0,
+                sequence: None,
+                started_at: None,
+                completed_at: None,
                 tool: "shell".into(),
                 kind: ActivityKind::Shell,
                 status: ActivityStatus::Completed,
@@ -4508,6 +4544,9 @@ mod tests {
             AgentActivity {
                 id: "write-1".into(),
                 turn_message_index: 0,
+                sequence: None,
+                started_at: None,
+                completed_at: None,
                 tool: "write_file".into(),
                 kind: ActivityKind::Write,
                 status: ActivityStatus::Completed,
@@ -4870,16 +4909,21 @@ mod tests {
     }
 
     #[test]
-    fn conversation_scroll_stays_manual_until_new_agent_output_arrives() {
+    fn conversation_scroll_stays_manual_during_new_agent_output_until_bottom() {
         let root = tempfile::tempdir().unwrap();
         let registry = test_registry(root.path());
         let mut app = test_app(root.path());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        app.event_rx = Some(event_rx);
         app.max_scroll = 30;
         app.scroll = 30;
         app.auto_scroll = true;
         app.activities.push(AgentActivity {
             id: "old-call".into(),
             turn_message_index: 0,
+            sequence: None,
+            started_at: None,
+            completed_at: None,
             tool: "shell".into(),
             kind: ActivityKind::Shell,
             status: ActivityStatus::Completed,
@@ -4895,7 +4939,16 @@ mod tests {
         assert_eq!(app.scroll, 20);
         assert!(!app.auto_scroll);
 
+        event_tx
+            .send(AgentEvent::AssistantTextDelta {
+                delta: "New output".into(),
+                start: true,
+                sequence: 1,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
         app.drain_agent_events();
+        assert_eq!(app.live_messages[0].content.as_deref(), Some("New output"));
         assert_eq!(app.scroll, 20);
         assert!(!app.auto_scroll);
 
@@ -4934,6 +4987,8 @@ mod tests {
             .push(Message::text(Role::User, "Inspect the project"));
         app.transcript.push(Message {
             role: Role::Assistant,
+            sequence: None,
+            created_at: None,
             content: Some("I’ll inspect the relevant file first.".into()),
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".into(),
@@ -4948,6 +5003,8 @@ mod tests {
         });
         app.transcript.push(Message {
             role: Role::Tool,
+            sequence: None,
+            created_at: None,
             content: Some("file contents".into()),
             tool_calls: None,
             tool_call_id: Some("call-1".into()),
@@ -4956,6 +5013,9 @@ mod tests {
         app.activities.push(AgentActivity {
             id: "call-1".into(),
             turn_message_index: 0,
+            sequence: None,
+            started_at: None,
+            completed_at: None,
             tool: "read_file".into(),
             kind: ActivityKind::Read,
             status: ActivityStatus::Completed,
@@ -5003,6 +5063,54 @@ mod tests {
     }
 
     #[test]
+    fn live_messages_and_unmatched_tools_follow_their_chronological_sequence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.pending_user = Some("Inspect the project".into());
+        let mut first = Message::text(Role::Assistant, "First progress");
+        first.sequence = Some(0);
+        let mut second = Message::text(Role::Assistant, "Second progress");
+        second.sequence = Some(3);
+        app.live_messages = vec![first, second];
+        app.activities.extend([
+            AgentActivity {
+                id: "call-1".into(),
+                turn_message_index: 0,
+                sequence: Some(1),
+                started_at: None,
+                completed_at: None,
+                tool: "read_file".into(),
+                kind: ActivityKind::Read,
+                status: ActivityStatus::Completed,
+                title: "Read".into(),
+                detail: "src/first.rs".into(),
+            },
+            AgentActivity {
+                id: "call-2".into(),
+                turn_message_index: 0,
+                sequence: Some(2),
+                started_at: None,
+                completed_at: None,
+                tool: "read_file".into(),
+                kind: ActivityKind::Read,
+                status: ActivityStatus::Completed,
+                title: "Read".into(),
+                detail: "src/second.rs".into(),
+            },
+        ]);
+
+        let lines = conversation_lines(&app)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let position = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap();
+
+        assert!(position("First progress") < position("src/first.rs"));
+        assert!(position("src/first.rs") < position("src/second.rs"));
+        assert!(position("src/second.rs") < position("Second progress"));
+    }
+
+    #[test]
     fn terminal_file_activities_are_relative_to_the_active_project() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("src");
@@ -5012,6 +5120,9 @@ mod tests {
         let activity = AgentActivity {
             id: "call-1".into(),
             turn_message_index: 0,
+            sequence: None,
+            started_at: None,
+            completed_at: None,
             tool: "read_file".into(),
             kind: ActivityKind::Read,
             status: ActivityStatus::Completed,
@@ -5286,10 +5397,12 @@ mod tests {
                 supported_reasoning_levels: vec![
                     ReasoningOption {
                         effort: "low".into(),
+                        name: "low".into(),
                         description: "Quick".into(),
                     },
                     ReasoningOption {
                         effort: "deep".into(),
+                        name: "deep".into(),
                         description: "Deep".into(),
                     },
                 ],

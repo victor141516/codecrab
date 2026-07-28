@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -5,8 +6,14 @@ use crate::provider::Message;
 
 #[derive(Clone)]
 pub(crate) enum AgentEvent {
+    UserMessage(Message),
     AssistantMessage(Message),
-    AssistantTextDelta { delta: String, start: bool },
+    AssistantTextDelta {
+        delta: String,
+        start: bool,
+        sequence: u64,
+        created_at: DateTime<Utc>,
+    },
     AssistantStreamReset,
     AssistantMessageCompleted(Message),
     Activity(AgentActivity),
@@ -36,6 +43,12 @@ pub(crate) enum ActivityStatus {
 pub(crate) struct AgentActivity {
     pub id: String,
     pub turn_message_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
     pub tool: String,
     pub kind: ActivityKind,
     pub status: ActivityStatus,
@@ -47,6 +60,7 @@ impl AgentActivity {
     pub(crate) fn started(
         id: String,
         turn_message_index: usize,
+        sequence: u64,
         tool: &str,
         arguments: &str,
     ) -> Self {
@@ -54,6 +68,9 @@ impl AgentActivity {
         Self {
             id,
             turn_message_index,
+            sequence: Some(sequence),
+            started_at: Some(Utc::now()),
+            completed_at: None,
             tool: tool.to_owned(),
             kind,
             status: ActivityStatus::Running,
@@ -70,11 +87,13 @@ impl AgentActivity {
             ActivityStatus::Failed
         };
         self.title = if succeeded { completed } else { failed }.to_owned();
+        self.completed_at = Some(Utc::now());
     }
 
     pub(crate) fn model_retry(
         id: String,
         turn_message_index: usize,
+        sequence: u64,
         retry: usize,
         max_retries: usize,
         error: String,
@@ -82,6 +101,9 @@ impl AgentActivity {
         Self {
             id,
             turn_message_index,
+            sequence: Some(sequence),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
             tool: "model_request".into(),
             kind: ActivityKind::Network,
             status: ActivityStatus::Completed,
@@ -90,10 +112,18 @@ impl AgentActivity {
         }
     }
 
-    pub(crate) fn model_error(id: String, turn_message_index: usize, error: String) -> Self {
+    pub(crate) fn model_error(
+        id: String,
+        turn_message_index: usize,
+        sequence: u64,
+        error: String,
+    ) -> Self {
         Self {
             id,
             turn_message_index,
+            sequence: Some(sequence),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
             tool: "model_request".into(),
             kind: ActivityKind::Network,
             status: ActivityStatus::Failed,
@@ -168,22 +198,31 @@ mod tests {
 
     #[test]
     fn activities_have_shared_human_readable_lifecycle_labels() {
-        let mut activity =
-            AgentActivity::started("call-1".into(), 3, "read_file", r#"{"path":"src/main.rs"}"#);
+        let mut activity = AgentActivity::started(
+            "call-1".into(),
+            3,
+            7,
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+        );
         assert_eq!(activity.title, "Reading");
         assert_eq!(activity.detail, "src/main.rs");
         assert_eq!(activity.status, ActivityStatus::Running);
+        assert_eq!(activity.sequence, Some(7));
+        assert!(activity.started_at.is_some());
+        assert!(activity.completed_at.is_none());
 
         activity.finish(true);
         assert_eq!(activity.title, "Read");
         assert_eq!(activity.status, ActivityStatus::Completed);
+        assert!(activity.completed_at.is_some());
     }
 
     #[test]
     fn activity_details_preserve_complete_tool_arguments() {
         let command = "x".repeat(400);
         let arguments = serde_json::json!({ "command": command }).to_string();
-        let activity = AgentActivity::started("call-1".into(), 0, "shell", &arguments);
+        let activity = AgentActivity::started("call-1".into(), 0, 4, "shell", &arguments);
 
         assert_eq!(activity.detail, command);
     }

@@ -1,8 +1,9 @@
 use std::{
+    collections::HashSet,
     error::Error,
     fmt, fs,
     io::ErrorKind,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -15,7 +16,8 @@ use uuid::Uuid;
 use crate::{
     events::{AgentActivity, AgentEvent},
     provider::{
-        Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role, default_model_selection,
+        Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role, ToolCall,
+        default_model_selection,
     },
     session::{GoalStatus, Session},
     skills::{Skill, SkillRegistry},
@@ -126,6 +128,7 @@ impl Agent {
         self.session.pause_active_goal();
         self.session.messages.clear();
         self.session.activities.clear();
+        self.session.reset_event_sequence();
         self.session.turns.clear();
         self.session.title = "New session".into();
         self.session.updated_at = Utc::now();
@@ -195,11 +198,15 @@ impl Agent {
         if self.session.messages.is_empty() && !hidden_prompt {
             self.session.title = prompt.chars().take(72).collect();
         }
-        self.session.messages.push(if hidden_prompt {
+        let user_message = if hidden_prompt {
             Message::hidden_text(Role::User, prompt)
         } else {
             Message::text(Role::User, prompt)
-        });
+        };
+        self.session.messages.push(user_message.clone());
+        if !hidden_prompt && let Some(events) = &events {
+            let _ = events.send(AgentEvent::UserMessage(user_message));
+        }
         let turn_message_index = self.session.messages.len() - 1;
         self.session.start_turn(turn_message_index, turn_started_at);
 
@@ -223,9 +230,12 @@ impl Agent {
                 definitions.extend(goal_definitions());
             }
             let mut retry = 0;
-            let (response, streamed_text) = loop {
+            let (mut response, streamed_text, response_created_at, response_sequence) = loop {
+                let response_sequence = self.session.reserve_event_sequence();
                 let streamed_text = Arc::new(Mutex::new(String::new()));
+                let response_created_at = Arc::new(Mutex::new(None));
                 let callback_text = streamed_text.clone();
+                let callback_created_at = response_created_at.clone();
                 let callback_events = events.clone();
                 let result = tokio::select! {
                     response = self.provider.complete(
@@ -237,22 +247,50 @@ impl Agent {
                                 .expect("streamed text mutex poisoned");
                             let start = text.is_empty();
                             text.push_str(delta);
+                            let created_at = if start {
+                                let now = Utc::now();
+                                *callback_created_at
+                                    .lock()
+                                    .expect("response timestamp mutex poisoned") = Some(now);
+                                now
+                            } else {
+                                callback_created_at
+                                    .lock()
+                                    .expect("response timestamp mutex poisoned")
+                                    .unwrap_or_else(Utc::now)
+                            };
                             if let Some(events) = &callback_events {
                                 let _ = events.send(AgentEvent::AssistantTextDelta {
                                     delta: delta.to_owned(),
                                     start,
+                                    sequence: response_sequence,
+                                    created_at,
                                 });
                             }
                         },
                     ) => response,
                     () = wait_for_cancellation(&mut cancellation) => {
-                        preserve_partial_assistant(&mut self.session.messages, &streamed_text);
+                        preserve_partial_assistant(
+                            &mut self.session.messages,
+                            &streamed_text,
+                            response_sequence,
+                            *response_created_at
+                                .lock()
+                                .expect("response timestamp mutex poisoned"),
+                        );
                         self.session.updated_at = Utc::now();
                         return Err(TurnCancelled.into());
                     }
                 };
                 match result {
-                    Ok(response) => break (response, streamed_text),
+                    Ok(response) => {
+                        break (
+                            response,
+                            streamed_text,
+                            response_created_at,
+                            response_sequence,
+                        );
+                    }
                     Err(error) if retry < MAX_MODEL_RETRIES => {
                         retry += 1;
                         let error_text = format!("{error:#}");
@@ -267,10 +305,12 @@ impl Agent {
                         {
                             let _ = events.send(AgentEvent::AssistantStreamReset);
                         }
+                        let retry_sequence = self.session.reserve_event_sequence();
                         self.record_activity(
                             AgentActivity::model_retry(
                                 format!("model-retry-{}", Uuid::new_v4()),
                                 turn_message_index,
+                                retry_sequence,
                                 retry,
                                 MAX_MODEL_RETRIES,
                                 error_text,
@@ -283,11 +323,20 @@ impl Agent {
                         eprintln!(
                             "CodeCrab model request failed after {MAX_MODEL_RETRIES} retries: {error_text}"
                         );
-                        preserve_partial_assistant(&mut self.session.messages, &streamed_text);
+                        preserve_partial_assistant(
+                            &mut self.session.messages,
+                            &streamed_text,
+                            response_sequence,
+                            *response_created_at
+                                .lock()
+                                .expect("response timestamp mutex poisoned"),
+                        );
+                        let error_sequence = self.session.reserve_event_sequence();
                         self.record_activity(
                             AgentActivity::model_error(
                                 format!("model-error-{}", Uuid::new_v4()),
                                 turn_message_index,
+                                error_sequence,
                                 error_text,
                             ),
                             events.as_ref(),
@@ -297,6 +346,13 @@ impl Agent {
                     }
                 }
             };
+            response.sequence = Some(response_sequence);
+            response.created_at = Some(
+                response_created_at
+                    .lock()
+                    .expect("response timestamp mutex poisoned")
+                    .unwrap_or_else(Utc::now),
+            );
             let calls = response.tool_calls.clone().unwrap_or_default();
             let content = response.content.clone().unwrap_or_default();
             let streamed = !streamed_text
@@ -324,13 +380,19 @@ impl Agent {
                 });
             }
 
-            let mut calls = calls.into_iter();
-            while let Some(call) = calls.next() {
-                if matches!(call.function.name.as_str(), "complete_goal" | "block_goal") {
+            let batch_rejections = tool_batch_rejections(self.tools.root(), &calls);
+            let mut calls = calls.into_iter().enumerate();
+            while let Some((call_index, call)) = calls.next() {
+                let batch_rejection = batch_rejections[call_index].as_deref();
+                if batch_rejection.is_none()
+                    && matches!(call.function.name.as_str(), "complete_goal" | "block_goal")
+                {
                     let result =
                         self.execute_goal_tool(&call.function.name, &call.function.arguments);
                     self.session.messages.push(Message {
                         role: Role::Tool,
+                        sequence: None,
+                        created_at: Some(Utc::now()),
                         content: Some(result.to_string()),
                         tool_calls: None,
                         tool_call_id: Some(call.id),
@@ -341,6 +403,7 @@ impl Agent {
                 let mut activity = AgentActivity::started(
                     call.id.clone(),
                     turn_message_index,
+                    self.session.reserve_event_sequence(),
                     &call.function.name,
                     &call.function.arguments,
                 );
@@ -355,13 +418,15 @@ impl Agent {
                     activity.finish(false);
                     self.record_activity(activity, events.as_ref());
                     push_cancelled_tool_result(&mut self.session.messages, call.id);
-                    for pending in calls {
+                    for (_, pending) in calls {
                         push_cancelled_tool_result(&mut self.session.messages, pending.id);
                     }
                     self.session.updated_at = Utc::now();
                     return Err(TurnCancelled.into());
                 }
-                let result = if self.skills.handles(&call.function.name) {
+                let result = if let Some(error) = batch_rejection {
+                    json!({"ok": false, "error": error})
+                } else if self.skills.handles(&call.function.name) {
                     self.skills
                         .execute(&call.function.name, &call.function.arguments)
                 } else {
@@ -374,7 +439,7 @@ impl Agent {
                             activity.finish(false);
                             self.record_activity(activity, events.as_ref());
                             push_cancelled_tool_result(&mut self.session.messages, call.id);
-                            for pending in calls {
+                            for (_, pending) in calls {
                                 push_cancelled_tool_result(
                                     &mut self.session.messages,
                                     pending.id,
@@ -389,6 +454,8 @@ impl Agent {
                 self.record_activity(activity, events.as_ref());
                 self.session.messages.push(Message {
                     role: Role::Tool,
+                    sequence: None,
+                    created_at: Some(Utc::now()),
                     content: Some(result.to_string()),
                     tool_calls: None,
                     tool_call_id: Some(call.id),
@@ -516,6 +583,8 @@ async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
 fn push_cancelled_tool_result(messages: &mut Vec<Message>, tool_call_id: String) {
     messages.push(Message {
         role: Role::Tool,
+        sequence: None,
+        created_at: Some(Utc::now()),
         content: Some(r#"{"ok":false,"error":"cancelled by user"}"#.into()),
         tool_calls: None,
         tool_call_id: Some(tool_call_id),
@@ -523,14 +592,112 @@ fn push_cancelled_tool_result(messages: &mut Vec<Message>, tool_call_id: String)
     });
 }
 
-fn preserve_partial_assistant(messages: &mut Vec<Message>, streamed_text: &Mutex<String>) {
+fn preserve_partial_assistant(
+    messages: &mut Vec<Message>,
+    streamed_text: &Mutex<String>,
+    sequence: u64,
+    created_at: Option<chrono::DateTime<Utc>>,
+) {
     let text = streamed_text
         .lock()
         .expect("streamed text mutex poisoned")
         .clone();
     if !text.is_empty() {
-        messages.push(Message::text(Role::Assistant, text));
+        let mut message = Message::text(Role::Assistant, text);
+        message.sequence = Some(sequence);
+        if let Some(created_at) = created_at {
+            message.created_at = Some(created_at);
+        }
+        messages.push(message);
     }
+}
+
+fn tool_batch_rejections(root: &Path, calls: &[ToolCall]) -> Vec<Option<String>> {
+    let mut rejections = vec![None; calls.len()];
+
+    if let Some(shell_index) = calls.iter().position(|call| call.function.name == "shell") {
+        let rejected_from = if shell_index == 0 { 1 } else { shell_index };
+        for rejection in rejections.iter_mut().skip(rejected_from) {
+            *rejection = Some(
+                "deferred because shell execution is a response barrier; request this tool again \
+                 after observing the shell output"
+                    .into(),
+            );
+        }
+    }
+
+    let mut written_paths = HashSet::new();
+    for (index, call) in calls.iter().enumerate() {
+        if rejections[index].is_some() {
+            continue;
+        }
+        let Some(path) = write_target_key(root, call) else {
+            continue;
+        };
+        if !written_paths.insert(path.clone()) {
+            rejections[index] = Some(format!(
+                "deferred because {path} is already modified by another tool call in this \
+                 response; request the additional modification after observing the first result"
+            ));
+        }
+    }
+
+    rejections
+}
+
+fn write_target_key(root: &Path, call: &ToolCall) -> Option<String> {
+    if !matches!(
+        call.function.name.as_str(),
+        "write_file" | "replace_in_file"
+    ) {
+        return None;
+    }
+    let arguments: Value = serde_json::from_str(&call.function.arguments).ok()?;
+    let requested = arguments.get("path")?.as_str()?;
+    let joined = root.join(requested);
+    let normalized = normalize_path(&joined);
+    let resolved = canonicalize_with_missing_tail(&normalized);
+    let key = resolved.to_string_lossy().replace('\\', "/");
+    Some(if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    })
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name().map(ToOwned::to_owned) else {
+            break;
+        };
+        missing.push(name);
+        if !ancestor.pop() {
+            break;
+        }
+    }
+    let mut resolved = ancestor.canonicalize().unwrap_or(ancestor);
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    resolved
 }
 
 fn system_prompt(root: &Path, project_instructions: Option<&ProjectInstructions>) -> String {
@@ -544,6 +711,9 @@ Work autonomously toward the user's request:
 - Prefer exact, small edits. Verify meaningful changes with the project's tests or checks.
 - Never claim that a command passed unless its tool result proves it.
 - Relative paths start at the working directory. Parent paths and absolute paths are allowed.
+- Group independent list_files, read_file, search, load_skill, and read_skill_file calls in the same response whenever useful.
+- You may also group write_file and replace_in_file calls only when every call targets a different file. Never modify the same resolved path twice in one response.
+- Shell is a response barrier: emit at most one shell call in a response and do not emit any other tool call with it. Wait for its output before deciding or requesting the next operation.
 - Briefly explain the result when finished. Mention verification and any remaining limitation.
 
 Communication:
@@ -630,6 +800,94 @@ mod tests {
         assert!(prompt.contains(std::env::consts::ARCH));
         assert!(prompt.contains(&root.display().to_string()));
         assert!(!prompt.to_lowercase().contains("username"));
+        assert!(prompt.contains("Group independent list_files"));
+        assert!(prompt.contains("Shell is a response barrier"));
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::provider::FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn parallel_batch_allows_reads_skills_and_distinct_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let calls = vec![
+            tool_call("1", "list_files", r#"{"path":"."}"#),
+            tool_call("2", "read_file", r#"{"path":"a.rs"}"#),
+            tool_call("3", "search", r#"{"query":"needle"}"#),
+            tool_call("4", "load_skill", r#"{"name":"review"}"#),
+            tool_call("5", "read_skill_file", r#"{"path":"references/a.md"}"#),
+            tool_call("6", "write_file", r#"{"path":"a.txt","content":"a"}"#),
+            tool_call(
+                "7",
+                "replace_in_file",
+                r#"{"path":"b.txt","old":"b","new":"c"}"#,
+            ),
+        ];
+
+        assert_eq!(
+            tool_batch_rejections(&root, &calls),
+            vec![None, None, None, None, None, None, None]
+        );
+    }
+
+    #[test]
+    fn parallel_batch_rejects_a_second_write_to_the_same_resolved_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("same.txt"), "old").unwrap();
+        let calls = vec![
+            tool_call(
+                "1",
+                "write_file",
+                r#"{"path":"same.txt","content":"first"}"#,
+            ),
+            tool_call(
+                "2",
+                "replace_in_file",
+                r#"{"path":"./same.txt","old":"first","new":"second"}"#,
+            ),
+        ];
+
+        let rejections = tool_batch_rejections(&root, &calls);
+        assert!(rejections[0].is_none());
+        assert!(
+            rejections[1]
+                .as_deref()
+                .is_some_and(|error| error.contains("already modified"))
+        );
+    }
+
+    #[test]
+    fn shell_is_a_batch_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let shell_first = vec![
+            tool_call("1", "shell", r#"{"command":"echo ready"}"#),
+            tool_call("2", "read_file", r#"{"path":"after.txt"}"#),
+        ];
+        let rejections = tool_batch_rejections(&root, &shell_first);
+        assert!(rejections[0].is_none());
+        assert!(rejections[1].is_some());
+
+        let shell_later = vec![
+            tool_call("1", "read_file", r#"{"path":"before.txt"}"#),
+            tool_call("2", "shell", r#"{"command":"echo ready"}"#),
+            tool_call("3", "read_file", r#"{"path":"after.txt"}"#),
+        ];
+        let rejections = tool_batch_rejections(&root, &shell_later);
+        assert!(rejections[0].is_none());
+        assert!(rejections[1].is_some());
+        assert!(rejections[2].is_some());
     }
 
     #[tokio::test]
@@ -754,6 +1012,14 @@ mod tests {
         assert_eq!(answer, "Recovered.");
         assert!(matches!(
             received.try_recv().unwrap(),
+            AgentEvent::UserMessage(Message {
+                content: Some(ref content),
+                created_at: Some(_),
+                ..
+            }) if content == "Recover"
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
             AgentEvent::Activity(AgentActivity {
                 kind: crate::events::ActivityKind::Network,
                 status: crate::events::ActivityStatus::Completed,
@@ -828,14 +1094,24 @@ mod tests {
                     "message": {
                         "role": "assistant",
                         "content": "I’ll read the note first.",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\":\"note.txt\"}"
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"note.txt\"}"
+                                }
+                            },
+                            {
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"note.txt\"}"
+                                }
                             }
-                        }]
+                        ]
                     }
                 }]
             })
@@ -903,14 +1179,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(answer, "I found the note.");
+        let user_message = received.try_recv().unwrap();
         let progress = received.try_recv().unwrap();
         let started = received.try_recv().unwrap();
         let completed = received.try_recv().unwrap();
+        let second_started = received.try_recv().unwrap();
+        let second_completed = received.try_recv().unwrap();
         let final_message = received.try_recv().unwrap();
+        assert!(matches!(
+            user_message,
+            AgentEvent::UserMessage(Message {
+                content: Some(ref content),
+                created_at: Some(_),
+                ..
+            }) if content == "Read the note"
+        ));
         assert!(matches!(
             progress,
             AgentEvent::AssistantMessage(Message {
                 content: Some(ref content),
+                sequence: Some(0),
                 ..
             }) if content == "I’ll read the note first."
         ));
@@ -919,6 +1207,7 @@ mod tests {
             AgentEvent::Activity(AgentActivity {
                 ref title,
                 status: crate::events::ActivityStatus::Running,
+                sequence: Some(1),
                 ..
             }) if title == "Reading"
         ));
@@ -927,21 +1216,46 @@ mod tests {
             AgentEvent::Activity(AgentActivity {
                 ref title,
                 status: crate::events::ActivityStatus::Completed,
+                sequence: Some(1),
                 ..
             }) if title == "Read"
+        ));
+        assert!(matches!(
+            second_started,
+            AgentEvent::Activity(AgentActivity {
+                status: crate::events::ActivityStatus::Running,
+                sequence: Some(2),
+                ..
+            })
+        ));
+        assert!(matches!(
+            second_completed,
+            AgentEvent::Activity(AgentActivity {
+                status: crate::events::ActivityStatus::Completed,
+                sequence: Some(2),
+                ..
+            })
         ));
         assert!(matches!(
             final_message,
             AgentEvent::AssistantMessage(Message {
                 content: Some(ref content),
+                sequence: Some(3),
                 ..
             }) if content == "I found the note."
         ));
-        assert_eq!(agent.session().activities.len(), 1);
+        assert_eq!(agent.session().activities.len(), 2);
         assert_eq!(
             agent.session().activities[0].status,
             crate::events::ActivityStatus::Completed
         );
+        assert!(agent.session().messages.iter().any(|message| {
+            matches!(message.role, Role::Assistant)
+                && message.sequence == Some(0)
+                && message.tool_calls.as_ref().is_some_and(|calls| {
+                    calls.len() == 2 && calls[0].id == "call_1" && calls[1].id == "call_2"
+                })
+        }));
         assert!(agent.session().messages.iter().any(|message| {
             matches!(message.role, Role::Tool)
                 && message

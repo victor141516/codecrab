@@ -50,6 +50,16 @@ needed.
 - Tool activity is structured core state, not presentation-layer log parsing.
   Every tool call must create and persist an `AgentActivity`, emit its running
   and terminal status to the active client, and remain visible after resume.
+- Enable provider parallel tool calls so independent reads, searches, and skill
+  loads can share one model response. Distinct-file writes may share that
+  response, but a second write to the same resolved path must be deferred.
+  Treat `shell` as a response barrier: the model must observe one command's
+  output before requesting any later operation.
+- Every visible assistant response and activity receives one monotonically
+  increasing persisted event sequence. Both clients must order a turn by that
+  sequence rather than collection position or tool-call matching alone, so
+  tool-only model responses, retries, streaming, and resume retain their exact
+  chronology.
 - The system prompt has a stable communication policy: respond in the language
   of the latest user message and provide concise, user-facing progress before
   the first tool call and at material phase changes. Progress is normal
@@ -240,8 +250,10 @@ to the current draft and all later turns until changed.
   panels, shortcut footers, empty-state slogans, session IDs, message counts,
   skill counts, or duplicated provider/auth labels. Keep the conversation
   viewport borderless and full-width, with one blank row above and below its
-  content. Manual keyboard or wheel scrolling must remain in place until new
-  live agent output arrives or the user returns to the bottom.
+  content. Manual keyboard or wheel scrolling must remain in place despite new
+  live agent output and must reactivate automatic following only when the user
+  returns to the bottom. Preserve this behavior in both terminal and web
+  conversation viewports.
 - Terminal conversation text has editor-like mouse selection backed by the
   native operating-system clipboard. Left-drag may start only inside the
   conversation, copies the exact displayed content on release, omits artificial
@@ -318,6 +330,7 @@ Node.js 20.19+ or 22.12+.
 
 ```console
 npm --prefix web ci
+npm --prefix web test
 npm --prefix web run build
 cargo fmt --check
 cargo test

@@ -22,6 +22,10 @@ terminal interface and an optional embedded web application.
   path, query, or other recorded detail.
 - Concise progress messages appear in the same language as the user's latest
   message and stay interleaved with the actions they describe.
+- Persisted event sequencing keeps streamed progress, tool activity, retries,
+  and final responses in their exact chronological order in both clients.
+- Automatic conversation scrolling pauses when the user scrolls upward and
+  resumes only after they return to the bottom, even while new output streams.
 - Sanitized Markdown responses in the web client with formatted headings,
   lists, tables, links, inline code, and syntax-highlighted code blocks.
 - Per-segment web copy controls for user messages and assistant text, excluding
@@ -77,13 +81,15 @@ On macOS and Linux, make the downloaded file executable before running it:
 chmod +x codecrab-v*-macos-* codecrab-v*-linux-*
 ```
 
-Pushing a Git tag whose name starts with `v` automatically builds every
-platform and creates the corresponding release. The tag should match the
-package version, for example:
+Pushing a Git tag whose name starts with `v` immediately creates a draft
+release and starts every platform build in parallel. Each binary is attached
+as soon as its build finishes; the draft is published after the complete build
+matrix finishes and the required x64 binaries are present. The tag should match
+the package version, for example:
 
 ```console
-git tag -a v1.0.0 -m "CodeCrab v1.0.0"
-git push origin v1.0.0
+git tag -a v1.1.0 -m "CodeCrab v1.1.0"
+git push origin v1.1.0
 ```
 
 Sign in with the OpenAI account that owns your ChatGPT subscription:
@@ -439,6 +445,16 @@ Environment variables override the file:
 CLI `--model` and `--base-url` flags have the highest priority. Run
 `codecrab config` to print two clearly labelled sections: the platform-global
 configuration file path and the effective non-secret configuration content.
+
+Provider catalogs are discovered from `GET /models` by default. Manual
+`providers.<name>.model_capabilities."<model-id>"` tables enrich matching
+entries and add models the endpoint omits. Reasoning levels and service tiers
+use `{ id, name, description }`, with only `id` required; lists and modalities
+are merged additively. Set `fetch_models = false` for providers without a model
+endpoint, and use optional `allowed_models = ["id", ...]` as a closed, ordered
+model list. Every allowed ID must be discovered or manually declared. These
+catalog settings are edited directly in TOML; provider management interfaces do
+not expose them. See the example file for the complete shape.
 
 `request_timeout_seconds` is the maximum time a model request may receive no
 new response data. Every streamed chunk resets the timer, so a response may run

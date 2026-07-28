@@ -246,10 +246,9 @@ async fn main() -> Result<()> {
                 Ok(catalog) => {
                     agent.resolve_auto_model(&catalog);
                 }
-                Err(error) if agent.session().model == "auto" => {
-                    return Err(error).context("cannot resolve the automatic model");
+                Err(error) => {
+                    return Err(error).context("cannot load the provider model catalog");
                 }
-                Err(_) => {}
             }
             let answer = agent.turn(prompt.trim()).await?;
             println!("{answer}");
@@ -320,6 +319,7 @@ fn manage_provider(command: &ProviderCommand) -> Result<()> {
                 base_url: base_url.clone(),
                 auth,
                 api_key: key,
+                ..config.providers.get(name).cloned().unwrap_or_default()
             };
             provider.validate(name)?;
             config.providers.insert(name.clone(), provider);

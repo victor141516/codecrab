@@ -10,6 +10,9 @@
 active_provider = "openai"
 # Maximum time without receiving new model response data. Each chunk resets the timer.
 request_timeout_seconds = 180
+# Managed automatically as projects acquire or lose saved sessions.
+# Paths may also be added manually.
+session_directories = []
 
 [providers.openai]
 # auto selects GPT-5.6 Sol, high reasoning, and Fast when offered.
@@ -25,13 +28,46 @@ model = "provider-model-name"
 base_url = "https://provider.example/v1"
 auth = "api_key"
 api_key = "provider-secret"
+# Set false when the provider does not expose GET /models. In that case,
+# declare at least one model below.
+fetch_models = true
+# Optional closed list of model IDs shown by CodeCrab. Every ID must either be
+# returned by GET /models or declared under model_capabilities.
+allowed_models = ["provider-model-name", "hidden-model"]
+
+# Manual entries enrich matching discovered models and add models omitted by
+# the endpoint. Lists are merged additively. Option id is required; name falls
+# back to id and description falls back to an empty string.
+[providers.example.model_capabilities."provider-model-name"]
+display_name = "Provider Model"
+default_reasoning_level = "high"
+default_service_tier = "priority"
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+reasoning_levels = [
+    { id = "low" },
+    { id = "high", name = "Deep", description = "More reasoning for complex tasks" },
+]
+service_tiers = [
+    { id = "priority", name = "Fast", description = "Priority processing" },
+]
+
+[providers.example.model_capabilities."hidden-model"]
+input_modalities = ["text"]
+output_modalities = ["text"]
 
 [providers.local]
 model = "local-model"
 base_url = "http://localhost:11434/v1"
 auth = "none"
 api_key = ""
+fetch_models = false
+allowed_models = ["local-model"]
 
-# Managed automatically as projects acquire or lose saved sessions.
-# Paths may also be added manually.
-session_directories = []
+[providers.local.model_capabilities."local-model"]
+reasoning_levels = [
+    { id = "low" },
+    { id = "high" },
+]
+input_modalities = ["text"]
+output_modalities = ["text"]

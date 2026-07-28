@@ -18,6 +18,41 @@ pub(crate) struct ProviderConfig {
     pub base_url: String,
     pub auth: String,
     pub api_key: String,
+    pub fetch_models: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_capabilities: BTreeMap<String, ModelCapabilitiesConfig>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct ModelCapabilitiesConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<CatalogOptionConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub service_tiers: Vec<CatalogOptionConfig>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_modalities: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct CatalogOptionConfig {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -27,6 +62,9 @@ impl Default for ProviderConfig {
             base_url: "https://api.openai.com/v1".into(),
             auth: "auto".into(),
             api_key: String::new(),
+            fetch_models: true,
+            allowed_models: None,
+            model_capabilities: BTreeMap::new(),
         }
     }
 }
@@ -65,6 +103,11 @@ pub(crate) struct PublicProvider<'a> {
     pub base_url: &'a str,
     pub auth: &'a str,
     pub api_key: &'static str,
+    pub fetch_models: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_capabilities: &'a BTreeMap<String, ModelCapabilitiesConfig>,
 }
 
 #[derive(Clone, Serialize)]
@@ -208,6 +251,9 @@ impl Config {
                             } else {
                                 "<redacted>"
                             },
+                            fetch_models: provider.fetch_models,
+                            allowed_models: provider.allowed_models.as_deref(),
+                            model_capabilities: &provider.model_capabilities,
                         },
                     )
                 })
@@ -226,6 +272,7 @@ impl ProviderConfig {
             base_url,
             auth: "none".into(),
             api_key: String::new(),
+            ..Self::default()
         }
     }
 
@@ -242,8 +289,87 @@ impl ProviderConfig {
                 "provider {name:?} has invalid auth mode {other:?}; expected auto, oauth, api_key, or none"
             ),
         }
+        if let Some(models) = &self.allowed_models {
+            validate_unique_values(name, "allowed_models", models)?;
+            if self.model != "auto" && !models.contains(&self.model) {
+                anyhow::bail!(
+                    "provider {name:?} selects model {:?}, but it is not present in allowed_models",
+                    self.model
+                );
+            }
+        }
+        for (model_id, capabilities) in &self.model_capabilities {
+            if model_id.trim().is_empty() {
+                anyhow::bail!("provider {name:?} has an empty model capability identifier");
+            }
+            capabilities.validate(name, model_id)?;
+        }
         Ok(())
     }
+}
+
+impl ModelCapabilitiesConfig {
+    fn validate(&self, provider: &str, model: &str) -> Result<()> {
+        if self
+            .display_name
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("provider {provider:?} model {model:?} has an empty display_name");
+        }
+        validate_options(provider, model, "reasoning_levels", &self.reasoning_levels)?;
+        validate_options(provider, model, "service_tiers", &self.service_tiers)?;
+        validate_unique_values(
+            provider,
+            &format!("model {model:?} input_modalities"),
+            &self.input_modalities,
+        )?;
+        validate_unique_values(
+            provider,
+            &format!("model {model:?} output_modalities"),
+            &self.output_modalities,
+        )?;
+        Ok(())
+    }
+}
+
+fn validate_options(
+    provider: &str,
+    model: &str,
+    field: &str,
+    options: &[CatalogOptionConfig],
+) -> Result<()> {
+    let ids = options
+        .iter()
+        .map(|option| option.id.clone())
+        .collect::<Vec<_>>();
+    validate_unique_values(provider, &format!("model {model:?} {field}"), &ids)?;
+    for option in options {
+        if option
+            .name
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!(
+                "provider {provider:?} model {model:?} {field} option {:?} has an empty name",
+                option.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_values(provider: &str, field: &str, values: &[String]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        if value.trim().is_empty() {
+            anyhow::bail!("provider {provider:?} has an empty value in {field}");
+        }
+        if !seen.insert(value) {
+            anyhow::bail!("provider {provider:?} has duplicate value {value:?} in {field}");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_provider_name(name: &str) -> Result<()> {
@@ -441,6 +567,82 @@ mod tests {
         let public = toml::to_string(&config.public_view()).unwrap();
         assert!(public.contains("<redacted>"));
         assert!(!public.contains("sk-secret"));
+    }
+
+    #[test]
+    fn parses_and_validates_manual_model_catalog() {
+        let config: Config = toml::from_str(
+            r#"
+active_provider = "local"
+
+[providers.local]
+model = "auto"
+base_url = "http://localhost:1234/v1"
+auth = "none"
+fetch_models = false
+allowed_models = ["vision-model"]
+
+[providers.local.model_capabilities."vision-model"]
+display_name = "Vision Model"
+default_reasoning_level = "high"
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+reasoning_levels = [{ id = "high", name = "Deep" }]
+service_tiers = [{ id = "priority" }]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let provider = config.provider("local").unwrap();
+        assert!(!provider.fetch_models);
+        assert_eq!(
+            provider.allowed_models.as_deref().unwrap(),
+            ["vision-model"]
+        );
+        let model = &provider.model_capabilities["vision-model"];
+        assert_eq!(model.reasoning_levels[0].name.as_deref(), Some("Deep"));
+        assert_eq!(model.service_tiers[0].name, None);
+    }
+
+    #[test]
+    fn rejects_explicit_default_outside_allowed_models() {
+        let mut config = Config::default();
+        let provider = config.providers.get_mut(DEFAULT_PROVIDER).unwrap();
+        provider.model = "other-model".into();
+        provider.allowed_models = Some(vec!["only-model".into()]);
+
+        assert!(format!("{:#}", config.validate().unwrap_err()).contains("allowed_models"));
+    }
+
+    #[test]
+    fn rejects_duplicate_manual_option_ids() {
+        let mut config = Config::default();
+        config
+            .providers
+            .get_mut(DEFAULT_PROVIDER)
+            .unwrap()
+            .model_capabilities
+            .insert(
+                "model".into(),
+                ModelCapabilitiesConfig {
+                    reasoning_levels: vec![
+                        CatalogOptionConfig {
+                            id: "high".into(),
+                            name: None,
+                            description: None,
+                        },
+                        CatalogOptionConfig {
+                            id: "high".into(),
+                            name: None,
+                            description: None,
+                        },
+                    ],
+                    ..ModelCapabilitiesConfig::default()
+                },
+            );
+
+        assert!(format!("{:#}", config.validate().unwrap_err()).contains("duplicate"));
     }
 
     #[test]
