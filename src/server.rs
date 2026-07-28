@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     future::{Future, IntoFuture},
+    ops::Deref,
     path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
@@ -94,7 +95,7 @@ struct CatalogState {
 #[derive(Serialize)]
 struct StateResponse {
     project: String,
-    session: Option<Session>,
+    session: Option<WebSession>,
     projects: Vec<SessionProject>,
     skills: Vec<SkillResponse>,
     models: Vec<ModelCatalogEntry>,
@@ -102,6 +103,34 @@ struct StateResponse {
     dictation_available: bool,
     providers: Vec<ProviderSummary>,
     workers: Vec<ConversationStatus>,
+}
+
+#[derive(Clone)]
+struct WebSession(Session);
+
+impl Deref for WebSession {
+    type Target = Session;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for WebSession {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("session did not serialize as an object"))?;
+        object.insert(
+            "messages".into(),
+            serde_json::to_value(&*self.0.messages).map_err(serde::ser::Error::custom)?,
+        );
+        value.serialize(serializer)
+    }
 }
 
 #[derive(Serialize)]
@@ -422,7 +451,7 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         .unwrap_or(workspace_root);
     let session = conversation_snapshot
         .as_ref()
-        .map(|snapshot| snapshot.session.clone());
+        .map(|snapshot| WebSession(snapshot.session.clone()));
     let skills = if let Some(snapshot) = &conversation_snapshot {
         snapshot
             .skills
@@ -1345,6 +1374,27 @@ mod tests {
         ConversationHandle::spawn(agent, registry).unwrap()
     }
 
+    #[test]
+    fn web_sessions_expose_the_active_projection_alongside_the_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = SessionStore::new(root.path())
+            .unwrap()
+            .create("test-model".into())
+            .unwrap();
+        session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "Inspect the tree",
+        ));
+
+        let value = serde_json::to_value(WebSession(session)).unwrap();
+        assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(value["conversation"]["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["messages"][0]["content"].as_str(),
+            Some("Inspect the tree")
+        );
+    }
+
     fn test_state(
         config: Config,
         root: PathBuf,
@@ -1589,6 +1639,7 @@ mod tests {
 
         let activity = AgentActivity {
             id: "call-1".into(),
+            turn_message_id: Uuid::nil(),
             turn_message_index: 0,
             sequence: Some(13),
             started_at: Some(created_at),

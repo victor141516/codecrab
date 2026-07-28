@@ -1,5 +1,7 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
+    ops::Deref,
     path::{Path, PathBuf},
 };
 
@@ -13,6 +15,214 @@ use crate::{
     events::AgentActivity,
     provider::{Message, TokenUsage},
 };
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct ConversationNode {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    pub message: Message,
+}
+
+#[derive(Clone, Default, Serialize)]
+pub(crate) struct ConversationTree {
+    nodes: Vec<ConversationNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_leaf_id: Option<Uuid>,
+    #[serde(skip)]
+    active_node_ids: Vec<Uuid>,
+    #[serde(skip)]
+    active_messages: Vec<Message>,
+}
+
+#[derive(Deserialize)]
+struct PersistedConversationTree {
+    nodes: Vec<ConversationNode>,
+    #[serde(default)]
+    active_leaf_id: Option<Uuid>,
+}
+
+impl<'de> Deserialize<'de> for ConversationTree {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let persisted = PersistedConversationTree::deserialize(deserializer)?;
+        let mut tree = Self {
+            nodes: persisted.nodes,
+            active_leaf_id: persisted.active_leaf_id,
+            active_node_ids: Vec::new(),
+            active_messages: Vec::new(),
+        };
+        tree.rebuild_active_path()
+            .map_err(serde::de::Error::custom)?;
+        Ok(tree)
+    }
+}
+
+impl Deref for ConversationTree {
+    type Target = [Message];
+
+    fn deref(&self) -> &Self::Target {
+        &self.active_messages
+    }
+}
+
+impl<'a> IntoIterator for &'a ConversationTree {
+    type Item = &'a Message;
+    type IntoIter = std::slice::Iter<'a, Message>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.active_messages.iter()
+    }
+}
+
+impl ConversationTree {
+    pub(crate) fn active_leaf_id(&self) -> Option<Uuid> {
+        self.active_leaf_id
+    }
+
+    pub(crate) fn active_node_ids(&self) -> &[Uuid] {
+        &self.active_node_ids
+    }
+
+    pub(crate) fn active_node_id(&self, message_index: usize) -> Option<Uuid> {
+        self.active_node_ids.get(message_index).copied()
+    }
+
+    pub(crate) fn push(&mut self, message: Message) -> Uuid {
+        self.branch_from(self.active_leaf_id, message)
+            .expect("the active conversation leaf must exist")
+    }
+
+    pub(crate) fn branch_from(
+        &mut self,
+        parent_id: Option<Uuid>,
+        message: Message,
+    ) -> Result<Uuid> {
+        if let Some(parent_id) = parent_id
+            && !self.nodes.iter().any(|node| node.id == parent_id)
+        {
+            anyhow::bail!("conversation node {parent_id} does not exist");
+        }
+        let id = Uuid::new_v4();
+        let extends_active_path = parent_id == self.active_leaf_id;
+        let active_message = extends_active_path.then(|| message.clone());
+        self.nodes.push(ConversationNode {
+            id,
+            parent_id,
+            message,
+        });
+        self.active_leaf_id = Some(id);
+        if let Some(message) = active_message {
+            self.active_node_ids.push(id);
+            self.active_messages.push(message);
+        } else {
+            self.rebuild_active_path().map_err(anyhow::Error::msg)?;
+        }
+        Ok(id)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.nodes.clear();
+        self.active_leaf_id = None;
+        self.active_node_ids.clear();
+        self.active_messages.clear();
+    }
+
+    pub(crate) fn is_ancestor(&self, ancestor: Uuid, descendant: Uuid) -> bool {
+        let parents = self
+            .nodes
+            .iter()
+            .map(|node| (node.id, node.parent_id))
+            .collect::<HashMap<_, _>>();
+        let mut current = Some(descendant);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            current = parents.get(&id).copied().flatten();
+        }
+        false
+    }
+
+    fn rebuild_active_path(&mut self) -> std::result::Result<(), String> {
+        let mut indexes = HashMap::with_capacity(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            if indexes.insert(node.id, index).is_some() {
+                return Err(format!("duplicate conversation node id {}", node.id));
+            }
+        }
+        for node in &self.nodes {
+            if let Some(parent_id) = node.parent_id
+                && !indexes.contains_key(&parent_id)
+            {
+                return Err(format!(
+                    "conversation node {} references missing parent {parent_id}",
+                    node.id
+                ));
+            }
+        }
+        for node in &self.nodes {
+            let mut visited = HashSet::new();
+            let mut current = Some(node.id);
+            while let Some(id) = current {
+                if !visited.insert(id) {
+                    return Err(format!("conversation tree contains a cycle at node {id}"));
+                }
+                current = indexes
+                    .get(&id)
+                    .and_then(|index| self.nodes[*index].parent_id);
+            }
+        }
+
+        if self.nodes.is_empty() {
+            if self.active_leaf_id.is_some() {
+                return Err("empty conversation tree has an active leaf".into());
+            }
+            self.active_node_ids.clear();
+            self.active_messages.clear();
+            return Ok(());
+        }
+
+        let active_leaf_id = self
+            .active_leaf_id
+            .ok_or_else(|| "non-empty conversation tree has no active leaf".to_owned())?;
+        if self
+            .nodes
+            .iter()
+            .any(|node| node.parent_id == Some(active_leaf_id))
+        {
+            return Err(format!(
+                "active conversation node {active_leaf_id} is not a leaf"
+            ));
+        }
+
+        let mut path = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = Some(active_leaf_id);
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                return Err(format!("conversation tree contains a cycle at node {id}"));
+            }
+            let index = indexes
+                .get(&id)
+                .copied()
+                .ok_or_else(|| format!("active conversation leaf {id} does not exist"))?;
+            let node = &self.nodes[index];
+            path.push(index);
+            current = node.parent_id;
+        }
+        path.reverse();
+
+        self.active_node_ids = path.iter().map(|index| self.nodes[*index].id).collect();
+        self.active_messages = path
+            .into_iter()
+            .map(|index| self.nodes[index].message.clone())
+            .collect();
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +246,7 @@ pub(crate) struct Goal {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AgentTurn {
+    pub message_id: Uuid,
     pub message_index: usize,
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,6 +265,8 @@ pub(crate) enum CompactionTrigger {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct CompactionCheckpoint {
     pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_leaf_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub trigger: CompactionTrigger,
     pub covered_from_message_index: usize,
@@ -75,6 +288,7 @@ impl CompactionCheckpoint {
     pub(crate) fn test(recent_tail_starts_at_message_index: usize, summary: &str) -> Self {
         Self {
             id: Uuid::new_v4(),
+            branch_leaf_id: None,
             created_at: Utc::now(),
             trigger: CompactionTrigger::BeforeTurn,
             covered_from_message_index: 0,
@@ -94,6 +308,8 @@ impl CompactionCheckpoint {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RequestUsage {
     pub recorded_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_leaf_id: Option<Uuid>,
     pub provider: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
@@ -114,7 +330,8 @@ pub(crate) struct Session {
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
     pub title: String,
-    pub messages: Vec<Message>,
+    #[serde(rename = "conversation")]
+    pub messages: ConversationTree,
     pub activities: Vec<AgentActivity>,
     #[serde(default)]
     next_event_sequence: u64,
@@ -145,20 +362,26 @@ impl Session {
         self.next_event_sequence = 0;
     }
 
-    pub(crate) fn start_turn(&mut self, message_index: usize, started_at: DateTime<Utc>) {
+    pub(crate) fn start_turn(
+        &mut self,
+        message_id: Uuid,
+        message_index: usize,
+        started_at: DateTime<Utc>,
+    ) {
         self.turns.push(AgentTurn {
+            message_id,
             message_index,
             started_at,
             completed_at: None,
         });
     }
 
-    pub(crate) fn complete_turn(&mut self, message_index: usize, completed_at: DateTime<Utc>) {
+    pub(crate) fn complete_turn(&mut self, message_id: Uuid, completed_at: DateTime<Utc>) {
         if let Some(turn) = self
             .turns
             .iter_mut()
             .rev()
-            .find(|turn| turn.message_index == message_index)
+            .find(|turn| turn.message_id == message_id)
         {
             turn.completed_at = Some(completed_at);
         }
@@ -282,7 +505,47 @@ impl Session {
     }
 
     pub(crate) fn latest_compaction(&self) -> Option<&CompactionCheckpoint> {
-        self.compaction_checkpoints.last()
+        let active_leaf_id = self.messages.active_leaf_id();
+        self.compaction_checkpoints.iter().rev().find(|checkpoint| {
+            checkpoint.branch_leaf_id.is_none_or(|checkpoint_leaf_id| {
+                active_leaf_id.is_some_and(|active_leaf_id| {
+                    self.messages
+                        .is_ancestor(checkpoint_leaf_id, active_leaf_id)
+                })
+            })
+        })
+    }
+
+    pub(crate) fn latest_request_usage(&self) -> Option<&RequestUsage> {
+        let usage = self.latest_request_usage.as_ref()?;
+        let active_leaf_id = self.messages.active_leaf_id();
+        usage
+            .branch_leaf_id
+            .is_none_or(|usage_leaf_id| {
+                active_leaf_id.is_some_and(|active_leaf_id| {
+                    self.messages.is_ancestor(usage_leaf_id, active_leaf_id)
+                })
+            })
+            .then_some(usage)
+    }
+
+    fn refresh_active_indexes(&mut self) {
+        let indexes = self
+            .messages
+            .active_node_ids()
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect::<HashMap<_, _>>();
+        for activity in &mut self.activities {
+            activity.turn_message_index = indexes
+                .get(&activity.turn_message_id)
+                .copied()
+                .unwrap_or(usize::MAX);
+        }
+        for turn in &mut self.turns {
+            turn.message_index = indexes.get(&turn.message_id).copied().unwrap_or(usize::MAX);
+        }
     }
 }
 
@@ -328,7 +591,7 @@ impl SessionStore {
             reasoning_effort: None,
             service_tier: None,
             title: "New session".into(),
-            messages: Vec::new(),
+            messages: ConversationTree::default(),
             activities: Vec::new(),
             next_event_sequence: 0,
             turns: Vec::new(),
@@ -403,8 +666,10 @@ impl SessionStore {
 
     fn read(&self, path: &Path) -> Result<Session> {
         let bytes = fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid session {}", path.display()))
+        let mut session: Session = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid session {}", path.display()))?;
+        session.refresh_active_indexes();
+        Ok(session)
     }
 }
 
@@ -475,6 +740,171 @@ mod tests {
     use crate::events::{ActivityKind, ActivityStatus, AgentActivity};
 
     #[test]
+    fn conversation_tree_preserves_branches_and_projects_only_the_active_path() {
+        let mut tree = ConversationTree::default();
+        let root = tree.push(Message::text(crate::provider::Role::User, "root"));
+        let original = tree.push(Message::text(crate::provider::Role::Assistant, "original"));
+        let original_leaf = tree.push(Message::text(crate::provider::Role::User, "original leaf"));
+
+        let alternate = tree
+            .branch_from(
+                Some(root),
+                Message::text(crate::provider::Role::Assistant, "alternate"),
+            )
+            .unwrap();
+
+        assert_eq!(tree.nodes.len(), 4);
+        assert_eq!(tree.active_leaf_id(), Some(alternate));
+        assert_eq!(tree.active_node_ids(), &[root, alternate]);
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].content.as_deref(), Some("root"));
+        assert_eq!(tree[1].content.as_deref(), Some("alternate"));
+        assert!(tree.is_ancestor(root, alternate));
+        assert!(!tree.is_ancestor(original, alternate));
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .find(|node| node.id == original_leaf)
+                .and_then(|node| node.message.content.as_deref()),
+            Some("original leaf")
+        );
+    }
+
+    #[test]
+    fn persisted_sessions_store_the_tree_without_a_duplicate_linear_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let root = session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "root"));
+        session
+            .messages
+            .push(Message::text(crate::provider::Role::Assistant, "original"));
+        let alternate = session
+            .messages
+            .branch_from(
+                Some(root),
+                Message::text(crate::provider::Role::Assistant, "alternate"),
+            )
+            .unwrap();
+        store.save(&session).unwrap();
+
+        let path = temp
+            .path()
+            .join(".codecrab")
+            .join("sessions")
+            .join(format!("{}.json", session.id));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(persisted.get("messages").is_none());
+        assert_eq!(
+            persisted["conversation"]["nodes"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(
+            persisted["conversation"]["active_leaf_id"],
+            serde_json::to_value(alternate).unwrap()
+        );
+
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0].content.as_deref(), Some("root"));
+        assert_eq!(loaded.messages[1].content.as_deref(), Some("alternate"));
+        assert_eq!(loaded.messages.nodes.len(), 3);
+    }
+
+    #[test]
+    fn deserialization_rejects_cycles_in_inactive_branches() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        let value = serde_json::json!({
+            "nodes": [
+                {
+                    "id": first,
+                    "parent_id": second,
+                    "message": {"role": "user", "content": "first"}
+                },
+                {
+                    "id": second,
+                    "parent_id": first,
+                    "message": {"role": "assistant", "content": "second"}
+                },
+                {
+                    "id": active,
+                    "message": {"role": "user", "content": "active"}
+                }
+            ],
+            "active_leaf_id": active
+        });
+
+        let error = serde_json::from_value::<ConversationTree>(value)
+            .err()
+            .expect("an inactive cycle must make the whole tree invalid");
+        assert!(error.to_string().contains("contains a cycle"));
+    }
+
+    #[test]
+    fn branch_specific_metadata_is_not_reused_on_an_alternate_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let root = session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "root"));
+        let original_turn = session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "original follow-up",
+        ));
+        let mut checkpoint = CompactionCheckpoint::test(1, "original branch summary");
+        checkpoint.branch_leaf_id = Some(original_turn);
+        session.compaction_checkpoints.push(checkpoint);
+        session.latest_request_usage = Some(RequestUsage {
+            recorded_at: Utc::now(),
+            branch_leaf_id: Some(original_turn),
+            provider: session.provider.clone(),
+            model: session.model.clone(),
+            reasoning_effort: None,
+            service_tier: None,
+            canonical_message_count: session.messages.len(),
+            checkpoint_id: None,
+            usage: TokenUsage::default(),
+        });
+        session.activities.push(AgentActivity {
+            id: "original-activity".into(),
+            turn_message_id: original_turn,
+            turn_message_index: 1,
+            sequence: None,
+            started_at: None,
+            completed_at: None,
+            tool: "read_file".into(),
+            kind: ActivityKind::Read,
+            status: ActivityStatus::Completed,
+            title: "Read".into(),
+            detail: "original.txt".into(),
+        });
+        session.start_turn(original_turn, 1, Utc::now());
+
+        session
+            .messages
+            .branch_from(
+                Some(root),
+                Message::text(crate::provider::Role::User, "alternate follow-up"),
+            )
+            .unwrap();
+        assert!(session.latest_compaction().is_none());
+        assert!(session.latest_request_usage().is_none());
+
+        store.save(&session).unwrap();
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.activities[0].turn_message_index, usize::MAX);
+        assert_eq!(loaded.turns[0].message_index, usize::MAX);
+        assert!(loaded.latest_compaction().is_none());
+        assert!(loaded.latest_request_usage().is_none());
+    }
+
+    #[test]
     fn provider_is_persisted_with_the_session() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
@@ -506,6 +936,7 @@ mod tests {
         session.compaction_checkpoints.push(checkpoint);
         session.latest_request_usage = Some(RequestUsage {
             recorded_at: Utc::now(),
+            branch_leaf_id: None,
             provider: session.provider.clone(),
             model: session.model.clone(),
             reasoning_effort: None,
@@ -546,9 +977,10 @@ mod tests {
         let completed_at = started_at + chrono::Duration::seconds(7);
         let mut message = Message::text(crate::provider::Role::User, "Inspect timestamps");
         message.created_at = Some(started_at);
-        session.messages.push(message);
+        let message_id = session.messages.push(message);
         session.activities.push(AgentActivity {
             id: "call-timestamp".into(),
+            turn_message_id: message_id,
             turn_message_index: 0,
             sequence: Some(1),
             started_at: Some(started_at),
@@ -559,8 +991,8 @@ mod tests {
             title: "Read".into(),
             detail: "src/main.rs".into(),
         });
-        session.start_turn(0, started_at);
-        session.complete_turn(0, completed_at);
+        session.start_turn(message_id, 0, started_at);
+        session.complete_turn(message_id, completed_at);
         store.save(&session).unwrap();
 
         let loaded = store.load(Some(&session.id.to_string())).unwrap();
@@ -593,6 +1025,7 @@ mod tests {
         let mut session = store.create("test-model".into()).unwrap();
         session.activities.push(AgentActivity {
             id: "call-1".into(),
+            turn_message_id: Uuid::nil(),
             turn_message_index: 0,
             sequence: None,
             started_at: None,

@@ -755,7 +755,7 @@ impl App {
                 scope: skill.scope.label(),
             })
             .collect::<Vec<_>>();
-        let transcript = agent.session().messages.clone();
+        let transcript = agent.session().messages.to_vec();
         let activities = agent.session().activities.clone();
         let turns = agent.session().turns.clone();
         let goals = agent.session().goals.clone();
@@ -1406,7 +1406,7 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snapshot: ConversationSnapshot) {
-        self.transcript.clone_from(&snapshot.session.messages);
+        self.transcript = snapshot.session.messages.to_vec();
         self.activities.clone_from(&snapshot.session.activities);
         self.turns.clone_from(&snapshot.session.turns);
         self.goals.clone_from(&snapshot.session.goals);
@@ -4873,6 +4873,7 @@ mod tests {
         app.activities.extend([
             AgentActivity {
                 id: "shell-1".into(),
+                turn_message_id: Uuid::nil(),
                 turn_message_index: 0,
                 sequence: None,
                 started_at: None,
@@ -4885,6 +4886,7 @@ mod tests {
             },
             AgentActivity {
                 id: "write-1".into(),
+                turn_message_id: Uuid::nil(),
                 turn_message_index: 0,
                 sequence: None,
                 started_at: None,
@@ -4924,6 +4926,7 @@ mod tests {
         app.transcript.push(final_message);
         app.activities.push(AgentActivity {
             id: "shell-1".into(),
+            turn_message_id: Uuid::nil(),
             turn_message_index: 0,
             sequence: Some(2),
             started_at: Some(started_at),
@@ -4939,6 +4942,7 @@ mod tests {
             detail: "cargo test".into(),
         });
         app.turns.push(AgentTurn {
+            message_id: Uuid::nil(),
             message_index: 0,
             started_at,
             completed_at: completed.then_some(started_at + chrono::Duration::seconds(7)),
@@ -5383,6 +5387,7 @@ mod tests {
         app.auto_scroll = true;
         app.activities.push(AgentActivity {
             id: "old-call".into(),
+            turn_message_id: Uuid::nil(),
             turn_message_index: 0,
             sequence: None,
             started_at: None,
@@ -5471,6 +5476,7 @@ mod tests {
         });
         app.activities.push(AgentActivity {
             id: "call-1".into(),
+            turn_message_id: Uuid::nil(),
             turn_message_index: 0,
             sequence: None,
             started_at: None,
@@ -5534,6 +5540,7 @@ mod tests {
         app.activities.extend([
             AgentActivity {
                 id: "call-1".into(),
+                turn_message_id: Uuid::nil(),
                 turn_message_index: 0,
                 sequence: Some(1),
                 started_at: None,
@@ -5546,6 +5553,7 @@ mod tests {
             },
             AgentActivity {
                 id: "call-2".into(),
+                turn_message_id: Uuid::nil(),
                 turn_message_index: 0,
                 sequence: Some(2),
                 started_at: None,
@@ -5578,6 +5586,7 @@ mod tests {
         fs::write(&file, "fn main() {}").unwrap();
         let activity = AgentActivity {
             id: "call-1".into(),
+            turn_message_id: Uuid::nil(),
             turn_message_index: 0,
             sequence: None,
             started_at: None,

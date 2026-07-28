@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::provider::Message;
 
@@ -42,6 +43,7 @@ pub(crate) enum ActivityStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AgentActivity {
     pub id: String,
+    pub turn_message_id: Uuid,
     pub turn_message_index: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
@@ -59,6 +61,7 @@ pub(crate) struct AgentActivity {
 impl AgentActivity {
     pub(crate) fn started(
         id: String,
+        turn_message_id: Uuid,
         turn_message_index: usize,
         sequence: u64,
         tool: &str,
@@ -67,6 +70,7 @@ impl AgentActivity {
         let (kind, running, _, _) = activity_labels(tool);
         Self {
             id,
+            turn_message_id,
             turn_message_index,
             sequence: Some(sequence),
             started_at: Some(Utc::now()),
@@ -92,6 +96,7 @@ impl AgentActivity {
 
     pub(crate) fn model_retry(
         id: String,
+        turn_message_id: Uuid,
         turn_message_index: usize,
         sequence: u64,
         retry: usize,
@@ -100,6 +105,7 @@ impl AgentActivity {
     ) -> Self {
         Self {
             id,
+            turn_message_id,
             turn_message_index,
             sequence: Some(sequence),
             started_at: Some(Utc::now()),
@@ -114,12 +120,14 @@ impl AgentActivity {
 
     pub(crate) fn model_error(
         id: String,
+        turn_message_id: Uuid,
         turn_message_index: usize,
         sequence: u64,
         error: String,
     ) -> Self {
         Self {
             id,
+            turn_message_id,
             turn_message_index,
             sequence: Some(sequence),
             started_at: Some(Utc::now()),
@@ -134,12 +142,14 @@ impl AgentActivity {
 
     pub(crate) fn compaction_started(
         id: String,
+        turn_message_id: Uuid,
         turn_message_index: usize,
         sequence: u64,
         estimated_tokens: u64,
     ) -> Self {
         Self {
             id,
+            turn_message_id,
             turn_message_index,
             sequence: Some(sequence),
             started_at: Some(Utc::now()),
@@ -154,6 +164,7 @@ impl AgentActivity {
 
     pub(crate) fn compaction_retry(
         id: String,
+        turn_message_id: Uuid,
         turn_message_index: usize,
         sequence: u64,
         retry: usize,
@@ -162,6 +173,7 @@ impl AgentActivity {
     ) -> Self {
         Self {
             id,
+            turn_message_id,
             turn_message_index,
             sequence: Some(sequence),
             started_at: Some(Utc::now()),
@@ -269,6 +281,7 @@ mod tests {
     fn activities_have_shared_human_readable_lifecycle_labels() {
         let mut activity = AgentActivity::started(
             "call-1".into(),
+            Uuid::new_v4(),
             3,
             7,
             "read_file",
@@ -291,7 +304,8 @@ mod tests {
     fn activity_details_preserve_complete_tool_arguments() {
         let command = "x".repeat(400);
         let arguments = serde_json::json!({ "command": command }).to_string();
-        let activity = AgentActivity::started("call-1".into(), 0, 4, "shell", &arguments);
+        let activity =
+            AgentActivity::started("call-1".into(), Uuid::new_v4(), 0, 4, "shell", &arguments);
 
         assert_eq!(activity.detail, command);
     }

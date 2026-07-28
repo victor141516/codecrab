@@ -24,7 +24,10 @@ use crate::{
         Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role, ToolCall,
         context_length_exceeded, default_model_selection,
     },
-    session::{CompactionCheckpoint, CompactionTrigger, GoalStatus, RequestUsage, Session},
+    session::{
+        CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
+        Session,
+    },
     skills::{Skill, SkillRegistry},
     tools::ToolBox,
 };
@@ -244,17 +247,17 @@ impl Agent {
         if self.session.messages.is_empty() && !hidden_prompt {
             self.session.title = prompt.chars().take(72).collect();
         }
-        self.session.messages.push(user_message.clone());
+        let turn_message_id = self.session.messages.push(user_message.clone());
         if !hidden_prompt && let Some(events) = &events {
             let _ = events.send(AgentEvent::UserMessage(user_message));
         }
         let turn_message_index = self.session.messages.len() - 1;
-        self.session.start_turn(turn_message_index, turn_started_at);
+        self.session
+            .start_turn(turn_message_id, turn_message_index, turn_started_at);
         let before_turn_system = self.system_context(&explicit_skills);
         let before_turn_trigger = if self
             .session
-            .latest_request_usage
-            .as_ref()
+            .latest_request_usage()
             .is_some_and(|usage| usage.model != self.session.model)
         {
             CompactionTrigger::SmallerModel
@@ -414,6 +417,7 @@ impl Agent {
                         self.record_activity(
                             AgentActivity::model_retry(
                                 format!("model-retry-{}", Uuid::new_v4()),
+                                turn_message_id,
                                 turn_message_index,
                                 retry_sequence,
                                 retry,
@@ -441,6 +445,7 @@ impl Agent {
                         self.record_activity(
                             AgentActivity::model_retry(
                                 format!("model-retry-{}", Uuid::new_v4()),
+                                turn_message_id,
                                 turn_message_index,
                                 retry_sequence,
                                 retry,
@@ -467,6 +472,7 @@ impl Agent {
                         self.record_activity(
                             AgentActivity::model_error(
                                 format!("model-error-{}", Uuid::new_v4()),
+                                turn_message_id,
                                 turn_message_index,
                                 error_sequence,
                                 error_text,
@@ -503,7 +509,7 @@ impl Agent {
 
             if calls.is_empty() {
                 let completed_at = Utc::now();
-                self.session.complete_turn(turn_message_index, completed_at);
+                self.session.complete_turn(turn_message_id, completed_at);
                 self.session.updated_at = completed_at;
                 return Ok(if content.trim().is_empty() {
                     "(The model returned an empty answer.)".into()
@@ -534,6 +540,7 @@ impl Agent {
                 }
                 let mut activity = AgentActivity::started(
                     call.id.clone(),
+                    turn_message_id,
                     turn_message_index,
                     self.session.reserve_event_sequence(),
                     &call.function.name,
@@ -620,8 +627,7 @@ impl Agent {
             .map(|checkpoint| checkpoint.id);
         let measured = self
             .session
-            .latest_request_usage
-            .as_ref()
+            .latest_request_usage()
             .filter(|usage| {
                 usage.model == self.session.model
                     && usage.reasoning_effort == self.session.reasoning_effort
@@ -738,9 +744,15 @@ because model {:?} publishes no context-window metadata",
             summary_input_budget,
             &self.compaction_tuning,
         );
+        let turn_message_id = self
+            .session
+            .messages
+            .active_node_id(turn_message_index)
+            .context("compaction turn message is not on the active conversation path")?;
 
         let mut activity = AgentActivity::compaction_started(
             format!("context-compaction-{}", Uuid::new_v4()),
+            turn_message_id,
             turn_message_index,
             self.session.reserve_event_sequence(),
             before_tokens,
@@ -817,6 +829,7 @@ because model {:?} publishes no context-window metadata",
                     self.record_activity(
                         AgentActivity::compaction_retry(
                             format!("context-compaction-retry-{}", Uuid::new_v4()),
+                            turn_message_id,
                             turn_message_index,
                             retry_sequence,
                             attempts,
@@ -865,6 +878,7 @@ because model {:?} publishes no context-window metadata",
                     self.record_activity(
                         AgentActivity::compaction_retry(
                             format!("context-compaction-retry-{}", Uuid::new_v4()),
+                            turn_message_id,
                             turn_message_index,
                             retry_sequence,
                             attempts,
@@ -882,6 +896,7 @@ because model {:?} publishes no context-window metadata",
 
         let checkpoint = CompactionCheckpoint {
             id: Uuid::new_v4(),
+            branch_leaf_id: self.session.messages.active_leaf_id(),
             created_at: Utc::now(),
             trigger,
             covered_from_message_index: 0,
@@ -920,6 +935,7 @@ because model {:?} publishes no context-window metadata",
     ) {
         self.session.latest_request_usage = Some(RequestUsage {
             recorded_at: Utc::now(),
+            branch_leaf_id: self.session.messages.active_leaf_id(),
             provider: self.session.provider.clone(),
             model: self.session.model.clone(),
             reasoning_effort: self.session.reasoning_effort.clone(),
@@ -1045,7 +1061,7 @@ async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
     }
 }
 
-fn push_cancelled_tool_result(messages: &mut Vec<Message>, tool_call_id: String) {
+fn push_cancelled_tool_result(messages: &mut ConversationTree, tool_call_id: String) {
     messages.push(Message {
         role: Role::Tool,
         sequence: None,
@@ -1058,7 +1074,7 @@ fn push_cancelled_tool_result(messages: &mut Vec<Message>, tool_call_id: String)
 }
 
 fn preserve_partial_assistant(
-    messages: &mut Vec<Message>,
+    messages: &mut ConversationTree,
     streamed_text: &Mutex<String>,
     sequence: u64,
     created_at: Option<chrono::DateTime<Utc>>,
@@ -2218,6 +2234,7 @@ mod tests {
             .push(Message::text(Role::Assistant, "ready"));
         session.latest_request_usage = Some(RequestUsage {
             recorded_at: Utc::now(),
+            branch_leaf_id: None,
             provider: session.provider.clone(),
             model: "large-model".into(),
             reasoning_effort: None,
