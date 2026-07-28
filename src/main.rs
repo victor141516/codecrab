@@ -26,7 +26,7 @@ use crate::{
     agent::Agent,
     auth::OAuthStore,
     config::{Config, ConfigStore, ProviderConfig, SessionRegistry, validate_provider_name},
-    conversation::ConversationHandle,
+    conversation::{ConversationHandle, ConversationManager},
     provider::OpenAiCompatible,
     session::{SessionStore, list_session_projects, resolve_global_session},
     skills::SkillRegistry,
@@ -254,9 +254,11 @@ async fn main() -> Result<()> {
                 }
             }
             let conversation = ConversationHandle::spawn(agent, registry.clone())?;
+            let conversations =
+                ConversationManager::with_handle(registry.clone(), conversation.clone());
             let turn = conversation.turn(prompt.trim().to_owned()).await?;
             let result = turn.result;
-            let shutdown = conversation.shutdown().await;
+            let shutdown = conversations.shutdown_all().await.map(|_| ());
             match (result, shutdown) {
                 (Ok(answer), Ok(_)) => println!("{answer}"),
                 (Ok(_), Err(error)) => return Err(error),

@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result};
@@ -11,6 +12,11 @@ use toml_edit::{Array, DocumentMut, Item, Value};
 
 pub(crate) const DEFAULT_PROVIDER: &str = "openai";
 pub(crate) const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+fn global_config_mutation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -135,6 +141,7 @@ pub(crate) struct ConfigStore {
 #[derive(Clone)]
 pub(crate) struct SessionRegistry {
     path: Option<PathBuf>,
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 impl Config {
@@ -433,7 +440,18 @@ impl ConfigStore {
     }
 
     pub(crate) fn save(&self, config: &Config) -> Result<()> {
+        let _guard = global_config_mutation_lock()
+            .lock()
+            .expect("global configuration mutation lock poisoned");
         config.validate()?;
+        let mut config = config.clone();
+        if self.path.exists() {
+            let text = fs::read_to_string(&self.path)
+                .with_context(|| format!("cannot read {}", self.path.display()))?;
+            let current: Config = toml::from_str(&text)
+                .with_context(|| format!("invalid config {}", self.path.display()))?;
+            config.session_directories = current.session_directories;
+        }
         let parent = self
             .path
             .parent()
@@ -441,7 +459,7 @@ impl ConfigStore {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
         let temp = self.path.with_extension("toml.tmp");
-        fs::write(&temp, toml::to_string_pretty(config)?)
+        fs::write(&temp, toml::to_string_pretty(&config)?)
             .with_context(|| format!("cannot write {}", temp.display()))?;
         #[cfg(unix)]
         {
@@ -461,12 +479,16 @@ impl SessionRegistry {
     pub(crate) fn global() -> Self {
         Self {
             path: Config::file_path(),
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn at(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+        Self {
+            path: Some(path),
+            mutation_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub(crate) fn directories(&self) -> Result<Vec<PathBuf>> {
@@ -484,6 +506,13 @@ impl SessionRegistry {
     }
 
     pub(crate) fn register(&self, root: &Path) -> Result<()> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .expect("session registry mutation lock poisoned");
+        let _global_guard = global_config_mutation_lock()
+            .lock()
+            .expect("global configuration mutation lock poisoned");
         let root = normalized_root(root);
         let mut directories = self.directories()?;
         if directories
@@ -497,6 +526,13 @@ impl SessionRegistry {
     }
 
     pub(crate) fn unregister(&self, root: &Path) -> Result<()> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .expect("session registry mutation lock poisoned");
+        let _global_guard = global_config_mutation_lock()
+            .lock()
+            .expect("global configuration mutation lock poisoned");
         let root = normalized_root(root);
         let mut directories = self.directories()?;
         let original_len = directories.len();
@@ -528,8 +564,13 @@ impl SessionRegistry {
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        fs::write(path, document.to_string())
-            .with_context(|| format!("cannot update {}", path.display()))
+        let temp = path.with_extension("toml.registry.tmp");
+        fs::write(&temp, document.to_string())
+            .with_context(|| format!("cannot write {}", temp.display()))?;
+        if path.exists() {
+            fs::remove_file(path).with_context(|| format!("cannot replace {}", path.display()))?;
+        }
+        fs::rename(&temp, path).with_context(|| format!("cannot update {}", path.display()))
     }
 }
 
@@ -693,5 +734,25 @@ service_tiers = [{ id = "priority" }]
 
         registry.unregister(&project).unwrap();
         assert!(registry.directories().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_provider_save_cannot_erase_a_concurrent_session_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = ConfigStore::new(path.clone());
+        store.save(&Config::default()).unwrap();
+        let stale = store.load().unwrap();
+        let registry = SessionRegistry::at(path);
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+
+        registry.register(&project).unwrap();
+        store.save(&stale).unwrap();
+
+        assert_eq!(
+            registry.directories().unwrap(),
+            vec![normalized_root(&project)]
+        );
     }
 }

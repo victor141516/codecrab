@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     future::{Future, IntoFuture},
     path::PathBuf,
@@ -10,8 +11,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::DefaultBodyLimit,
-    extract::State,
+    extract::{DefaultBodyLimit, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE},
@@ -33,14 +33,12 @@ use crate::{
     auth::OAuthStore,
     completion::{CompletionItem, complete as complete_input},
     config::{
-        Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry, paths_equal,
+        Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry,
         validate_provider_name,
     },
-    conversation::ConversationHandle,
+    conversation::{ConversationHandle, ConversationManager, ConversationStatus},
     events::{AgentActivity, AgentEvent},
-    provider::{
-        Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, default_model_selection,
-    },
+    provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible},
     session::{
         Session, SessionProject, SessionStore, list_session_projects, resolve_global_session,
     },
@@ -71,16 +69,23 @@ struct ServerInner {
     config: RwLock<Config>,
     registry: SessionRegistry,
     debug_openai: bool,
-    models: RwLock<Vec<ModelCatalogEntry>>,
-    catalog_error: RwLock<Option<String>>,
     oauth_logged_in: bool,
     workspace_transition: Mutex<()>,
     workspace: Mutex<ServerWorkspace>,
+    conversations: ConversationManager,
+    catalogs: RwLock<HashMap<Uuid, CatalogState>>,
 }
 
 struct ServerWorkspace {
     root: PathBuf,
+    selected_session: Option<Uuid>,
     conversation: Option<ConversationHandle>,
+}
+
+#[derive(Clone, Default)]
+struct CatalogState {
+    models: Vec<ModelCatalogEntry>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -93,6 +98,7 @@ struct StateResponse {
     catalog_error: Option<String>,
     dictation_available: bool,
     providers: Vec<ProviderSummary>,
+    workers: Vec<ConversationStatus>,
 }
 
 #[derive(Serialize)]
@@ -104,6 +110,7 @@ struct SkillResponse {
 
 #[derive(Deserialize)]
 struct ChatRequest {
+    session_id: Option<Uuid>,
     #[serde(default)]
     prompt: String,
     #[serde(default)]
@@ -111,7 +118,13 @@ struct ChatRequest {
 }
 
 #[derive(Deserialize)]
+struct ConversationRequest {
+    session_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
 struct ModelRequest {
+    session_id: Option<Uuid>,
     model: String,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
@@ -125,12 +138,14 @@ struct SessionRequest {
 
 #[derive(Deserialize)]
 struct CompletionRequest {
+    session_id: Option<Uuid>,
     before_cursor: String,
     after_cursor: String,
 }
 
 #[derive(Deserialize)]
 struct GoalRequest {
+    session_id: Option<Uuid>,
     id: Option<Uuid>,
     objective: Option<String>,
 }
@@ -209,19 +224,29 @@ pub(crate) async fn serve(
     };
     list_session_projects(&root, &registry)?;
 
+    let initial_handle = ConversationHandle::spawn(agent, registry.clone())?;
+    let initial_id = initial_handle.snapshot().session.id;
+    let manager = ConversationManager::with_handle(registry.clone(), initial_handle.clone());
     let state = ServerState {
         inner: Arc::new(ServerInner {
             config: RwLock::new(config),
             registry: registry.clone(),
             debug_openai,
-            models: RwLock::new(models),
-            catalog_error: RwLock::new(catalog_error),
             oauth_logged_in,
             workspace_transition: Mutex::new(()),
             workspace: Mutex::new(ServerWorkspace {
                 root,
-                conversation: Some(ConversationHandle::spawn(agent, registry.clone())?),
+                selected_session: Some(initial_id),
+                conversation: Some(initial_handle),
             }),
+            conversations: manager,
+            catalogs: RwLock::new(HashMap::from([(
+                initial_id,
+                CatalogState {
+                    models,
+                    error: catalog_error,
+                },
+            )])),
         }),
     };
     let app = Router::new()
@@ -275,16 +300,17 @@ pub(crate) async fn serve(
         eprintln!("Forcing CodeCrab to exit immediately.");
         std::process::exit(130);
     }
-    shutdown_active_conversation(&state).await?;
-    Ok(())
-}
-
-async fn shutdown_active_conversation(state: &ServerState) -> Result<()> {
-    let _transition = state.inner.workspace_transition.lock().await;
-    let conversation = state.inner.workspace.lock().await.conversation.take();
-    if let Some(conversation) = conversation {
-        conversation.shutdown().await?;
+    state.inner.conversations.cancel_all();
+    while state
+        .inner
+        .conversations
+        .statuses()
+        .iter()
+        .any(|status| status.lifecycle == crate::conversation::ConversationLifecycle::Running)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    state.inner.conversations.shutdown_all().await?;
     Ok(())
 }
 
@@ -312,35 +338,28 @@ async fn load_catalog(agent: &mut Agent) -> (Vec<ModelCatalogEntry>, Option<Stri
 
 fn install_catalog(
     inner: &ServerInner,
-    (models, catalog_error): (Vec<ModelCatalogEntry>, Option<String>),
+    session_id: Uuid,
+    (models, error): (Vec<ModelCatalogEntry>, Option<String>),
 ) {
-    *inner.models.write().unwrap() = models;
-    *inner.catalog_error.write().unwrap() = catalog_error;
+    inner
+        .catalogs
+        .write()
+        .unwrap()
+        .insert(session_id, CatalogState { models, error });
 }
 
-async fn install_conversation(state: &ServerState, root: PathBuf, agent: Agent) -> Result<()> {
-    let previous = {
-        let mut workspace = state.inner.workspace.lock().await;
-        if workspace
-            .conversation
-            .as_ref()
-            .is_some_and(ConversationHandle::is_running)
-        {
-            anyhow::bail!("wait for the active turn before switching conversations");
-        }
-        workspace.conversation.take()
-    };
-    if let Some(previous) = previous
-        && let Err(error) = previous.shutdown().await
-    {
-        state.inner.workspace.lock().await.conversation = Some(previous);
-        return Err(error);
-    }
-    let conversation = ConversationHandle::spawn(agent, state.inner.registry.clone())?;
+async fn install_conversation(
+    state: &ServerState,
+    root: PathBuf,
+    agent: Agent,
+) -> Result<ConversationHandle> {
+    let conversation = state.inner.conversations.install(agent)?;
+    let session_id = conversation.snapshot().session.id;
     let mut workspace = state.inner.workspace.lock().await;
     workspace.root = root;
-    workspace.conversation = Some(conversation);
-    Ok(())
+    workspace.selected_session = Some(session_id);
+    workspace.conversation = Some(conversation.clone());
+    Ok(conversation)
 }
 
 fn resolve_session_root(
@@ -355,12 +374,32 @@ fn resolve_session_root(
     resolve_global_session(&projects, Some(&request.id)).map(|(root, _)| root)
 }
 
-async fn snapshot(state: &ServerState) -> Result<StateResponse> {
-    let (root, conversation) = {
-        let workspace = state.inner.workspace.lock().await;
-        (workspace.root.clone(), workspace.conversation.clone())
+async fn selected_conversation(
+    state: &ServerState,
+    requested: Option<Uuid>,
+) -> Option<ConversationHandle> {
+    let selected = if requested.is_some() {
+        requested
+    } else {
+        state.inner.workspace.lock().await.selected_session
     };
+    selected.and_then(|id| state.inner.conversations.get(id))
+}
+
+async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<StateResponse> {
+    let (workspace_root, selected_id) = {
+        let workspace = state.inner.workspace.lock().await;
+        (
+            workspace.root.clone(),
+            requested.or(workspace.selected_session),
+        )
+    };
+    let conversation = selected_id.and_then(|id| state.inner.conversations.get(id));
     let conversation_snapshot = conversation.as_ref().map(ConversationHandle::snapshot);
+    let root = conversation_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.project_root.clone())
+        .unwrap_or(workspace_root);
     let session = conversation_snapshot
         .as_ref()
         .map(|snapshot| snapshot.session.clone());
@@ -405,11 +444,21 @@ async fn snapshot(state: &ServerState) -> Result<StateResponse> {
         session,
         projects,
         skills,
-        models: state.inner.models.read().unwrap().clone(),
-        catalog_error: state.inner.catalog_error.read().unwrap().clone(),
+        models: selected_id
+            .and_then(|id| state.inner.catalogs.read().unwrap().get(&id).cloned())
+            .map(|catalog| catalog.models)
+            .unwrap_or_default(),
+        catalog_error: selected_id
+            .and_then(|id| state.inner.catalogs.read().unwrap().get(&id).cloned())
+            .and_then(|catalog| catalog.error),
         dictation_available,
         providers,
+        workers: state.inner.conversations.statuses(),
     })
+}
+
+async fn snapshot(state: &ServerState) -> Result<StateResponse> {
+    snapshot_for(state, None).await
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -419,11 +468,14 @@ async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-async fn get_state(State(state): State<ServerState>) -> ApiResult<StateResponse> {
-    if let Some(conversation) = state.inner.workspace.lock().await.conversation.clone() {
+async fn get_state(
+    State(state): State<ServerState>,
+    Query(request): Query<ConversationRequest>,
+) -> ApiResult<StateResponse> {
+    if let Some(conversation) = selected_conversation(&state, request.session_id).await {
         conversation.persist_if_idle().await?;
     }
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(snapshot_for(&state, request.session_id).await?))
 }
 
 async fn completions(
@@ -432,13 +484,8 @@ async fn completions(
 ) -> ApiResult<Option<CompletionResponse>> {
     let cursor = request.before_cursor.len();
     let input = format!("{}{}", request.before_cursor, request.after_cursor);
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -480,13 +527,14 @@ async fn transcribe(
             "recording is empty",
         ));
     }
-    let provider = state
-        .inner
-        .workspace
-        .lock()
+    let requested = headers
+        .get("x-codecrab-session")
+        .and_then(|value| value.to_str().ok())
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ApiError::message(StatusCode::BAD_REQUEST, "invalid session id"))?;
+    let provider = selected_conversation(&state, requested)
         .await
-        .conversation
-        .as_ref()
         .map(|conversation| conversation.snapshot().session.provider)
         .context("create or resume a session before using voice dictation")?;
     let config = state.inner.config.read().unwrap().clone();
@@ -518,13 +566,8 @@ async fn chat(
             "prompt is empty",
         ));
     }
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -532,6 +575,7 @@ async fn chat(
             )
         })?;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let session_id = conversation.snapshot().session.id;
     let turn = if request.continuation {
         conversation.start_goal_continuation(Some(event_tx))
     } else {
@@ -583,14 +627,16 @@ async fn chat(
         let _ = forward_events.await;
 
         let message = match result {
-            Ok(()) => match snapshot(&state).await {
+            Ok(()) => match snapshot_for(&state, Some(session_id)).await {
                 Ok(state) => ChatStreamMessage::Done { state },
                 Err(error) => stream_error(error),
             },
-            Err(error) if turn_was_cancelled(&error) => match snapshot(&state).await {
-                Ok(state) => ChatStreamMessage::Cancelled { state },
-                Err(error) => stream_error(error),
-            },
+            Err(error) if turn_was_cancelled(&error) => {
+                match snapshot_for(&state, Some(session_id)).await {
+                    Ok(state) => ChatStreamMessage::Cancelled { state },
+                    Err(error) => stream_error(error),
+                }
+            }
             Err(error) => stream_error(error),
         };
         let _ = send_stream_message(&output_tx, message).await;
@@ -614,9 +660,16 @@ fn stream_error(error: anyhow::Error) -> ChatStreamMessage {
     ChatStreamMessage::Error { error }
 }
 
-async fn cancel_chat(State(state): State<ServerState>) -> Json<serde_json::Value> {
-    let conversation = state.inner.workspace.lock().await.conversation.clone();
-    let cancelled = conversation.is_some_and(|conversation| conversation.cancel());
+async fn cancel_chat(
+    State(state): State<ServerState>,
+    Json(request): Json<ConversationRequest>,
+) -> Json<serde_json::Value> {
+    let session_id = if request.session_id.is_some() {
+        request.session_id
+    } else {
+        state.inner.workspace.lock().await.selected_session
+    };
+    let cancelled = session_id.is_some_and(|id| state.inner.conversations.cancel(id));
     Json(json!({ "cancelled": cancelled }))
 }
 
@@ -637,11 +690,25 @@ async fn set_model(
     Json(request): Json<ModelRequest>,
 ) -> ApiResult<StateResponse> {
     let _transition = state.inner.workspace_transition.lock().await;
-    if let Some(model) = state
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::message(
+                StatusCode::CONFLICT,
+                "create or resume a session before changing the model",
+            )
+        })?;
+    let session_id = conversation.snapshot().session.id;
+    let catalog = state
         .inner
-        .models
+        .catalogs
         .read()
         .unwrap()
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(model) = catalog
+        .models
         .iter()
         .find(|model| model.slug == request.model)
     {
@@ -664,26 +731,13 @@ async fn set_model(
                 "service tier is not supported by this model",
             ));
         }
-    } else if !state.inner.models.read().unwrap().is_empty() {
+    } else if !catalog.models.is_empty() {
         return Err(ApiError::message(
             StatusCode::BAD_REQUEST,
             "model is not in the provider catalog",
         ));
     }
 
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
-        .await
-        .conversation
-        .clone()
-        .ok_or_else(|| {
-            ApiError::message(
-                StatusCode::CONFLICT,
-                "create or resume a session before changing the model",
-            )
-        })?;
     conversation
         .set_model(ModelSelection {
             model: request.model,
@@ -691,7 +745,7 @@ async fn set_model(
             service_tier: request.service_tier,
         })
         .await?;
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(snapshot_for(&state, Some(session_id)).await?))
 }
 
 async fn save_provider(
@@ -763,14 +817,12 @@ async fn delete_provider(
     Ok(Json(snapshot(&state).await?))
 }
 
-async fn clear_session(State(state): State<ServerState>) -> ApiResult<StateResponse> {
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+async fn clear_session(
+    State(state): State<ServerState>,
+    Json(request): Json<ConversationRequest>,
+) -> ApiResult<StateResponse> {
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -778,12 +830,20 @@ async fn clear_session(State(state): State<ServerState>) -> ApiResult<StateRespo
             )
         })?;
     conversation.clear().await?;
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(
+        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
+    ))
 }
 
 async fn new_session(State(state): State<ServerState>) -> ApiResult<StateResponse> {
     let _transition = state.inner.workspace_transition.lock().await;
-    let root = state.inner.workspace.lock().await.root.clone();
+    let (root, current) = {
+        let workspace = state.inner.workspace.lock().await;
+        (workspace.root.clone(), workspace.conversation.clone())
+    };
+    if let Some(current) = current {
+        current.persist_if_idle().await?;
+    }
     let session = configured_new_session(&state, &root)?;
     let mut agent = build_agent(
         &root,
@@ -792,16 +852,9 @@ async fn new_session(State(state): State<ServerState>) -> ApiResult<StateRespons
         session,
     )?;
     let catalog = load_catalog(&mut agent).await;
-    install_conversation(&state, root, agent).await?;
-    install_catalog(&state.inner, catalog);
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
-        .await
-        .conversation
-        .clone()
-        .expect("conversation was just installed");
+    let conversation = install_conversation(&state, root, agent).await?;
+    let session_id = conversation.snapshot().session.id;
+    install_catalog(&state.inner, session_id, catalog);
     conversation.persist().await?;
     Ok(Json(snapshot(&state).await?))
 }
@@ -809,16 +862,8 @@ async fn new_session(State(state): State<ServerState>) -> ApiResult<StateRespons
 fn configured_new_session(state: &ServerState, root: &std::path::Path) -> Result<Session> {
     let config = state.inner.config.read().unwrap();
     let active = config.provider(&config.active_provider)?;
-    let mut session = SessionStore::new(root)?
-        .create_for_provider(config.active_provider.clone(), active.model.clone())?;
-    if session.model == "auto"
-        && let Some(selection) = default_model_selection(&state.inner.models.read().unwrap())
-    {
-        session.model = selection.model;
-        session.reasoning_effort = selection.reasoning_effort;
-        session.service_tier = selection.service_tier;
-    }
-    Ok(session)
+    SessionStore::new(root)?
+        .create_for_provider(config.active_provider.clone(), active.model.clone())
 }
 
 async fn resume_session(
@@ -826,10 +871,24 @@ async fn resume_session(
     Json(request): Json<SessionRequest>,
 ) -> ApiResult<StateResponse> {
     let _transition = state.inner.workspace_transition.lock().await;
-    let current_root = state.inner.workspace.lock().await.root.clone();
+    let (current_root, current) = {
+        let workspace = state.inner.workspace.lock().await;
+        (workspace.root.clone(), workspace.conversation.clone())
+    };
+    if let Some(current) = current {
+        current.persist_if_idle().await?;
+    }
     let root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
     let store = SessionStore::new(&root)?;
     let session = store.load(Some(&request.id))?;
+    if let Some(existing) = state.inner.conversations.get(session.id) {
+        let mut workspace = state.inner.workspace.lock().await;
+        workspace.root = root;
+        workspace.selected_session = Some(session.id);
+        workspace.conversation = Some(existing);
+        drop(workspace);
+        return Ok(Json(snapshot(&state).await?));
+    }
     let mut agent = build_agent(
         &root,
         &state.inner.config.read().unwrap(),
@@ -837,8 +896,8 @@ async fn resume_session(
         session,
     )?;
     let catalog = load_catalog(&mut agent).await;
-    install_conversation(&state, root, agent).await?;
-    install_catalog(&state.inner, catalog);
+    let conversation = install_conversation(&state, root, agent).await?;
+    install_catalog(&state.inner, conversation.snapshot().session.id, catalog);
     Ok(Json(snapshot(&state).await?))
 }
 
@@ -847,67 +906,62 @@ async fn delete_session(
     Json(request): Json<SessionRequest>,
 ) -> ApiResult<StateResponse> {
     let _transition = state.inner.workspace_transition.lock().await;
-    let (current_root, current_conversation) = {
+    let (current_root, selected_session) = {
         let workspace = state.inner.workspace.lock().await;
-        (workspace.root.clone(), workspace.conversation.clone())
+        (workspace.root.clone(), workspace.selected_session)
     };
     let root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
     let store = SessionStore::new(&root)?;
     let sessions = store.list()?;
-    let deleting_active = current_conversation.as_ref().is_some_and(|conversation| {
-        let snapshot = conversation.snapshot();
-        paths_equal(&snapshot.project_root, &root)
-            && snapshot.session.id.to_string().starts_with(&request.id)
-    });
-    let deleted_index = sessions
-        .iter()
-        .position(|session| session.id.to_string().starts_with(&request.id));
-    if deleting_active {
-        let conversation = {
-            let mut workspace = state.inner.workspace.lock().await;
-            let conversation = workspace
-                .conversation
-                .as_ref()
-                .context("active conversation disappeared before deletion")?;
-            if conversation.is_running() {
-                return Err(ApiError::message(
-                    StatusCode::CONFLICT,
-                    "wait for the active turn before deleting its session",
-                ));
-            }
-            workspace.conversation.take().expect("checked above")
-        };
-        if let Err(error) = conversation.shutdown().await {
-            state.inner.workspace.lock().await.conversation = Some(conversation);
-            return Err(error.into());
-        }
+    let target = store.load(Some(&request.id))?;
+    let target_id = target.id;
+    let deleting_active = selected_session == Some(target_id);
+    let deleted_index = sessions.iter().position(|session| session.id == target_id);
+    if let Some(conversation) =
+        state
+            .inner
+            .conversations
+            .take_if_idle(target_id)
+            .map_err(|error| ApiError {
+                status: StatusCode::CONFLICT,
+                error,
+            })?
+    {
+        conversation.shutdown().await?;
     }
 
     store.delete(&request.id)?;
+    state.inner.catalogs.write().unwrap().remove(&target_id);
     let remaining = store.list()?;
     if deleting_active {
-        let replacement = deleted_index
+        let replacement_session = deleted_index
             .and_then(|index| {
                 (!remaining.is_empty()).then(|| index.min(remaining.len().saturating_sub(1)))
             })
             .map(|index| store.load(Some(&remaining[index].id.to_string())))
-            .transpose()?
-            .map(|session| {
-                build_agent(
+            .transpose()?;
+        if let Some(session) = replacement_session {
+            if let Some(existing) = state.inner.conversations.get(session.id) {
+                let mut workspace = state.inner.workspace.lock().await;
+                workspace.root.clone_from(&root);
+                workspace.selected_session = Some(session.id);
+                workspace.conversation = Some(existing);
+            } else {
+                let mut agent = build_agent(
                     &root,
                     &state.inner.config.read().unwrap(),
                     state.inner.debug_openai,
                     session,
-                )
-            })
-            .transpose()?;
-        if let Some(agent) = replacement {
-            let mut agent = agent;
-            let catalog = load_catalog(&mut agent).await;
-            install_conversation(&state, root.clone(), agent).await?;
-            install_catalog(&state.inner, catalog);
+                )?;
+                let catalog = load_catalog(&mut agent).await;
+                let conversation = install_conversation(&state, root.clone(), agent).await?;
+                install_catalog(&state.inner, conversation.snapshot().session.id, catalog);
+            }
         } else {
-            state.inner.workspace.lock().await.root.clone_from(&root);
+            let mut workspace = state.inner.workspace.lock().await;
+            workspace.root.clone_from(&root);
+            workspace.selected_session = None;
+            workspace.conversation = None;
         }
     }
     if remaining.is_empty() {
@@ -944,13 +998,8 @@ async fn create_goal(
     Json(request): Json<GoalRequest>,
 ) -> ApiResult<StateResponse> {
     let objective = required_goal_objective(&request)?;
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -958,7 +1007,9 @@ async fn create_goal(
             )
         })?;
     conversation.create_goal(objective).await?;
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(
+        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
+    ))
 }
 
 async fn edit_goal(
@@ -967,13 +1018,8 @@ async fn edit_goal(
 ) -> ApiResult<StateResponse> {
     let id = required_goal_id(&request)?;
     let objective = required_goal_objective(&request)?;
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -987,7 +1033,9 @@ async fn edit_goal(
     {
         return Err(ApiError::message(StatusCode::NOT_FOUND, "goal not found"));
     }
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(
+        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
+    ))
 }
 
 async fn activate_goal(
@@ -995,13 +1043,8 @@ async fn activate_goal(
     Json(request): Json<GoalRequest>,
 ) -> ApiResult<StateResponse> {
     let id = required_goal_id(&request)?;
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -1011,7 +1054,9 @@ async fn activate_goal(
     if conversation.activate_goal(id).await?.is_none() {
         return Err(ApiError::message(StatusCode::NOT_FOUND, "goal not found"));
     }
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(
+        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
+    ))
 }
 
 async fn pause_goal(
@@ -1019,13 +1064,8 @@ async fn pause_goal(
     Json(request): Json<GoalRequest>,
 ) -> ApiResult<StateResponse> {
     let id = required_goal_id(&request)?;
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -1035,7 +1075,9 @@ async fn pause_goal(
     if conversation.pause_goal(id).await?.is_none() {
         return Err(ApiError::message(StatusCode::NOT_FOUND, "goal not found"));
     }
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(
+        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
+    ))
 }
 
 async fn delete_goal(
@@ -1043,13 +1085,8 @@ async fn delete_goal(
     Json(request): Json<GoalRequest>,
 ) -> ApiResult<StateResponse> {
     let id = required_goal_id(&request)?;
-    let conversation = state
-        .inner
-        .workspace
-        .lock()
+    let conversation = selected_conversation(&state, request.session_id)
         .await
-        .conversation
-        .clone()
         .ok_or_else(|| {
             ApiError::message(
                 StatusCode::CONFLICT,
@@ -1059,7 +1096,9 @@ async fn delete_goal(
     if conversation.delete_goal(id).await?.is_none() {
         return Err(ApiError::message(StatusCode::NOT_FOUND, "goal not found"));
     }
-    Ok(Json(snapshot(&state).await?))
+    Ok(Json(
+        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
+    ))
 }
 
 async fn index() -> Response {
@@ -1191,16 +1230,55 @@ async fn shutdown_signal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{ActivityKind, ActivityStatus};
+    use crate::{
+        config::paths_equal,
+        events::{ActivityKind, ActivityStatus},
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::Notify,
+        sync::{Barrier, Notify},
     };
 
     fn test_conversation(agent: Agent) -> ConversationHandle {
         let registry = SessionRegistry::at(agent.project_root().join("test-global-config.toml"));
         ConversationHandle::spawn(agent, registry).unwrap()
+    }
+
+    fn test_state(
+        config: Config,
+        root: PathBuf,
+        conversation: ConversationHandle,
+        oauth_logged_in: bool,
+    ) -> ServerState {
+        let registry = SessionRegistry::at(root.join("test-global-config.toml"));
+        test_state_with_registry(config, root, conversation, oauth_logged_in, registry)
+    }
+
+    fn test_state_with_registry(
+        config: Config,
+        root: PathBuf,
+        conversation: ConversationHandle,
+        oauth_logged_in: bool,
+        registry: SessionRegistry,
+    ) -> ServerState {
+        let session_id = conversation.snapshot().session.id;
+        ServerState {
+            inner: Arc::new(ServerInner {
+                config: RwLock::new(config),
+                registry: registry.clone(),
+                debug_openai: false,
+                oauth_logged_in,
+                workspace_transition: Mutex::new(()),
+                workspace: Mutex::new(ServerWorkspace {
+                    root,
+                    selected_session: Some(session_id),
+                    conversation: Some(conversation.clone()),
+                }),
+                conversations: ConversationManager::with_handle(registry, conversation),
+                catalogs: RwLock::new(HashMap::new()),
+            }),
+        }
     }
 
     #[test]
@@ -1220,21 +1298,7 @@ mod tests {
             .create_for_provider(config.active_provider.clone(), "model".into())
             .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
-        let state = ServerState {
-            inner: Arc::new(ServerInner {
-                config: RwLock::new(config),
-                registry: SessionRegistry::at(root.join("test-global-config.toml")),
-                debug_openai: false,
-                models: RwLock::new(Vec::new()),
-                catalog_error: RwLock::new(None),
-                oauth_logged_in: true,
-                workspace_transition: Mutex::new(()),
-                workspace: Mutex::new(ServerWorkspace {
-                    root,
-                    conversation: Some(test_conversation(agent)),
-                }),
-            }),
-        };
+        let state = test_state(config, root, test_conversation(agent), true);
 
         let error =
             match transcribe(State(state), HeaderMap::new(), Bytes::from_static(b"audio")).await {
@@ -1264,24 +1328,12 @@ mod tests {
         let agent = build_agent(&root, &config, false, session).unwrap();
         let conversation = test_conversation(agent);
         let turn = conversation.start_turn("Wait".into(), None).unwrap();
-        let state = ServerState {
-            inner: Arc::new(ServerInner {
-                config: RwLock::new(config),
-                registry: SessionRegistry::at(root.join("test-global-config.toml")),
-                debug_openai: false,
-                models: RwLock::new(Vec::new()),
-                catalog_error: RwLock::new(None),
-                oauth_logged_in: false,
-                workspace_transition: Mutex::new(()),
-                workspace: Mutex::new(ServerWorkspace {
-                    root,
-                    conversation: Some(conversation),
-                }),
-            }),
-        };
+        let state = test_state(config, root, conversation, false);
         tokio::time::sleep(Duration::from_millis(25)).await;
 
-        let response = cancel_chat(State(state)).await.0;
+        let response = cancel_chat(State(state), Json(ConversationRequest { session_id: None }))
+            .await
+            .0;
         let outcome = turn.await.unwrap().unwrap();
 
         assert_eq!(response["cancelled"], true);
@@ -1305,25 +1357,12 @@ mod tests {
             )
             .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
-        let state = ServerState {
-            inner: Arc::new(ServerInner {
-                config: RwLock::new(config),
-                registry: SessionRegistry::at(root.join("test-global-config.toml")),
-                debug_openai: false,
-                models: RwLock::new(Vec::new()),
-                catalog_error: RwLock::new(None),
-                oauth_logged_in: false,
-                workspace_transition: Mutex::new(()),
-                workspace: Mutex::new(ServerWorkspace {
-                    root,
-                    conversation: Some(test_conversation(agent)),
-                }),
-            }),
-        };
+        let state = test_state(config, root, test_conversation(agent), false);
 
         let _ = create_goal(
             State(state.clone()),
             Json(GoalRequest {
+                session_id: None,
                 id: None,
                 objective: Some("First objective".into()),
             }),
@@ -1334,6 +1373,7 @@ mod tests {
         let response = create_goal(
             State(state.clone()),
             Json(GoalRequest {
+                session_id: None,
                 id: None,
                 objective: Some("Second objective".into()),
             }),
@@ -1543,25 +1583,12 @@ mod tests {
             )
             .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
-        let state = ServerState {
-            inner: Arc::new(ServerInner {
-                config: RwLock::new(config),
-                registry: SessionRegistry::at(root.join("test-global-config.toml")),
-                debug_openai: false,
-                models: RwLock::new(Vec::new()),
-                catalog_error: RwLock::new(None),
-                oauth_logged_in: false,
-                workspace_transition: Mutex::new(()),
-                workspace: Mutex::new(ServerWorkspace {
-                    root: root.clone(),
-                    conversation: Some(test_conversation(agent)),
-                }),
-            }),
-        };
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
 
         let response = chat(
             State(state),
             Json(ChatRequest {
+                session_id: None,
                 prompt: "Read the note".into(),
                 continuation: false,
             }),
@@ -1600,6 +1627,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn different_sessions_run_provider_turns_concurrently() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let provider_barrier = barrier.clone();
+        let provider_server = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let barrier = provider_barrier.clone();
+                handlers.push(tokio::spawn(async move {
+                    let mut request = vec![0; 16_384];
+                    let _ = socket.read(&mut request).await.unwrap();
+                    barrier.wait().await;
+                    let body = json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "Finished independently."
+                            }
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let store = SessionStore::new(&root).unwrap();
+        let first_session = store.create("mock-model".into()).unwrap();
+        let first_id = first_session.id;
+        let first_agent = build_agent(&root, &config, false, first_session).unwrap();
+        let first = test_conversation(first_agent);
+        let state = test_state(config.clone(), root.clone(), first, false);
+
+        let second_session = store.create("mock-model".into()).unwrap();
+        let second_id = second_session.id;
+        let second_agent = build_agent(&root, &config, false, second_session).unwrap();
+        state.inner.conversations.install(second_agent).unwrap();
+
+        let first_response = chat(
+            State(state.clone()),
+            Json(ChatRequest {
+                session_id: Some(first_id),
+                prompt: "First".into(),
+                continuation: false,
+            }),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let second_response = chat(
+            State(state),
+            Json(ChatRequest {
+                session_id: Some(second_id),
+                prompt: "Second".into(),
+                continuation: false,
+            }),
+        )
+        .await
+        .ok()
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("both provider requests must reach the barrier concurrently");
+        let (first_body, second_body) = tokio::join!(
+            axum::body::to_bytes(first_response.into_body(), 1_000_000),
+            axum::body::to_bytes(second_response.into_body(), 1_000_000),
+        );
+        let first_body = String::from_utf8(first_body.unwrap().to_vec()).unwrap();
+        let second_body = String::from_utf8(second_body.unwrap().to_vec()).unwrap();
+        assert!(first_body.contains(&first_id.to_string()));
+        assert!(second_body.contains(&second_id.to_string()));
+        assert!(first_body.contains("\"type\":\"done\""));
+        assert!(second_body.contains("\"type\":\"done\""));
+        provider_server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn completion_api_uses_shared_commands_skills_and_files() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -1624,25 +1742,12 @@ mod tests {
             )
             .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
-        let state = ServerState {
-            inner: Arc::new(ServerInner {
-                config: RwLock::new(config),
-                registry: SessionRegistry::at(root.join("test-global-config.toml")),
-                debug_openai: false,
-                models: RwLock::new(Vec::new()),
-                catalog_error: RwLock::new(None),
-                oauth_logged_in: false,
-                workspace_transition: Mutex::new(()),
-                workspace: Mutex::new(ServerWorkspace {
-                    root: root.clone(),
-                    conversation: Some(test_conversation(agent)),
-                }),
-            }),
-        };
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
 
         let slash = completions(
             State(state.clone()),
             Json(CompletionRequest {
+                session_id: None,
                 before_cursor: "/".into(),
                 after_cursor: String::new(),
             }),
@@ -1666,6 +1771,7 @@ mod tests {
         let files = completions(
             State(state),
             Json(CompletionRequest {
+                session_id: None,
                 before_cursor: "@".into(),
                 after_cursor: String::new(),
             }),
@@ -1712,21 +1818,13 @@ mod tests {
         let registry = SessionRegistry::at(temp.path().join("test-global-config.toml"));
         registry.register(&other_root).unwrap();
         let agent = build_agent(&current_root, &config, false, current).unwrap();
-        let state = ServerState {
-            inner: Arc::new(ServerInner {
-                config: RwLock::new(config),
-                registry,
-                debug_openai: false,
-                models: RwLock::new(Vec::new()),
-                catalog_error: RwLock::new(None),
-                oauth_logged_in: false,
-                workspace_transition: Mutex::new(()),
-                workspace: Mutex::new(ServerWorkspace {
-                    root: current_root.clone(),
-                    conversation: Some(test_conversation(agent)),
-                }),
-            }),
-        };
+        let state = test_state_with_registry(
+            config,
+            current_root.clone(),
+            test_conversation(agent),
+            false,
+            registry,
+        );
 
         let response = resume_session(
             State(state.clone()),
@@ -1751,6 +1849,7 @@ mod tests {
         let files = completions(
             State(state),
             Json(CompletionRequest {
+                session_id: None,
                 before_cursor: "@".into(),
                 after_cursor: String::new(),
             }),
@@ -1794,21 +1893,7 @@ mod tests {
         let active_id = active.id;
         store.save(&active).unwrap();
         let agent = build_agent(&root, &config, false, active).unwrap();
-        let state = ServerState {
-            inner: Arc::new(ServerInner {
-                config: RwLock::new(config),
-                registry: SessionRegistry::at(root.join("test-global-config.toml")),
-                debug_openai: false,
-                models: RwLock::new(Vec::new()),
-                catalog_error: RwLock::new(None),
-                oauth_logged_in: false,
-                workspace_transition: Mutex::new(()),
-                workspace: Mutex::new(ServerWorkspace {
-                    root: root.clone(),
-                    conversation: Some(test_conversation(agent)),
-                }),
-            }),
-        };
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
 
         let response = delete_session(
             State(state.clone()),

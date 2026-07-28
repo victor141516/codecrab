@@ -1,12 +1,14 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -40,6 +42,32 @@ pub(crate) struct ConversationTurn {
     pub snapshot: ConversationSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConversationLifecycle {
+    Idle,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl ConversationLifecycle {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Running,
+            2 => Self::Stopping,
+            3 => Self::Stopped,
+            _ => Self::Failed,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConversationHandle {
     commands: mpsc::UnboundedSender<ConversationCommand>,
@@ -48,6 +76,7 @@ pub(crate) struct ConversationHandle {
     command_gate: Arc<Mutex<()>>,
     accepting_commands: Arc<AtomicBool>,
     turn_reserved: Arc<AtomicBool>,
+    lifecycle: Arc<AtomicU8>,
 }
 
 enum ConversationCommand {
@@ -104,6 +133,7 @@ impl ConversationHandle {
         let command_gate = Arc::new(Mutex::new(()));
         let accepting_commands = Arc::new(AtomicBool::new(true));
         let turn_reserved = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU8::new(ConversationLifecycle::Idle.as_u8()));
         spawn_worker(run_worker(
             agent,
             registry,
@@ -111,6 +141,7 @@ impl ConversationHandle {
             snapshot_tx,
             active_cancellation.clone(),
             turn_reserved.clone(),
+            lifecycle.clone(),
         ))?;
         Ok(Self {
             commands,
@@ -119,6 +150,7 @@ impl ConversationHandle {
             command_gate,
             accepting_commands,
             turn_reserved,
+            lifecycle,
         })
     }
 
@@ -128,6 +160,10 @@ impl ConversationHandle {
 
     pub(crate) fn is_running(&self) -> bool {
         self.turn_reserved.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn lifecycle(&self) -> ConversationLifecycle {
+        ConversationLifecycle::from_u8(self.lifecycle.load(Ordering::Acquire))
     }
 
     pub(crate) fn cancel(&self) -> bool {
@@ -176,6 +212,8 @@ impl ConversationHandle {
             .active_cancellation
             .lock()
             .expect("conversation cancellation mutex poisoned") = Some(cancel_tx);
+        self.lifecycle
+            .store(ConversationLifecycle::Running.as_u8(), Ordering::Release);
         let (reply, response) = oneshot::channel();
         if let Err(error) = self.send_unchecked(ConversationCommand::Turn {
             prompt,
@@ -189,6 +227,8 @@ impl ConversationHandle {
                 .lock()
                 .expect("conversation cancellation mutex poisoned") = None;
             self.turn_reserved.store(false, Ordering::Release);
+            self.lifecycle
+                .store(ConversationLifecycle::Idle.as_u8(), Ordering::Release);
             return Err(error);
         }
         Ok(tokio::spawn(async move {
@@ -295,9 +335,13 @@ impl ConversationHandle {
                 anyhow::bail!("wait for the active turn before shutting down the conversation");
             }
             self.accepting_commands.store(false, Ordering::Release);
+            self.lifecycle
+                .store(ConversationLifecycle::Stopping.as_u8(), Ordering::Release);
             let (reply, response) = oneshot::channel();
             if let Err(error) = self.send_unchecked(ConversationCommand::Shutdown { reply }) {
                 self.accepting_commands.store(true, Ordering::Release);
+                self.lifecycle
+                    .store(ConversationLifecycle::Idle.as_u8(), Ordering::Release);
                 return Err(error);
             }
             response
@@ -359,7 +403,9 @@ async fn run_worker(
     snapshots: watch::Sender<ConversationSnapshot>,
     active_cancellation: Arc<Mutex<Option<watch::Sender<bool>>>>,
     turn_reserved: Arc<AtomicBool>,
+    lifecycle: Arc<AtomicU8>,
 ) {
+    let mut explicitly_stopped = false;
     while let Some(command) = commands.recv().await {
         let stop = match command {
             ConversationCommand::Turn {
@@ -392,6 +438,7 @@ async fn run_worker(
                     ))),
                 };
                 turn_reserved.store(false, Ordering::Release);
+                lifecycle.store(ConversationLifecycle::Idle.as_u8(), Ordering::Release);
                 let _ = reply.send(ConversationTurn {
                     result,
                     snapshot: current,
@@ -447,12 +494,147 @@ async fn run_worker(
             }
             ConversationCommand::Shutdown { reply } => {
                 reply_snapshot(&agent, &registry, &snapshots, reply);
+                explicitly_stopped = true;
                 true
             }
         };
         if stop {
             break;
         }
+    }
+    lifecycle.store(
+        if explicitly_stopped {
+            ConversationLifecycle::Stopped.as_u8()
+        } else {
+            ConversationLifecycle::Failed.as_u8()
+        },
+        Ordering::Release,
+    );
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct ConversationStatus {
+    pub id: Uuid,
+    pub project_root: PathBuf,
+    pub lifecycle: ConversationLifecycle,
+}
+
+#[derive(Clone)]
+pub(crate) struct ConversationManager {
+    conversations: Arc<RwLock<HashMap<Uuid, ConversationHandle>>>,
+    registry: SessionRegistry,
+}
+
+impl ConversationManager {
+    pub(crate) fn new(registry: SessionRegistry) -> Self {
+        Self {
+            conversations: Arc::new(RwLock::new(HashMap::new())),
+            registry,
+        }
+    }
+
+    pub(crate) fn with_handle(registry: SessionRegistry, handle: ConversationHandle) -> Self {
+        let manager = Self::new(registry);
+        let id = handle.snapshot().session.id;
+        manager
+            .conversations
+            .write()
+            .expect("conversation manager lock poisoned")
+            .insert(id, handle);
+        manager
+    }
+
+    pub(crate) fn install(&self, agent: Agent) -> Result<ConversationHandle> {
+        let id = agent.session().id;
+        let mut conversations = self
+            .conversations
+            .write()
+            .expect("conversation manager lock poisoned");
+        if let Some(existing) = conversations.get(&id) {
+            return Ok(existing.clone());
+        }
+        let handle = ConversationHandle::spawn(agent, self.registry.clone())?;
+        conversations.insert(id, handle.clone());
+        Ok(handle)
+    }
+
+    pub(crate) fn get(&self, id: Uuid) -> Option<ConversationHandle> {
+        self.conversations
+            .read()
+            .expect("conversation manager lock poisoned")
+            .get(&id)
+            .cloned()
+    }
+
+    pub(crate) fn statuses(&self) -> Vec<ConversationStatus> {
+        self.conversations
+            .read()
+            .expect("conversation manager lock poisoned")
+            .iter()
+            .map(|(id, handle)| {
+                let snapshot = handle.snapshot();
+                ConversationStatus {
+                    id: *id,
+                    project_root: snapshot.project_root,
+                    lifecycle: handle.lifecycle(),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn take_if_idle(&self, id: Uuid) -> Result<Option<ConversationHandle>> {
+        let mut conversations = self
+            .conversations
+            .write()
+            .expect("conversation manager lock poisoned");
+        let Some(handle) = conversations.get(&id) else {
+            return Ok(None);
+        };
+        if handle.is_running() {
+            anyhow::bail!("wait for the active turn before deleting its session");
+        }
+        Ok(conversations.remove(&id))
+    }
+
+    pub(crate) fn cancel(&self, id: Uuid) -> bool {
+        self.get(id).is_some_and(|handle| handle.cancel())
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        for handle in self
+            .conversations
+            .read()
+            .expect("conversation manager lock poisoned")
+            .values()
+        {
+            handle.cancel();
+        }
+    }
+
+    pub(crate) async fn shutdown_all(&self) -> Result<Vec<ConversationSnapshot>> {
+        let handles = {
+            let mut conversations = self
+                .conversations
+                .write()
+                .expect("conversation manager lock poisoned");
+            conversations
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        let mut snapshots = Vec::with_capacity(handles.len());
+        let mut first_error = None;
+        for handle in handles {
+            match handle.shutdown().await {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(snapshots)
     }
 }
 
@@ -644,5 +826,35 @@ mod tests {
 
         assert!(handle.cancel());
         assert!(*cancel_rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn manager_routes_cancellation_to_exactly_one_session() {
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let first = test_handle(first_root.path());
+        let second = test_handle(second_root.path());
+        let first_id = first.snapshot().session.id;
+        let second_id = second.snapshot().session.id;
+        let registry = SessionRegistry::at(first_root.path().join("manager-global-config.toml"));
+        let manager = ConversationManager::with_handle(registry, first.clone());
+        manager
+            .conversations
+            .write()
+            .unwrap()
+            .insert(second_id, second.clone());
+        let (first_cancel, mut first_rx) = watch::channel(false);
+        let (second_cancel, mut second_rx) = watch::channel(false);
+        *first.active_cancellation.lock().unwrap() = Some(first_cancel);
+        *second.active_cancellation.lock().unwrap() = Some(second_cancel);
+
+        assert!(manager.cancel(first_id));
+        assert!(*first_rx.borrow_and_update());
+        assert!(!*second_rx.borrow_and_update());
+        assert_eq!(manager.statuses().len(), 2);
+
+        *first.active_cancellation.lock().unwrap() = None;
+        *second.active_cancellation.lock().unwrap() = None;
+        manager.shutdown_all().await.unwrap();
     }
 }

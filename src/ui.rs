@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -43,7 +44,10 @@ use crate::{
         Config, ConfigStore, ProviderConfig, SessionRegistry, normalized_root, paths_equal,
         validate_provider_name,
     },
-    conversation::{ConversationHandle, ConversationSnapshot, ConversationTurn},
+    conversation::{
+        ConversationHandle, ConversationLifecycle, ConversationManager, ConversationSnapshot,
+        ConversationTurn,
+    },
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role},
     session::{Goal, GoalStatus, SessionProject, SessionStore, list_session_projects},
@@ -631,6 +635,7 @@ impl SessionPicker {
 }
 
 struct App {
+    conversations: ConversationManager,
     conversation: ConversationHandle,
     transcript: Vec<Message>,
     live_messages: Vec<Message>,
@@ -682,6 +687,17 @@ struct App {
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
     skills: Vec<SkillView>,
+    background_turns: HashMap<Uuid, BackgroundTurn>,
+    model_catalogs: HashMap<Uuid, Vec<ModelCatalogEntry>>,
+}
+
+struct BackgroundTurn {
+    running: JoinHandle<Result<ConversationTurn>>,
+    event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    pending_user: Option<String>,
+    queued_prompt: Option<String>,
+    pending_goal_action: Option<PendingGoalAction>,
+    live_messages: Vec<Message>,
 }
 
 impl App {
@@ -715,7 +731,12 @@ impl App {
             .as_ref()
             .map(|error| format!("Could not load the model catalog: {error}"));
         let conversation = ConversationHandle::spawn(agent, registry.clone())?;
+        let session_id = conversation.snapshot().session.id;
+        let conversations =
+            ConversationManager::with_handle(registry.clone(), conversation.clone());
+        let model_catalogs = HashMap::from([(session_id, model_catalog.clone())]);
         Ok(Self {
+            conversations,
             conversation,
             transcript,
             live_messages: Vec::new(),
@@ -767,6 +788,8 @@ impl App {
             reasoning_effort,
             service_tier,
             skills,
+            background_turns: HashMap::new(),
+            model_catalogs,
         })
     }
 
@@ -1265,7 +1288,7 @@ impl App {
     }
 
     async fn save_active_session(&self) -> Result<()> {
-        self.conversation.persist().await?;
+        self.conversation.persist_if_idle().await?;
         Ok(())
     }
 
@@ -1549,23 +1572,82 @@ impl App {
             let project = &picker.projects[project_index].project;
             (project.root.clone(), project.sessions[session_index].id)
         };
-        let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
-        let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
-        provider.set_debug_openai(self.debug_openai);
-        let agent = Agent::new(
-            provider,
-            ToolBox::new(root.clone()),
-            SkillRegistry::discover(&root),
-            session,
-        )?;
-        self.conversation.shutdown().await?;
-        self.conversation = ConversationHandle::spawn(agent, self.registry.clone())?;
+        self.park_current_turn();
+        let mut catalog_error = None;
+        self.model_catalogs.insert(
+            self.conversation.snapshot().session.id,
+            self.model_catalog.clone(),
+        );
+        self.conversation = if let Some(existing) = self.conversations.get(id) {
+            existing
+        } else {
+            let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
+            let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
+            provider.set_debug_openai(self.debug_openai);
+            let mut agent = Agent::new(
+                provider,
+                ToolBox::new(root.clone()),
+                SkillRegistry::discover(&root),
+                session,
+            )?;
+            let catalog = match agent.fetch_models().await {
+                Ok(catalog) => {
+                    agent.resolve_auto_model(&catalog);
+                    catalog
+                }
+                Err(error) => {
+                    catalog_error = Some(format!("Could not load the model catalog: {error:#}"));
+                    Vec::new()
+                }
+            };
+            self.model_catalogs.insert(id, catalog);
+            self.conversations.install(agent)?
+        };
+        self.model_catalog = self.model_catalogs.get(&id).cloned().unwrap_or_default();
         self.sync_active_session();
+        self.restore_turn_state(id);
+        if catalog_error.is_some() {
+            self.error = catalog_error;
+        }
         self.session_picker = None;
-        if self.active_goal_id().is_some() {
+        if !self.is_running() && self.active_goal_id().is_some() {
             self.start_goal_continuation()?;
         }
         Ok(())
+    }
+
+    fn park_current_turn(&mut self) {
+        let Some(running) = self.running.take() else {
+            return;
+        };
+        let event_rx = self
+            .event_rx
+            .take()
+            .expect("a running terminal turn has an event stream");
+        let id = self.conversation.snapshot().session.id;
+        self.background_turns.insert(
+            id,
+            BackgroundTurn {
+                running,
+                event_rx,
+                pending_user: self.pending_user.take(),
+                queued_prompt: self.queued_prompt.take(),
+                pending_goal_action: self.pending_goal_action.take(),
+                live_messages: std::mem::take(&mut self.live_messages),
+            },
+        );
+    }
+
+    fn restore_turn_state(&mut self, id: Uuid) {
+        let Some(background) = self.background_turns.remove(&id) else {
+            return;
+        };
+        self.running = Some(background.running);
+        self.event_rx = Some(background.event_rx);
+        self.pending_user = background.pending_user;
+        self.queued_prompt = background.queued_prompt;
+        self.pending_goal_action = background.pending_goal_action;
+        self.live_messages = background.live_messages;
     }
 
     async fn delete_session_selection(&mut self) -> Result<()> {
@@ -1586,9 +1668,11 @@ impl App {
         let active_snapshot = self.conversation.snapshot();
         let deleting_active =
             id == active_snapshot.session.id && paths_equal(&root, &active_snapshot.project_root);
-        if deleting_active {
-            self.conversation.shutdown().await?;
+        if let Some(conversation) = self.conversations.take_if_idle(id)? {
+            conversation.shutdown().await?;
         }
+        self.background_turns.remove(&id);
+        self.model_catalogs.remove(&id);
         store.delete(&id.to_string())?;
 
         if deleting_active {
@@ -1604,7 +1688,11 @@ impl App {
                 SkillRegistry::discover(&root),
                 session,
             )?;
-            self.conversation = ConversationHandle::spawn(agent, self.registry.clone())?;
+            self.conversation = self.conversations.install(agent)?;
+            self.model_catalogs.insert(
+                self.conversation.snapshot().session.id,
+                self.model_catalog.clone(),
+            );
             self.sync_active_session();
         }
 
@@ -2542,8 +2630,18 @@ async fn run_tui(
         }
     }
 
-    let snapshot = app.conversation.shutdown().await?;
-    Ok(snapshot.session.id.to_string())
+    let session_id = app.conversation.snapshot().session.id;
+    app.conversations.cancel_all();
+    while app
+        .conversations
+        .statuses()
+        .iter()
+        .any(|status| status.lifecycle == ConversationLifecycle::Running)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    app.conversations.shutdown_all().await?;
+    Ok(session_id.to_string())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -3680,6 +3778,19 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         &picker.projects[project_index].project.root,
                         &app.project_root,
                     );
+                let lifecycle = app
+                    .conversations
+                    .statuses()
+                    .into_iter()
+                    .find(|status| status.id == session.id)
+                    .map(|status| status.lifecycle);
+                let status = match lifecycle {
+                    Some(ConversationLifecycle::Running) => "running",
+                    Some(ConversationLifecycle::Failed) => "error",
+                    Some(ConversationLifecycle::Stopping) => "stopping",
+                    Some(ConversationLifecycle::Idle) => "idle",
+                    _ => "",
+                };
                 Line::from(vec![
                     Span::styled(
                         if selected { " ›     " } else { "       " },
@@ -3694,8 +3805,9 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ),
                     Span::styled(
                         format!(
-                            " {:<18}  {}  {}",
+                            " {:<18}  {:<8}  {}  {}",
                             compact_text(&session.model, 17),
+                            status,
                             &session.id.to_string()[..8],
                             session.updated_at.format("%Y-%m-%d %H:%M")
                         ),

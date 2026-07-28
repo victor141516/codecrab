@@ -113,19 +113,18 @@ The main flow is:
 TUI / run / web API
         |
         v
- ConversationHandle ----> persistent Tokio conversation worker
-                                   |
-                                   v
-                                 Agent ----> provider
-                                   |
-                                   +----> ToolBox
-                                   +----> SkillRegistry
-                                   +----> SessionStore
+ ConversationManager
+        |
+        +----> Session A ----> ConversationHandle ----> worker ----> Agent A
+        +----> Session B ----> ConversationHandle ----> worker ----> Agent B
+        +----> Session C ----> ConversationHandle ----> worker ----> Agent C
 ```
 
-The conversation worker exclusively owns its `Agent`, serializes typed commands
-and persistence, emits authoritative snapshots/events, and exposes out-of-band
-turn cancellation. Presentation code must never retain or lock an `Agent`.
+Each conversation worker exclusively owns its `Agent`, serializes typed
+commands and persistence, emits authoritative snapshots/events, and exposes
+out-of-band turn cancellation. `ConversationManager` prevents duplicate
+workers for a session and keeps them alive across navigation. Presentation code
+must never retain or lock an `Agent`.
 `Agent` owns conversation behavior; UI code collects input and renders state,
 while API code translates HTTP requests and responses. Persist model, reasoning
 effort, and service tier in the active session so a selection applies to the
@@ -369,6 +368,12 @@ real credentials, network access, or a user's saved sessions.
   not in duplicated TUI and web implementations.
 - Preserve unrelated working-tree changes. Inspect the diff before editing and
   again before handing off.
+- GitHub issue #6 (`https://github.com/victor141516/codecrab/issues/6`) is the
+  permanent umbrella for deferred small UX improvements and must remain open.
+  When someone requests or mentions a small UX change but does not want it
+  implemented now, ask for confirmation before adding it as a sub-issue of #6;
+  never add it there without that confirmation. Keep bugs, substantial features,
+  and architectural/design work as standalone issues instead.
 - Prefer focused, direct implementations. Because compatibility is not
   required, remove superseded code, stale fields, dead events, and misleading
   documentation in the same change.

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import {
   ArrowUp,
   Check,
@@ -32,9 +32,6 @@ import { sortChronologically } from "./timeline.js";
 const state = ref(null);
 const draft = ref("");
 const loading = ref(true);
-const sending = ref(false);
-const cancelling = ref(false);
-const queuedPrompt = ref("");
 const recording = ref(false);
 const transcribing = ref(false);
 const error = ref("");
@@ -73,9 +70,50 @@ let audioAnalyser = null;
 let waveformFrame = null;
 let waveformData = null;
 let lastEscapeAt = 0;
-let pendingGoalAction = null;
+const sessionStates = new Map();
+const sessionRuntimes = new Map();
 
 const session = computed(() => state.value?.session ?? null);
+function runtimeFor(id) {
+  if (!id) {
+    return {
+      sending: false,
+      cancelling: false,
+      queuedPrompt: "",
+      pendingGoalAction: null,
+      error: ""
+    };
+  }
+  if (!sessionRuntimes.has(id)) {
+    sessionRuntimes.set(id, reactive({
+      sending: false,
+      cancelling: false,
+      queuedPrompt: "",
+      pendingGoalAction: null,
+      error: ""
+    }));
+  }
+  return sessionRuntimes.get(id);
+}
+const selectedRuntime = computed(() => runtimeFor(session.value?.id));
+const sending = computed({
+  get: () => selectedRuntime.value.sending,
+  set: (value) => {
+    selectedRuntime.value.sending = value;
+  }
+});
+const cancelling = computed({
+  get: () => selectedRuntime.value.cancelling,
+  set: (value) => {
+    selectedRuntime.value.cancelling = value;
+  }
+});
+const queuedPrompt = computed({
+  get: () => selectedRuntime.value.queuedPrompt,
+  set: (value) => {
+    selectedRuntime.value.queuedPrompt = value;
+  }
+});
 const projects = computed(() => state.value?.projects ?? []);
 const selectedProject = computed(
   () =>
@@ -376,6 +414,7 @@ async function loadState({ resumeGoal = false } = {}) {
     }
     if (
       resumeGoal &&
+      !runtimeFor(nextState.session?.id).sending &&
       nextState.session?.goals?.some((goal) => goal.status === "active")
     ) {
       window.queueMicrotask(() => runPrompt("", { continuation: true }));
@@ -436,13 +475,17 @@ async function resumeSession(project, id) {
       historyMode: "push"
     }
   );
-  if (nextState?.session?.goals?.some((goal) => goal.status === "active")) {
+  if (
+    !runtimeFor(nextState?.session?.id).sending &&
+    nextState?.session?.goals?.some((goal) => goal.status === "active")
+  ) {
     void runPrompt("", { continuation: true });
   }
+  if (runtimeFor(id).error) error.value = runtimeFor(id).error;
 }
 
 async function deleteSession(project, id) {
-  if (sending.value) return;
+  if (runtimeFor(id).sending) return;
   const deletingActive =
     project === state.value?.project && id === session.value?.id;
   error.value = "";
@@ -451,6 +494,8 @@ async function deleteSession(project, id) {
       method: "POST",
       body: JSON.stringify({ project, id })
     });
+    sessionStates.delete(id);
+    sessionRuntimes.delete(id);
     applyServerState(nextState, {
       selectActiveProject: deletingActive
     });
@@ -472,10 +517,36 @@ function applyServerState(nextState, { selectActiveProject = false } = {}) {
   if (nextState.session?.id !== session.value?.id) {
     autoScroll.value = true;
   }
-  state.value = nextState;
+  const id = nextState.session?.id;
+  const cached = id ? sessionStates.get(id) : null;
+  const effective =
+    id && runtimeFor(id).sending && cached
+      ? { ...nextState, session: cached.session }
+      : nextState;
+  state.value = effective;
+  if (id) sessionStates.set(id, effective);
   if (selectActiveProject || !selectedProjectRoot.value) {
-    selectedProjectRoot.value = nextState.project;
+    selectedProjectRoot.value = effective.project;
     sidebarView.value = "sessions";
+  }
+}
+
+function targetState(sessionId) {
+  if (session.value?.id === sessionId) return state.value;
+  return sessionStates.get(sessionId) ?? null;
+}
+
+function setTargetState(sessionId, nextState) {
+  sessionStates.set(sessionId, nextState);
+  if (session.value?.id === sessionId) {
+    state.value = nextState;
+  } else if (state.value) {
+    state.value = {
+      ...state.value,
+      projects: nextState.projects ?? state.value.projects,
+      workers: nextState.workers ?? state.value.workers,
+      providers: nextState.providers ?? state.value.providers
+    };
   }
 }
 
@@ -511,7 +582,9 @@ async function handleHistoryNavigation() {
     });
     applyServerState(nextState, { selectActiveProject: true });
     await scrollToBottom();
-    if (activeGoal.value) void runPrompt("", { continuation: true });
+    if (!sending.value && activeGoal.value) {
+      void runPrompt("", { continuation: true });
+    }
   } catch (cause) {
     error.value = cause.message;
   }
@@ -526,34 +599,57 @@ function isCurrentSession(project, item) {
   return project.root === state.value?.project && item.id === session.value?.id;
 }
 
+function workerLifecycle(id) {
+  if (runtimeFor(id).error) return "failed";
+  if (runtimeFor(id).sending) return "running";
+  return state.value?.workers?.find((worker) => worker.id === id)?.lifecycle ?? "";
+}
+
 async function clearSession() {
-  await runAction(() => api("/api/session/clear", { method: "POST", body: "{}" }));
+  const sessionId = session.value?.id;
+  if (!sessionId) return;
+  error.value = "";
+  try {
+    const nextState = await api("/api/session/clear", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId })
+    });
+    if (session.value?.id === sessionId) applyServerState(nextState);
+    else setTargetState(sessionId, nextState);
+  } catch (cause) {
+    error.value = cause.message;
+  }
 }
 
 function applyGoalState(nextState) {
   applyServerState(nextState);
 }
 
-async function goalRequest(path, { method = "POST", id, objective } = {}) {
+async function goalRequest(
+  path,
+  { method = "POST", sessionId = session.value?.id, id, objective } = {}
+) {
   const nextState = await api(`/api/goals/${path}`, {
     method,
-    body: JSON.stringify({ id, objective })
+    body: JSON.stringify({ session_id: sessionId, id, objective })
   });
-  applyGoalState(nextState);
+  if (session.value?.id === sessionId) applyGoalState(nextState);
+  else setTargetState(sessionId, nextState);
   return nextState;
 }
 
 async function afterCurrentTurn(action) {
+  const sessionId = session.value?.id;
   const guarded = async () => {
     error.value = "";
     try {
-      await action();
+      await action(sessionId);
     } catch (cause) {
       error.value = cause.message;
     }
   };
   if (sending.value) {
-    pendingGoalAction = guarded;
+    selectedRuntime.value.pendingGoalAction = guarded;
     await cancelTurn({ pauseGoal: false });
     return;
   }
@@ -561,27 +657,27 @@ async function afterCurrentTurn(action) {
 }
 
 async function createGoal(objective) {
-  await afterCurrentTurn(async () => {
-    await goalRequest("create", { objective });
-    void runPrompt(objective);
+  await afterCurrentTurn(async (sessionId) => {
+    await goalRequest("create", { sessionId, objective });
+    void runPrompt(objective, { sessionId });
   });
 }
 
 async function toggleGoal(goal) {
-  await afterCurrentTurn(async () => {
+  await afterCurrentTurn(async (sessionId) => {
     if (goal.status === "active") {
-      await goalRequest("pause", { id: goal.id });
+      await goalRequest("pause", { sessionId, id: goal.id });
     } else {
-      await goalRequest("activate", { id: goal.id });
+      await goalRequest("activate", { sessionId, id: goal.id });
       goalsOpen.value = false;
-      void runPrompt("", { continuation: true });
+      void runPrompt("", { continuation: true, sessionId });
     }
   });
 }
 
 async function deleteGoal(goal) {
-  await afterCurrentTurn(async () => {
-    await goalRequest("delete", { id: goal.id });
+  await afterCurrentTurn(async (sessionId) => {
+    await goalRequest("delete", { sessionId, id: goal.id });
     if (describedGoal.value?.id === goal.id) describedGoal.value = null;
     if (editingGoal.value?.id === goal.id) editingGoal.value = null;
   });
@@ -589,9 +685,9 @@ async function deleteGoal(goal) {
 
 async function beginGoalEdit(goal) {
   const resume = goal.status === "active";
-  await afterCurrentTurn(async () => {
-    if (resume) await goalRequest("pause", { id: goal.id });
-    editingGoal.value = { ...goal };
+  await afterCurrentTurn(async (sessionId) => {
+    if (resume) await goalRequest("pause", { sessionId, id: goal.id });
+    editingGoal.value = { ...goal, sessionId };
     goalDraft.value = goal.objective;
     editingGoalResume.value = resume;
   });
@@ -602,8 +698,10 @@ async function saveGoalEdit() {
   const objective = goalDraft.value.trim();
   if (!goal || !objective) return;
   try {
+    const sessionId = goal.sessionId ?? session.value?.id;
     await goalRequest("edit", {
       method: "PUT",
+      sessionId,
       id: goal.id,
       objective
     });
@@ -611,8 +709,8 @@ async function saveGoalEdit() {
     editingGoal.value = null;
     editingGoalResume.value = false;
     if (resume) {
-      await goalRequest("activate", { id: goal.id });
-      void runPrompt("", { continuation: true });
+      await goalRequest("activate", { sessionId, id: goal.id });
+      void runPrompt("", { continuation: true, sessionId });
     }
   } catch (cause) {
     error.value = cause.message;
@@ -626,8 +724,9 @@ async function cancelGoalEdit() {
   editingGoalResume.value = false;
   if (goal && resume) {
     try {
-      await goalRequest("activate", { id: goal.id });
-      void runPrompt("", { continuation: true });
+      const sessionId = goal.sessionId ?? session.value?.id;
+      await goalRequest("activate", { sessionId, id: goal.id });
+      void runPrompt("", { continuation: true, sessionId });
     } catch (cause) {
       error.value = cause.message;
     }
@@ -769,7 +868,10 @@ async function transcribeRecording() {
   try {
     const response = await fetch("/api/transcribe", {
       method: "POST",
-      headers: { "Content-Type": contentType },
+      headers: {
+        "Content-Type": contentType,
+        "X-CodeCrab-Session": session.value?.id ?? ""
+      },
       body: blob
     });
     const body = await response.json().catch(() => ({}));
@@ -838,22 +940,30 @@ async function toggleDictation() {
 
 async function updateModel(patch) {
   if (!session.value) return;
-  await runAction(() =>
-    api("/api/model", {
+  const sessionId = session.value.id;
+  const currentSession = session.value;
+  error.value = "";
+  try {
+    const nextState = await api("/api/model", {
       method: "PUT",
       body: JSON.stringify({
-        model: patch.model ?? session.value.model,
+        session_id: sessionId,
+        model: patch.model ?? currentSession.model,
         reasoning_effort:
           patch.reasoning_effort === undefined
-            ? session.value.reasoning_effort
+            ? currentSession.reasoning_effort
             : patch.reasoning_effort,
         service_tier:
           patch.service_tier === undefined
-            ? session.value.service_tier
+            ? currentSession.service_tier
             : patch.service_tier
       })
-    })
-  );
+    });
+    if (session.value?.id === sessionId) applyServerState(nextState);
+    else setTargetState(sessionId, nextState);
+  } catch (cause) {
+    error.value = cause.message;
+  }
 }
 
 async function chooseModel(event) {
@@ -868,8 +978,18 @@ async function chooseModel(event) {
   });
 }
 
-function applyActivity(activity) {
-  const current = session.value?.activities ?? [];
+function updateTargetSession(sessionId, update) {
+  const currentState = targetState(sessionId);
+  if (!currentState?.session) return;
+  setTargetState(sessionId, {
+    ...currentState,
+    session: update(currentState.session)
+  });
+}
+
+function applyActivity(sessionId, activity) {
+  const target = targetState(sessionId)?.session;
+  const current = target?.activities ?? [];
   const index = current.findIndex((item) => item.id === activity.id);
   const activities =
     index === -1
@@ -877,27 +997,21 @@ function applyActivity(activity) {
       : current.map((item, itemIndex) =>
           itemIndex === index ? activity : item
         );
-  state.value = {
-    ...state.value,
-    session: {
-      ...session.value,
+  updateTargetSession(sessionId, (targetSession) => ({
+      ...targetSession,
       activities
-    }
-  };
+  }));
 }
 
-function applyAssistantMessage(message) {
-  state.value = {
-    ...state.value,
-    session: {
-      ...session.value,
-      messages: [...(session.value?.messages ?? []), message]
-    }
-  };
+function applyAssistantMessage(sessionId, message) {
+  updateTargetSession(sessionId, (targetSession) => ({
+    ...targetSession,
+    messages: [...(targetSession.messages ?? []), message]
+  }));
 }
 
-function applyAssistantTextDelta(delta, start, sequence, createdAt) {
-  const messages = [...(session.value?.messages ?? [])];
+function applyAssistantTextDelta(sessionId, delta, start, sequence, createdAt) {
+  const messages = [...(targetState(sessionId)?.session?.messages ?? [])];
   if (start || messages.at(-1)?.role !== "assistant") {
     messages.push({
       role: "assistant",
@@ -913,83 +1027,75 @@ function applyAssistantTextDelta(delta, start, sequence, createdAt) {
       content: (last.content ?? "") + delta
     };
   }
-  state.value = {
-    ...state.value,
-    session: {
-      ...session.value,
-      messages
-    }
-  };
+  updateTargetSession(sessionId, (targetSession) => ({
+    ...targetSession,
+    messages
+  }));
 }
 
-function applyAssistantStreamReset() {
-  const messages = [...(session.value?.messages ?? [])];
+function applyAssistantStreamReset(sessionId) {
+  const messages = [...(targetState(sessionId)?.session?.messages ?? [])];
   if (messages.at(-1)?.role === "assistant") {
     messages.pop();
   }
-  state.value = {
-    ...state.value,
-    session: {
-      ...session.value,
-      messages
-    }
-  };
+  updateTargetSession(sessionId, (targetSession) => ({
+    ...targetSession,
+    messages
+  }));
 }
 
-function applyAssistantMessageCompleted(message) {
-  const messages = [...(session.value?.messages ?? [])];
+function applyAssistantMessageCompleted(sessionId, message) {
+  const messages = [...(targetState(sessionId)?.session?.messages ?? [])];
   const index = messages.findLastIndex((item) => item.role === "assistant");
   if (index === -1) messages.push(message);
   else messages[index] = message;
-  state.value = {
-    ...state.value,
-    session: {
-      ...session.value,
-      messages
-    }
-  };
+  updateTargetSession(sessionId, (targetSession) => ({
+    ...targetSession,
+    messages
+  }));
 }
 
-async function handleChatStreamEvent(event) {
+async function handleChatStreamEvent(sessionId, event) {
   if (event.type === "user_message") {
-    applyAssistantMessage(event.message);
-    await scrollToBottom();
+    applyAssistantMessage(sessionId, event.message);
+    if (session.value?.id === sessionId) await scrollToBottom();
     return false;
   }
   if (event.type === "assistant_message") {
-    applyAssistantMessage(event.message);
-    await scrollToBottom();
+    applyAssistantMessage(sessionId, event.message);
+    if (session.value?.id === sessionId) await scrollToBottom();
     return false;
   }
   if (event.type === "assistant_text_delta") {
     applyAssistantTextDelta(
+      sessionId,
       event.delta,
       event.start,
       event.sequence,
       event.created_at
     );
-    await scrollToBottom();
+    if (session.value?.id === sessionId) await scrollToBottom();
     return false;
   }
   if (event.type === "assistant_stream_reset") {
-    applyAssistantStreamReset();
+    applyAssistantStreamReset(sessionId);
     return false;
   }
   if (event.type === "assistant_message_completed") {
-    applyAssistantMessageCompleted(event.message);
+    applyAssistantMessageCompleted(sessionId, event.message);
     return false;
   }
   if (event.type === "activity") {
-    applyActivity(event.activity);
-    await scrollToBottom();
+    applyActivity(sessionId, event.activity);
+    if (session.value?.id === sessionId) await scrollToBottom();
     return false;
   }
   if (event.type === "done") {
-    state.value = event.state;
+    setTargetState(sessionId, event.state);
     return true;
   }
   if (event.type === "cancelled") {
-    state.value = event.state;
+    setTargetState(sessionId, event.state);
     return true;
   }
   if (event.type === "error") {
@@ -998,11 +1104,15 @@ async function handleChatStreamEvent(event) {
   return false;
 }
 
-async function streamChat(prompt, { continuation = false } = {}) {
+async function streamChat(
+  prompt,
+  { continuation = false, sessionId = session.value?.id } = {}
+) {
+  if (!sessionId) throw new Error("Create or resume a session first");
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, continuation })
+    body: JSON.stringify({ session_id: sessionId, prompt, continuation })
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -1023,14 +1133,15 @@ async function streamChat(prompt, { continuation = false } = {}) {
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       if (line.trim()) {
-        completed = (await handleChatStreamEvent(JSON.parse(line))) || completed;
+        completed =
+          (await handleChatStreamEvent(sessionId, JSON.parse(line))) || completed;
       }
     }
     if (done) break;
   }
   if (buffer.trim()) {
     completed =
-      (await handleChatStreamEvent(JSON.parse(buffer))) || completed;
+      (await handleChatStreamEvent(sessionId, JSON.parse(buffer))) || completed;
   }
   if (!completed) {
     throw new Error("The agent stream ended before returning its final state");
@@ -1075,59 +1186,80 @@ async function sendPrompt() {
   await runPrompt(prompt);
 }
 
-async function runPrompt(prompt, { continuation = false } = {}) {
-  closeAutocomplete();
-  sending.value = true;
-  cancelling.value = false;
-  error.value = "";
+function activeGoalFor(sessionId) {
+  return (
+    targetState(sessionId)?.session?.goals?.find(
+      (goal) => goal.status === "active"
+    ) ?? null
+  );
+}
 
-  await scrollToBottom();
+async function runPrompt(
+  prompt,
+  { continuation = false, sessionId = session.value?.id } = {}
+) {
+  if (!sessionId) return;
+  const runtime = runtimeFor(sessionId);
+  if (session.value?.id === sessionId) closeAutocomplete();
+  runtime.sending = true;
+  runtime.cancelling = false;
+  if (session.value?.id === sessionId) error.value = "";
+
+  if (session.value?.id === sessionId) await scrollToBottom();
 
   let completed = false;
   try {
-    await streamChat(prompt, { continuation });
+    await streamChat(prompt, { continuation, sessionId });
     completed = true;
+    runtime.error = "";
   } catch (cause) {
     const streamError = cause.message;
-    await loadState();
-    error.value = streamError;
+    runtime.error = streamError;
+    if (session.value?.id === sessionId) {
+      await loadState();
+      error.value = streamError;
+    }
   } finally {
-    sending.value = false;
-    cancelling.value = false;
-    await scrollToBottom();
-    const goalAction = pendingGoalAction;
-    pendingGoalAction = null;
+    runtime.sending = false;
+    runtime.cancelling = false;
+    if (session.value?.id === sessionId) await scrollToBottom();
+    const goalAction = runtime.pendingGoalAction;
+    runtime.pendingGoalAction = null;
     if (goalAction) {
       void goalAction();
       return;
     }
-    const nextPrompt = queuedPrompt.value;
-    queuedPrompt.value = "";
+    const nextPrompt = runtime.queuedPrompt;
+    runtime.queuedPrompt = "";
     if (nextPrompt) {
-      void runPrompt(nextPrompt);
-    } else if (completed && activeGoal.value) {
-      void runPrompt("", { continuation: true });
-    } else {
+      void runPrompt(nextPrompt, { sessionId });
+    } else if (completed && activeGoalFor(sessionId)) {
+      void runPrompt("", { continuation: true, sessionId });
+    } else if (session.value?.id === sessionId) {
       composer.value?.focus();
     }
   }
 }
 
 async function cancelTurn({ pauseGoal = true } = {}) {
-  if (!sending.value || cancelling.value) return;
-  if (pauseGoal && activeGoal.value && !pendingGoalAction) {
-    const id = activeGoal.value.id;
-    pendingGoalAction = () => goalRequest("pause", { id });
+  const sessionId = session.value?.id;
+  const runtime = runtimeFor(sessionId);
+  if (!sessionId || !runtime.sending || runtime.cancelling) return;
+  const goal = activeGoalFor(sessionId);
+  if (pauseGoal && goal && !runtime.pendingGoalAction) {
+    const id = goal.id;
+    runtime.pendingGoalAction = () =>
+      goalRequest("pause", { sessionId, id });
   }
-  cancelling.value = true;
+  runtime.cancelling = true;
   error.value = "";
   try {
     await api("/api/chat/cancel", {
       method: "POST",
-      body: "{}"
+      body: JSON.stringify({ session_id: sessionId })
     });
   } catch (cause) {
-    cancelling.value = false;
+    runtime.cancelling = false;
     error.value = `Could not stop the agent: ${cause.message}`;
   }
 }
@@ -1185,6 +1317,7 @@ async function refreshAutocomplete(element = composer.value) {
     const result = await api("/api/completions", {
       method: "POST",
       body: JSON.stringify({
+        session_id: session.value?.id,
         before_cursor: draft.value.slice(0, cursor),
         after_cursor: draft.value.slice(cursor)
       })
@@ -1691,13 +1824,24 @@ onBeforeUnmount(() => {
                 {{ item.title || "New session" }}
               </span>
               <span class="mt-1 flex items-center justify-between font-mono text-[9px] text-zinc-600">
-                <span>{{ shortId(item.id) }}</span>
+                <span class="flex items-center gap-1.5">
+                  <span
+                    v-if="workerLifecycle(item.id)"
+                    class="size-1.5 rounded-full"
+                    :class="{
+                      'animate-pulse bg-cyan-400': workerLifecycle(item.id) === 'running',
+                      'bg-red-400': workerLifecycle(item.id) === 'failed',
+                      'bg-zinc-600': workerLifecycle(item.id) === 'idle'
+                    }"
+                  ></span>
+                  <span>{{ workerLifecycle(item.id) || shortId(item.id) }}</span>
+                </span>
                 <span>{{ formatTime(item.updated_at) }}</span>
               </span>
             </button>
             <button
               class="mr-1 grid size-8 shrink-0 place-items-center rounded text-sm text-zinc-700 transition hover:bg-red-500/10 hover:text-red-400 disabled:pointer-events-none disabled:opacity-30"
-              :disabled="sending"
+              :disabled="runtimeFor(item.id).sending"
               :aria-label="`Delete session ${item.title || shortId(item.id)}`"
               title="Delete session"
               @click.stop="deleteSession(selectedProject.root, item.id)"

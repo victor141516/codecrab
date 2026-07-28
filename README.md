@@ -59,6 +59,9 @@ terminal interface and an optional embedded web application.
   controls, and a history containing at most one active goal.
 - Project-local JSON sessions with a global cross-project browser, resume, and
   deletion.
+- Concurrent session workers in one process: a turn keeps running after
+  navigation, another session can start immediately, and Stop/model/goals are
+  routed to the selected session only.
 - Config file, environment overrides, and CLI overrides.
 
 ## Install
@@ -173,16 +176,16 @@ The initial API surface is:
 | --- | --- | --- |
 | `GET` | `/api/health` | Process health and version |
 | `GET` | `/api/state` | Current session, grouped projects/sessions, models, and skills |
-| `POST` | `/api/completions` | Shared slash, skill, and filesystem suggestions |
-| `POST` | `/api/chat` | Run one visible prompt or hidden goal-continuation turn as an ordered NDJSON stream |
-| `POST` | `/api/chat/cancel` | Cancel the active agent turn and its in-flight provider/tool operation |
-| `POST` | `/api/transcribe` | Transcribe recorded audio with ChatGPT OAuth |
-| `PUT` | `/api/model` | Change model, thinking, and service tier |
-| `POST` | `/api/session/clear` | Clear the current conversation |
+| `POST` | `/api/completions` | Shared slash, skill, and filesystem suggestions for `session_id` |
+| `POST` | `/api/chat` | Run a prompt for `session_id` as an ordered NDJSON stream |
+| `POST` | `/api/chat/cancel` | Cancel only `session_id` and its in-flight provider/tool operation |
+| `POST` | `/api/transcribe` | Transcribe audio for the `X-CodeCrab-Session` session |
+| `PUT` | `/api/model` | Change model, thinking, and service tier for `session_id` |
+| `POST` | `/api/session/clear` | Clear `session_id` |
 | `POST` | `/api/sessions` | Create and select a session |
 | `POST` | `/api/sessions/delete` | Delete `{ project?, id }`; select the next saved session when active |
 | `POST` | `/api/sessions/resume` | Resume `{ project?, id }`, resolving the project globally when omitted |
-| `POST` | `/api/goals/create` | Create and activate a goal, pausing the previous active goal |
+| `POST` | `/api/goals/create` | Create and activate a goal in `session_id`, pausing its previous active goal |
 | `PUT` | `/api/goals/edit` | Replace a goal objective |
 | `POST` | `/api/goals/activate` | Activate a saved goal and pause any other active goal |
 | `POST` | `/api/goals/pause` | Pause a goal |
@@ -349,6 +352,9 @@ its project and then collapses it; `Right` expands a selected project; vertical
 arrows move through the visible tree. `Enter` resumes a session and switches
 the agent's working directory, relative tools, `AGENTS.md`, skills, and file
 completion to that session's project. `Delete` / `Backspace` removes a session.
+Switching sessions does not cancel a running turn. The session picker shows
+each live worker as running, idle, stopping, or failed; returning to a running
+session restores its live event stream and queued follow-up.
 In the web sidebar, the normal view shows the selected project's name and its
 sessions. Its back button opens the project list; choosing a project opens that
 project's sessions. Selecting a session updates the browser URL to
@@ -722,30 +728,30 @@ projection. Compaction is intentionally automatic; there is no normal
 TUI / run / JSON API
          |
          v
-ConversationHandle ──commands──> conversation worker (Tokio task)
-         ^                              |
-         |                         owns Agent
-   events/snapshots                      |
-                                        +──> provider
-                                        +──> ToolBox
-                                        +──> SkillRegistry
-                                        +──> SessionStore
+ConversationManager
+   ├── session A ──> ConversationHandle ──> Tokio worker ──> Agent A
+   ├── session B ──> ConversationHandle ──> Tokio worker ──> Agent B
+   └── session C ──> ConversationHandle ──> Tokio worker ──> Agent C
 ```
 
-The persistent conversation worker is the exclusive owner of its `Agent`.
+Each persistent conversation worker is the exclusive owner of its `Agent`.
 Presentation layers communicate through typed commands, streamed events,
 authoritative snapshots, and an out-of-band cancellation signal; they never
-lock or borrow the agent while a turn is running. The current process exposes
-one active worker, providing the ownership boundary needed for future
-independent concurrent conversations without changing agent semantics.
+lock or borrow an agent while a turn is running. `ConversationManager` prevents
+duplicate owners for a session, keeps background workers alive across
+navigation, exposes per-session lifecycle state, and shuts down every worker
+when the process exits. Workers share the operating-system filesystem and can
+therefore conflict if two sessions edit the same project simultaneously.
+Persisted sessions are started lazily when opened; once live, an idle worker is
+kept until that session is deleted or the process shuts down.
 
 The code is intentionally split by responsibility:
 
 - `agent.rs`: model/tool loop and system policy.
 - `compaction/`: context projection, safe turn boundaries, summary prompt, and
   all documented production tuning values.
-- `conversation.rs`: persistent Tokio worker that exclusively owns one agent,
-  serializes mutations and persistence, and exposes commands/events/snapshots.
+- `conversation.rs`: multi-worker manager plus persistent Tokio workers that
+  serialize per-session mutations and expose commands/events/snapshots.
 - `completion.rs`: shared slash, skill, and filesystem completion engine.
 - `events.rs`: ordered assistant-message events plus persisted tool activity
   and lifecycle labels shared by clients.
