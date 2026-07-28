@@ -29,10 +29,7 @@ use syntect::{
     highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet},
     parsing::SyntaxSet,
 };
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
@@ -46,6 +43,7 @@ use crate::{
         Config, ConfigStore, ProviderConfig, SessionRegistry, normalized_root, paths_equal,
         validate_provider_name,
     },
+    conversation::{ConversationHandle, ConversationSnapshot, ConversationTurn},
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role},
     session::{Goal, GoalStatus, SessionProject, SessionStore, list_session_projects},
@@ -633,17 +631,18 @@ impl SessionPicker {
 }
 
 struct App {
-    agent: Option<Agent>,
+    conversation: ConversationHandle,
     transcript: Vec<Message>,
     live_messages: Vec<Message>,
     activities: Vec<AgentActivity>,
-    running: Option<JoinHandle<(Agent, Result<String>)>>,
+    running: Option<JoinHandle<Result<ConversationTurn>>>,
     event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     recording: Option<AudioRecording>,
     transcription: Option<JoinHandle<Result<String>>>,
     send_after_transcription: bool,
     debug_openai: bool,
     config: Config,
+    registry: SessionRegistry,
     clipboard: Option<arboard::Clipboard>,
     markdown: Arc<MarkdownHighlighter>,
     input: String,
@@ -659,7 +658,6 @@ struct App {
     editing_goal_id: Option<Uuid>,
     editing_goal_resume: bool,
     goal_buttons: GoalButtons,
-    cancel_tx: Option<watch::Sender<bool>>,
     last_escape: Option<Instant>,
     steer_button: Option<Rect>,
     conversation_view: Option<ConversationView>,
@@ -693,7 +691,8 @@ impl App {
         catalog_error: Option<String>,
         debug_openai: bool,
         config: Config,
-    ) -> Self {
+        registry: SessionRegistry,
+    ) -> Result<Self> {
         let project_root = agent.project_root().to_path_buf();
         let project = project_root.display().to_string();
         let model = agent.session().model.clone();
@@ -715,8 +714,9 @@ impl App {
         let initial_error = catalog_error
             .as_ref()
             .map(|error| format!("Could not load the model catalog: {error}"));
-        Self {
-            agent: Some(agent),
+        let conversation = ConversationHandle::spawn(agent, registry.clone())?;
+        Ok(Self {
+            conversation,
             transcript,
             live_messages: Vec::new(),
             activities,
@@ -727,6 +727,7 @@ impl App {
             send_after_transcription: false,
             debug_openai,
             config,
+            registry,
             clipboard: arboard::Clipboard::new().ok(),
             markdown: shared_markdown_highlighter(),
             input: String::new(),
@@ -742,7 +743,6 @@ impl App {
             editing_goal_id: None,
             editing_goal_resume: false,
             goal_buttons: GoalButtons::default(),
-            cancel_tx: None,
             last_escape: None,
             steer_button: None,
             conversation_view: None,
@@ -767,7 +767,7 @@ impl App {
             reasoning_effort,
             service_tier,
             skills,
-        }
+        })
     }
 
     fn is_running(&self) -> bool {
@@ -843,19 +843,12 @@ impl App {
         true
     }
 
-    fn session_provider(&self) -> Result<&str> {
-        Ok(&self
-            .agent
-            .as_ref()
-            .context("agent is unavailable")?
-            .session()
-            .provider)
+    fn session_provider(&self) -> String {
+        self.conversation.snapshot().session.provider
     }
 
     fn dictation_available(&self) -> bool {
-        self.session_provider()
-            .and_then(|provider| Transcriber::is_available(&self.config, provider))
-            .unwrap_or(false)
+        Transcriber::is_available(&self.config, &self.session_provider()).unwrap_or(false)
     }
 
     fn toggle_dictation(&mut self) -> Result<()> {
@@ -887,7 +880,7 @@ impl App {
         self.send_after_transcription = send_after_transcription;
         let debug_openai = self.debug_openai;
         let config = self.config.clone();
-        let provider = self.session_provider()?.to_owned();
+        let provider = self.session_provider();
         self.transcription = Some(tokio::spawn(async move {
             Transcriber::new(&config, &provider, debug_openai)?
                 .transcribe(audio, "audio/wav")
@@ -896,7 +889,7 @@ impl App {
         Ok(())
     }
 
-    async fn finish_transcription_if_ready(&mut self, registry: &SessionRegistry) -> Result<()> {
+    async fn finish_transcription_if_ready(&mut self) -> Result<()> {
         if !self
             .transcription
             .as_ref()
@@ -911,7 +904,7 @@ impl App {
                 let inserted = self.insert_transcript(&transcript);
                 self.error = None;
                 if send_after_transcription && inserted {
-                    self.submit(registry)?;
+                    self.submit().await?;
                 }
             }
             Err(error) => self.error = Some(format!("Dictation failed: {error:#}")),
@@ -1194,9 +1187,7 @@ impl App {
         }
     }
 
-    fn accept_model_selection(&mut self, registry: &SessionRegistry) -> Result<()> {
-        let store = self.current_store()?;
-        let root = self.project_root.clone();
+    async fn accept_model_selection(&mut self) -> Result<()> {
         let Some(picker) = &mut self.model_picker else {
             return Ok(());
         };
@@ -1264,15 +1255,8 @@ impl App {
                     reasoning_effort: picker.reasoning_effort.clone(),
                     service_tier,
                 };
-                if let Some(agent) = &mut self.agent {
-                    agent.set_model_selection(selection.clone());
-                    store.save(agent.session())?;
-                    registry.register(&root)?;
-                }
-                self.model.clone_from(&selection.model);
-                self.reasoning_effort
-                    .clone_from(&selection.reasoning_effort);
-                self.service_tier.clone_from(&selection.service_tier);
+                let snapshot = self.conversation.set_model(selection).await?;
+                self.apply_snapshot(snapshot);
                 self.error = None;
                 self.model_picker = None;
             }
@@ -1280,21 +1264,31 @@ impl App {
         Ok(())
     }
 
-    fn current_store(&self) -> Result<SessionStore> {
-        SessionStore::new(&self.project_root)
+    async fn save_active_session(&self) -> Result<()> {
+        self.conversation.persist().await?;
+        Ok(())
     }
 
-    fn save_active_session(&self, registry: &SessionRegistry) -> Result<()> {
-        let agent = self.agent.as_ref().context("agent is unavailable")?;
-        self.current_store()?.save(agent.session())?;
-        registry.register(&self.project_root)
-    }
-
-    fn sync_goals_from_agent(&mut self) {
-        if let Some(agent) = &self.agent {
-            self.goals.clone_from(&agent.session().goals);
-            self.visible_goal_id = agent.session().visible_goal_id;
-        }
+    fn apply_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        self.transcript.clone_from(&snapshot.session.messages);
+        self.activities.clone_from(&snapshot.session.activities);
+        self.goals.clone_from(&snapshot.session.goals);
+        self.visible_goal_id = snapshot.session.visible_goal_id;
+        self.project_root = snapshot.project_root;
+        self.project = self.project_root.display().to_string();
+        self.model.clone_from(&snapshot.session.model);
+        self.reasoning_effort
+            .clone_from(&snapshot.session.reasoning_effort);
+        self.service_tier.clone_from(&snapshot.session.service_tier);
+        self.skills = snapshot
+            .skills
+            .into_iter()
+            .map(|skill| SkillView {
+                name: skill.name,
+                description: skill.description,
+                scope: skill.scope,
+            })
+            .collect();
     }
 
     fn visible_goal(&self) -> Option<&Goal> {
@@ -1410,55 +1404,54 @@ impl App {
         self.editing_goal_id = Some(id);
     }
 
-    fn apply_pending_goal_action(&mut self, registry: &SessionRegistry) -> Result<bool> {
+    async fn apply_pending_goal_action(&mut self) -> Result<bool> {
         let Some(action) = self.pending_goal_action.take() else {
             return Ok(false);
         };
-        let agent = self.agent.as_mut().context("agent is unavailable")?;
         let mut start_prompt = None;
         let mut continue_goal = false;
-        match action {
+        let snapshot = match action {
             PendingGoalAction::Create(objective) => {
-                agent.create_goal(objective.clone());
-                start_prompt = Some(objective);
+                start_prompt = Some(objective.clone());
+                Some(self.conversation.create_goal(objective).await?)
             }
             PendingGoalAction::Toggle(id) => {
-                let active = agent
-                    .session()
+                let active = self
                     .goals
                     .iter()
                     .find(|goal| goal.id == id)
                     .is_some_and(|goal| goal.status == GoalStatus::Active);
                 if active {
-                    agent.pause_goal(id);
-                } else if agent.activate_goal(id) {
-                    continue_goal = true;
+                    self.conversation.pause_goal(id).await?
+                } else {
+                    let snapshot = self.conversation.activate_goal(id).await?;
+                    continue_goal = snapshot.is_some();
+                    snapshot
                 }
             }
-            PendingGoalAction::Pause(id) => {
-                agent.pause_goal(id);
-            }
-            PendingGoalAction::Delete(id) => {
-                agent.delete_goal(id);
-            }
+            PendingGoalAction::Pause(id) => self.conversation.pause_goal(id).await?,
+            PendingGoalAction::Delete(id) => self.conversation.delete_goal(id).await?,
             PendingGoalAction::BeginEdit(id) => {
-                self.editing_goal_resume = agent
-                    .session()
+                self.editing_goal_resume = self
                     .goals
                     .iter()
                     .find(|goal| goal.id == id)
                     .is_some_and(|goal| goal.status == GoalStatus::Active);
-                if self.editing_goal_resume {
-                    agent.pause_goal(id);
+                let snapshot = if self.editing_goal_resume {
+                    self.conversation.pause_goal(id).await?
+                } else {
+                    Some(self.conversation.snapshot())
+                };
+                if let Some(snapshot) = snapshot {
+                    self.apply_snapshot(snapshot);
                 }
-                self.sync_goals_from_agent();
-                self.save_active_session(registry)?;
                 self.begin_goal_edit(id);
                 return Ok(false);
             }
+        };
+        if let Some(snapshot) = snapshot {
+            self.apply_snapshot(snapshot);
         }
-        self.sync_goals_from_agent();
-        self.save_active_session(registry)?;
         if let Some(prompt) = start_prompt {
             self.start_turn(prompt, false)?;
             return Ok(true);
@@ -1470,15 +1463,10 @@ impl App {
         Ok(false)
     }
 
-    fn open_session_picker(&mut self, registry: &SessionRegistry) -> Result<()> {
-        self.save_active_session(registry)?;
-        let current_id = self
-            .agent
-            .as_ref()
-            .context("agent is unavailable")?
-            .session()
-            .id;
-        let projects = list_session_projects(&self.project_root, registry)?
+    async fn open_session_picker(&mut self) -> Result<()> {
+        self.save_active_session().await?;
+        let current_id = self.conversation.snapshot().session.id;
+        let projects = list_session_projects(&self.project_root, &self.registry)?
             .into_iter()
             .enumerate()
             .map(|(index, project)| SessionProjectView {
@@ -1544,7 +1532,7 @@ impl App {
         }
     }
 
-    fn accept_session_selection(&mut self) -> Result<()> {
+    async fn accept_session_selection(&mut self) -> Result<()> {
         let Some(row) = self
             .session_picker
             .as_ref()
@@ -1564,13 +1552,15 @@ impl App {
         let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
         let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
         provider.set_debug_openai(self.debug_openai);
-        self.agent = Some(Agent::new(
+        let agent = Agent::new(
             provider,
             ToolBox::new(root.clone()),
             SkillRegistry::discover(&root),
             session,
-        )?);
-        self.sync_active_session()?;
+        )?;
+        self.conversation.shutdown().await?;
+        self.conversation = ConversationHandle::spawn(agent, self.registry.clone())?;
+        self.sync_active_session();
         self.session_picker = None;
         if self.active_goal_id().is_some() {
             self.start_goal_continuation()?;
@@ -1578,7 +1568,7 @@ impl App {
         Ok(())
     }
 
-    fn delete_session_selection(&mut self, registry: &SessionRegistry) -> Result<()> {
+    async fn delete_session_selection(&mut self) -> Result<()> {
         let Some(SessionPickerRow::Session(project_index, session_index)) = self
             .session_picker
             .as_ref()
@@ -1593,43 +1583,35 @@ impl App {
             (project.root.clone(), project.sessions[session_index].id)
         };
         let store = SessionStore::new(&root)?;
-        let current_id = self
-            .agent
-            .as_ref()
-            .context("agent is unavailable")?
-            .session()
-            .id;
+        let active_snapshot = self.conversation.snapshot();
+        let deleting_active =
+            id == active_snapshot.session.id && paths_equal(&root, &active_snapshot.project_root);
+        if deleting_active {
+            self.conversation.shutdown().await?;
+        }
         store.delete(&id.to_string())?;
 
-        if id == current_id && paths_equal(&root, &self.project_root) {
-            let provider = self
-                .agent
-                .as_ref()
-                .context("agent is unavailable")?
-                .session()
-                .provider
-                .clone();
-            let mut session = store.create_for_provider(provider, self.model.clone())?;
+        if deleting_active {
+            let mut session =
+                store.create_for_provider(active_snapshot.session.provider, self.model.clone())?;
             session.reasoning_effort.clone_from(&self.reasoning_effort);
             session.service_tier.clone_from(&self.service_tier);
-            self.agent
-                .as_mut()
-                .context("agent is unavailable")?
-                .replace_session(session);
-            self.sync_active_session()?;
-            store.save(
-                self.agent
-                    .as_ref()
-                    .context("agent is unavailable")?
-                    .session(),
+            let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
+            provider.set_debug_openai(self.debug_openai);
+            let agent = Agent::new(
+                provider,
+                ToolBox::new(root.clone()),
+                SkillRegistry::discover(&root),
+                session,
             )?;
-            registry.register(&root)?;
+            self.conversation = ConversationHandle::spawn(agent, self.registry.clone())?;
+            self.sync_active_session();
         }
 
         if store.list()?.is_empty() {
-            registry.unregister(&root)?;
+            self.registry.unregister(&root)?;
         }
-        let projects = list_session_projects(&self.project_root, registry)?;
+        let projects = list_session_projects(&self.project_root, &self.registry)?;
         let expanded = self
             .session_picker
             .as_ref()
@@ -1658,38 +1640,8 @@ impl App {
         Ok(())
     }
 
-    fn sync_active_session(&mut self) -> Result<()> {
-        let session = self
-            .agent
-            .as_ref()
-            .context("agent is unavailable")?
-            .session();
-        self.transcript.clone_from(&session.messages);
-        self.activities.clone_from(&session.activities);
-        self.goals.clone_from(&session.goals);
-        self.visible_goal_id = session.visible_goal_id;
-        self.project_root = self
-            .agent
-            .as_ref()
-            .context("agent is unavailable")?
-            .project_root()
-            .to_path_buf();
-        self.project = self.project_root.display().to_string();
-        self.model.clone_from(&session.model);
-        self.reasoning_effort.clone_from(&session.reasoning_effort);
-        self.service_tier.clone_from(&session.service_tier);
-        self.skills = self
-            .agent
-            .as_ref()
-            .context("agent is unavailable")?
-            .skills()
-            .iter()
-            .map(|skill| SkillView {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                scope: skill.scope.label(),
-            })
-            .collect();
+    fn sync_active_session(&mut self) {
+        self.apply_snapshot(self.conversation.snapshot());
         self.live_messages.clear();
         self.pending_user = None;
         self.queued_prompt = None;
@@ -1698,7 +1650,6 @@ impl App {
         self.editing_goal_id = None;
         self.editing_goal_resume = false;
         self.goal_buttons = GoalButtons::default();
-        self.cancel_tx = None;
         self.last_escape = None;
         self.steer_button = None;
         self.conversation_view = None;
@@ -1707,7 +1658,6 @@ impl App {
         self.error = None;
         self.scroll = 0;
         self.auto_scroll = true;
-        Ok(())
     }
 
     fn scroll_up(&mut self, amount: u16) {
@@ -2020,27 +1970,18 @@ impl App {
         }
     }
 
-    async fn finish_turn_if_ready(&mut self, registry: &SessionRegistry) -> Result<()> {
+    async fn finish_turn_if_ready(&mut self) -> Result<()> {
         if !self.running.as_ref().is_some_and(JoinHandle::is_finished) {
             return Ok(());
         }
         let handle = self.running.take().expect("checked above");
-        let (agent, result) = handle.await.context("agent task failed")?;
-        self.transcript = agent.session().messages.clone();
-        self.activities = agent.session().activities.clone();
-        self.goals = agent.session().goals.clone();
-        self.visible_goal_id = agent.session().visible_goal_id;
-        let root = agent.project_root().to_path_buf();
-        let store = SessionStore::new(&root)?;
-        store.save(agent.session())?;
-        registry.register(&root)?;
-        self.agent = Some(agent);
+        let turn = handle.await.context("conversation turn task failed")??;
+        self.apply_snapshot(turn.snapshot);
         self.event_rx = None;
-        self.cancel_tx = None;
         self.last_escape = None;
         self.live_messages.clear();
         self.pending_user = None;
-        let turn_succeeded = match result {
+        let turn_succeeded = match turn.result {
             Ok(_) => {
                 self.error = None;
                 true
@@ -2054,7 +1995,7 @@ impl App {
                 false
             }
         };
-        if self.apply_pending_goal_action(registry)? {
+        if self.apply_pending_goal_action().await? {
             return Ok(());
         }
         if let Some(prompt) = self.queued_prompt.take() {
@@ -2065,7 +2006,7 @@ impl App {
         Ok(())
     }
 
-    fn submit(&mut self, registry: &SessionRegistry) -> Result<()> {
+    async fn submit(&mut self) -> Result<()> {
         if self.recording.is_some() || self.transcription.is_some() {
             return Ok(());
         }
@@ -2080,27 +2021,18 @@ impl App {
                 return Ok(());
             }
             let resume = std::mem::take(&mut self.editing_goal_resume);
-            let edited = {
-                let agent = self.agent.as_mut().context("agent is unavailable")?;
-                let edited = agent.edit_goal(id, prompt);
-                if edited && resume {
-                    agent.activate_goal(id);
-                }
-                edited
-            };
-            if !edited {
-                self.error = Some("The goal no longer exists.".into());
-            } else {
+            if let Some(snapshot) = self.conversation.edit_goal(id, prompt, resume).await? {
                 self.input.clear();
                 self.cursor = 0;
                 self.preferred_column = None;
                 self.completion = None;
-                self.sync_goals_from_agent();
-                self.save_active_session(registry)?;
+                self.apply_snapshot(snapshot);
                 self.error = None;
                 if resume {
                     self.start_goal_continuation()?;
                 }
+            } else {
+                self.error = Some("The goal no longer exists.".into());
             }
             return Ok(());
         }
@@ -2115,7 +2047,7 @@ impl App {
             self.completion = None;
             self.request_goal_action(PendingGoalAction::Create(objective));
             if !self.is_running() {
-                self.apply_pending_goal_action(registry)?;
+                self.apply_pending_goal_action().await?;
             }
             return Ok(());
         }
@@ -2124,7 +2056,7 @@ impl App {
             self.cursor = 0;
             self.preferred_column = None;
             self.completion = None;
-            return self.command(&prompt, registry);
+            return self.command(&prompt).await;
         }
         if prompt == "/providers" || prompt.starts_with("/provider ") {
             self.input.clear();
@@ -2148,7 +2080,7 @@ impl App {
             self.cursor = 0;
             self.preferred_column = None;
             self.completion = None;
-            return self.command(&prompt, registry);
+            return self.command(&prompt).await;
         }
 
         self.start_turn(prompt, true)
@@ -2165,17 +2097,9 @@ impl App {
         self.pending_user = Some(prompt.clone());
         self.live_messages.clear();
 
-        let mut agent = self.agent.take().context("agent is unavailable")?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, cancellation) = watch::channel(false);
         self.event_rx = Some(event_rx);
-        self.cancel_tx = Some(cancel_tx);
-        self.running = Some(tokio::spawn(async move {
-            let result = agent
-                .turn_with_events(&prompt, event_tx, cancellation)
-                .await;
-            (agent, result)
-        }));
+        self.running = Some(self.conversation.start_turn(prompt, Some(event_tx))?);
         Ok(())
     }
 
@@ -2184,24 +2108,14 @@ impl App {
         self.pending_user = None;
         self.live_messages.clear();
 
-        let mut agent = self.agent.take().context("agent is unavailable")?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (cancel_tx, cancellation) = watch::channel(false);
         self.event_rx = Some(event_rx);
-        self.cancel_tx = Some(cancel_tx);
-        self.running = Some(tokio::spawn(async move {
-            let result = agent
-                .continue_goal_with_events(event_tx, cancellation)
-                .await;
-            (agent, result)
-        }));
+        self.running = Some(self.conversation.start_goal_continuation(Some(event_tx))?);
         Ok(())
     }
 
     fn cancel_current_turn(&mut self) {
-        if let Some(cancel_tx) = &self.cancel_tx {
-            let _ = cancel_tx.send(true);
-        }
+        self.conversation.cancel();
     }
 
     fn provider_command(&mut self, command: &str) -> Result<()> {
@@ -2243,7 +2157,7 @@ impl App {
                 self.config = persisted.clone();
                 self.error = Some(format!(
                     "Provider {name:?} selected for new sessions. The current session keeps provider {:?}.",
-                    self.agent.as_ref().unwrap().session().provider
+                    self.conversation.snapshot().session.provider
                 ));
             }
             ["/provider", "remove", name] => {
@@ -2289,31 +2203,26 @@ impl App {
         Ok(())
     }
 
-    fn command(&mut self, command: &str, registry: &SessionRegistry) -> Result<()> {
+    async fn command(&mut self, command: &str) -> Result<()> {
         match command {
             "/quit" => self.should_quit = true,
             "/help" => self.show_help = true,
             "/model" | "/models" => self.open_model_picker(),
             "/skills" => self.open_skill_picker(),
-            "/sessions" => self.open_session_picker(registry)?,
+            "/sessions" => self.open_session_picker().await?,
             "/goals" => self.open_goal_picker(),
             "/clear" => {
-                if let Some(agent) = &mut self.agent {
-                    agent.clear();
-                    self.transcript.clear();
-                    self.live_messages.clear();
-                    self.activities.clear();
-                    self.error = None;
-                }
-                self.sync_goals_from_agent();
-                self.save_active_session(registry)?;
+                let snapshot = self.conversation.clear().await?;
+                self.apply_snapshot(snapshot);
+                self.live_messages.clear();
+                self.error = None;
             }
             _ => self.error = Some(format!("Unknown command: {command}")),
         }
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent, registry: &SessionRegistry) -> Result<()> {
+    async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Ok(());
         }
@@ -2380,7 +2289,7 @@ impl App {
                 KeyCode::Down => self.move_model_selection(1),
                 KeyCode::PageUp => self.move_model_selection(-5),
                 KeyCode::PageDown => self.move_model_selection(5),
-                KeyCode::Enter | KeyCode::Tab => self.accept_model_selection(registry)?,
+                KeyCode::Enter | KeyCode::Tab => self.accept_model_selection().await?,
                 KeyCode::Left | KeyCode::Backspace | KeyCode::Esc => self.back_model_picker(),
                 _ => {}
             }
@@ -2394,8 +2303,8 @@ impl App {
                 KeyCode::PageDown => self.move_session_selection(5),
                 KeyCode::Left => self.move_session_left(),
                 KeyCode::Right => self.move_session_right(),
-                KeyCode::Enter => self.accept_session_selection()?,
-                KeyCode::Delete | KeyCode::Backspace => self.delete_session_selection(registry)?,
+                KeyCode::Enter => self.accept_session_selection().await?,
+                KeyCode::Delete | KeyCode::Backspace => self.delete_session_selection().await?,
                 KeyCode::Esc => self.session_picker = None,
                 _ => {}
             }
@@ -2410,12 +2319,8 @@ impl App {
             self.preferred_column = None;
             self.completion = None;
             self.error = None;
-            if resume {
-                if let Some(agent) = &mut self.agent {
-                    agent.activate_goal(id);
-                }
-                self.sync_goals_from_agent();
-                self.save_active_session(registry)?;
+            if resume && let Some(snapshot) = self.conversation.activate_goal(id).await? {
+                self.apply_snapshot(snapshot);
                 self.start_goal_continuation()?;
             }
             return Ok(());
@@ -2510,7 +2415,7 @@ impl App {
             {
                 self.insert("\n");
             }
-            KeyCode::Enter => self.submit(registry)?,
+            KeyCode::Enter => self.submit().await?,
             KeyCode::Char('?') if self.input.is_empty() => self.show_help = true,
             KeyCode::Char(value) => self.insert_char(value),
             KeyCode::Backspace => self.backspace(),
@@ -2578,8 +2483,14 @@ pub(crate) async fn interactive(
 
     let result = run_tui(
         &mut terminal,
-        App::new(agent, model_catalog, catalog_error, debug_openai, config),
-        registry,
+        App::new(
+            agent,
+            model_catalog,
+            catalog_error,
+            debug_openai,
+            config,
+            registry.clone(),
+        )?,
     )
     .await;
 
@@ -2603,18 +2514,17 @@ pub(crate) async fn interactive(
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: App,
-    registry: &SessionRegistry,
 ) -> Result<String> {
     if app.active_goal_id().is_some() {
         app.start_goal_continuation()?;
     }
     loop {
         app.drain_agent_events();
-        app.finish_turn_if_ready(registry).await?;
+        app.finish_turn_if_ready().await?;
         if !app.is_running() {
-            app.apply_pending_goal_action(registry)?;
+            app.apply_pending_goal_action().await?;
         }
-        app.finish_transcription_if_ready(registry).await?;
+        app.finish_transcription_if_ready().await?;
         app.update_drag_autoscroll();
         app.spinner = app.spinner.wrapping_add(1);
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -2624,7 +2534,7 @@ async fn run_tui(
         }
         if event::poll(Duration::from_millis(70))? {
             match event::read()? {
-                Event::Key(key) => app.handle_key(key, registry)?,
+                Event::Key(key) => app.handle_key(key).await?,
                 Event::Paste(text) => app.insert(&text.replace("\r\n", "\n")),
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
@@ -2632,11 +2542,8 @@ async fn run_tui(
         }
     }
 
-    let agent = app.agent.context("agent did not return before exit")?;
-    let store = SessionStore::new(agent.project_root())?;
-    store.save(agent.session())?;
-    registry.register(agent.project_root())?;
-    Ok(agent.session().id.to_string())
+    let snapshot = app.conversation.shutdown().await?;
+    Ok(snapshot.session.id.to_string())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -2935,7 +2842,7 @@ fn conversation_source(app: &App) -> ConversationSource {
         }
 
         if let Some(content) = visible_message_content(message) {
-            push_actor_label(&mut source, "YOU", AQUA);
+            push_actor_label(&mut source, "USER", AQUA);
             push_message_lines(&mut source, content, true, None);
             source.lines.push(Line::default());
         }
@@ -2955,7 +2862,7 @@ fn conversation_source(app: &App) -> ConversationSource {
     }
 
     if let Some(content) = &app.pending_user {
-        push_actor_label(&mut source, "YOU", AQUA);
+        push_actor_label(&mut source, "USER", AQUA);
         push_message_lines(&mut source, content, true, None);
         source.lines.push(Line::default());
         let turn_message_index = app.transcript.len();
@@ -3727,7 +3634,7 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .selected
         .saturating_sub(available.saturating_sub(1))
         .min(rows.len().saturating_sub(available));
-    let current_id = app.agent.as_ref().map(|agent| agent.session().id);
+    let current_id = Some(app.conversation.snapshot().session.id);
     let mut lines = vec![
         Line::from(Span::styled(
             "↑↓ select  •  ← parent/collapse  •  → expand  •  Enter resume  •  Del delete",
@@ -4279,7 +4186,9 @@ mod tests {
             None,
             false,
             config,
+            test_registry(root),
         )
+        .unwrap()
     }
 
     fn render_text(width: u16, height: u16) -> String {
@@ -4322,7 +4231,6 @@ mod tests {
     #[tokio::test]
     async fn voice_transcript_can_be_inserted_and_submitted_immediately() {
         let root = tempfile::tempdir().unwrap();
-        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
         app.send_after_transcription = true;
         app.transcription = Some(tokio::spawn(async {
@@ -4339,7 +4247,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        app.finish_transcription_if_ready(&registry).await.unwrap();
+        app.finish_transcription_if_ready().await.unwrap();
 
         assert_eq!(app.pending_user.as_deref(), Some("spoken prompt"));
         assert!(app.input.is_empty());
@@ -4413,18 +4321,16 @@ mod tests {
     #[tokio::test]
     async fn submitting_while_the_agent_works_queues_the_next_message() {
         let root = tempfile::tempdir().unwrap();
-        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
-        let agent = app.agent.take().unwrap();
         let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
         app.running = Some(tokio::spawn(async move {
             let _ = finish_rx.await;
-            (agent, Ok(String::new()))
+            anyhow::bail!("test turn remains pending")
         }));
         app.input = "Follow up after this turn".into();
         app.cursor = app.input.len();
 
-        app.submit(&registry).unwrap();
+        app.submit().await.unwrap();
 
         assert_eq!(
             app.queued_prompt.as_deref(),
@@ -4438,26 +4344,22 @@ mod tests {
     #[tokio::test]
     async fn double_escape_and_the_mouse_only_steer_button_cancel_a_turn() {
         let root = tempfile::tempdir().unwrap();
-        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
-        let agent = app.agent.take().unwrap();
         let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
         app.running = Some(tokio::spawn(async move {
             let _ = finish_rx.await;
-            (agent, Ok(String::new()))
+            anyhow::bail!("test turn remains pending")
         }));
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        app.cancel_tx = Some(cancel_tx);
 
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &registry)
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
             .unwrap();
-        assert!(!*cancel_rx.borrow());
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &registry)
+        assert!(app.last_escape.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
             .unwrap();
-        assert!(*cancel_rx.borrow_and_update());
+        assert!(app.last_escape.is_none());
 
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        app.cancel_tx = Some(cancel_tx);
         app.queued_prompt = Some("Steer now".into());
         app.steer_button = Some(Rect::new(10, 4, 9, 3));
         app.handle_mouse(MouseEvent {
@@ -4466,7 +4368,7 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(*cancel_rx.borrow_and_update());
+        assert_eq!(app.queued_prompt.as_deref(), Some("Steer now"));
         app.running.take().unwrap().abort();
     }
 
@@ -4492,22 +4394,22 @@ mod tests {
         assert!(app.steer_button.is_some());
     }
 
-    #[test]
-    fn goal_picker_pauses_the_active_goal_and_the_goal_row_has_mouse_controls() {
+    #[tokio::test]
+    async fn goal_picker_pauses_the_active_goal_and_the_goal_row_has_mouse_controls() {
         let root = tempfile::tempdir().unwrap();
-        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
-        let id = app
-            .agent
-            .as_mut()
-            .unwrap()
-            .create_goal("Finish the migration and keep every test green".into());
-        app.sync_goals_from_agent();
+        let snapshot = app
+            .conversation
+            .create_goal("Finish the migration and keep every test green".into())
+            .await
+            .unwrap();
+        let id = snapshot.session.goals[0].id;
+        app.apply_snapshot(snapshot);
 
         app.open_goal_picker();
         assert_eq!(app.goal_picker.as_ref().unwrap().selected, 0);
         app.toggle_selected_goal();
-        app.apply_pending_goal_action(&registry).unwrap();
+        app.apply_pending_goal_action().await.unwrap();
 
         assert_eq!(
             app.goals.iter().find(|goal| goal.id == id).unwrap().status,
@@ -4552,7 +4454,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(
-            lines.iter().filter(|line| line.as_str() == " YOU ").count(),
+            lines
+                .iter()
+                .filter(|line| line.as_str() == " USER ")
+                .count(),
             1
         );
         assert_eq!(
@@ -4913,52 +4818,41 @@ mod tests {
         assert_eq!(builtin_command_from_input("/review-rust"), None);
     }
 
-    #[test]
-    fn printable_characters_use_the_terminal_resolved_keyboard_layout() {
+    #[tokio::test]
+    async fn printable_characters_use_the_terminal_resolved_keyboard_layout() {
         let root = tempfile::tempdir().unwrap();
-        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
 
         // Spanish layout: AltGr+2 is reported by Windows as Ctrl+Alt+'@'.
-        app.handle_key(
-            KeyEvent::new(
-                KeyCode::Char('@'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            ),
-            &registry,
-        )
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .await
         .unwrap();
         // US layout: Shift+2 is already reported as the logical '@' character.
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('@'), KeyModifiers::SHIFT),
-            &registry,
-        )
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('€'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .await
         .unwrap();
-        app.handle_key(
-            KeyEvent::new(
-                KeyCode::Char('€'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            ),
-            &registry,
-        )
-        .unwrap();
-        app.handle_key(
-            KeyEvent::new(
-                KeyCode::Char('b'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            ),
-            &registry,
-        )
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .await
         .unwrap();
 
         assert_eq!(app.input, "@@€b");
 
         // An unknown Ctrl-only chord remains a control chord rather than text.
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-            &registry,
-        )
-        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
         assert_eq!(app.input, "@@€b");
     }
 
@@ -4978,10 +4872,9 @@ mod tests {
         assert!(compact.contains("Message"));
     }
 
-    #[test]
-    fn conversation_scroll_stays_manual_during_new_agent_output_until_bottom() {
+    #[tokio::test]
+    async fn conversation_scroll_stays_manual_during_new_agent_output_until_bottom() {
         let root = tempfile::tempdir().unwrap();
-        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         app.event_rx = Some(event_rx);
@@ -5001,11 +4894,9 @@ mod tests {
             detail: "cargo test".into(),
         });
 
-        app.handle_key(
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
-            &registry,
-        )
-        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert_eq!(app.scroll, 20);
         assert!(!app.auto_scroll);
 
@@ -5040,11 +4931,9 @@ mod tests {
         assert_eq!(app.scroll, 20);
         assert!(!app.auto_scroll);
 
-        app.handle_key(
-            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
-            &registry,
-        )
-        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert_eq!(app.scroll, 30);
         assert!(app.auto_scroll);
     }
@@ -5112,7 +5001,7 @@ mod tests {
                 .count(),
             1
         );
-        let you = lines.iter().position(|line| line == " YOU ").unwrap();
+        let user = lines.iter().position(|line| line == " USER ").unwrap();
         let crab = lines.iter().position(|line| line == " CRAB ").unwrap();
         let action = lines
             .iter()
@@ -5126,7 +5015,7 @@ mod tests {
             .iter()
             .position(|line| line == "Inspection complete.")
             .unwrap();
-        assert!(you < crab && crab < progress && progress < action && action < answer);
+        assert!(user < crab && crab < progress && progress < action && action < answer);
         assert!(lines[crab - 1].is_empty());
         assert!(lines[action - 1].is_empty());
         assert!(lines[answer - 1].is_empty());
@@ -5473,10 +5362,9 @@ mod tests {
         assert_eq!(file_icon(Path::new("script.py")), "");
     }
 
-    #[test]
-    fn model_picker_walks_model_reasoning_and_service_tier() {
+    #[tokio::test]
+    async fn model_picker_walks_model_reasoning_and_service_tier() {
         let root = tempfile::tempdir().unwrap();
-        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
         app.model_catalog = vec![
             ModelCatalogEntry {
@@ -5506,31 +5394,26 @@ mod tests {
         ];
 
         app.open_model_picker();
-        app.accept_model_selection(&registry).unwrap();
+        app.accept_model_selection().await.unwrap();
         assert_eq!(
             app.model_picker.as_ref().unwrap().step,
             ModelPickerStep::Reasoning
         );
         app.model_picker.as_mut().unwrap().selected = 1;
-        app.accept_model_selection(&registry).unwrap();
+        app.accept_model_selection().await.unwrap();
         assert_eq!(
             app.model_picker.as_ref().unwrap().step,
             ModelPickerStep::Speed
         );
         app.model_picker.as_mut().unwrap().selected = 1;
-        app.accept_model_selection(&registry).unwrap();
+        app.accept_model_selection().await.unwrap();
 
         assert_eq!(app.model, "future-9-sol");
         assert_eq!(app.reasoning_effort.as_deref(), Some("deep"));
         assert_eq!(app.service_tier.as_deref(), Some("priority"));
         assert!(app.uses_fast_service_tier());
         assert_eq!(
-            app.agent
-                .as_ref()
-                .unwrap()
-                .session()
-                .service_tier
-                .as_deref(),
+            app.conversation.snapshot().session.service_tier.as_deref(),
             Some("priority")
         );
         assert_eq!(
@@ -5557,8 +5440,8 @@ mod tests {
         assert_eq!(before_thinking.matches('│').count(), 1);
     }
 
-    #[test]
-    fn session_picker_navigates_projects_and_switches_the_agent_root() {
+    #[tokio::test]
+    async fn session_picker_navigates_projects_and_switches_the_agent_root() {
         let temp = tempfile::tempdir().unwrap();
         let current_root = temp.path().join("current-project");
         let other_root = temp.path().join("other-project");
@@ -5569,6 +5452,7 @@ mod tests {
         let registry = test_registry(temp.path());
         let other_store = SessionStore::new(&other_root).unwrap();
         let mut app = test_app(&current_root);
+        app.registry = registry.clone();
         let mut saved = other_store.create("restored-model".into()).unwrap();
         saved.reasoning_effort = Some("high".into());
         saved.service_tier = Some("priority".into());
@@ -5579,7 +5463,7 @@ mod tests {
         other_store.save(&saved).unwrap();
         registry.register(&other_root).unwrap();
 
-        app.open_session_picker(&registry).unwrap();
+        app.open_session_picker().await.unwrap();
         let picker = app.session_picker.as_ref().unwrap();
         assert!(paths_equal(&picker.projects[0].project.root, &current_root));
         assert!(picker.projects[0].expanded);
@@ -5622,10 +5506,10 @@ mod tests {
         assert!(text.contains("Saved conversation"));
         assert!(text.contains("Del delete"));
 
-        app.accept_session_selection().unwrap();
+        app.accept_session_selection().await.unwrap();
         assert!(paths_equal(&app.project_root, &other_root));
         assert!(paths_equal(
-            app.agent.as_ref().unwrap().project_root(),
+            &app.conversation.snapshot().project_root,
             &other_root
         ));
         assert_eq!(app.model, "restored-model");
@@ -5645,7 +5529,7 @@ mod tests {
                 .any(|item| item.name == "only-in-other.txt")
         );
 
-        app.open_session_picker(&registry).unwrap();
+        app.open_session_picker().await.unwrap();
         let saved_row = {
             let picker = app.session_picker.as_ref().unwrap();
             picker
@@ -5661,9 +5545,9 @@ mod tests {
                 .unwrap()
         };
         app.session_picker.as_mut().unwrap().selected = saved_row;
-        app.delete_session_selection(&registry).unwrap();
+        app.delete_session_selection().await.unwrap();
 
-        let replacement = app.agent.as_ref().unwrap().session();
+        let replacement = app.conversation.snapshot().session;
         assert_ne!(replacement.id, saved.id);
         assert_eq!(replacement.model, "restored-model");
         assert_eq!(replacement.reasoning_effort.as_deref(), Some("high"));

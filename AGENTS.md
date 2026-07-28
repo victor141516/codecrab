@@ -75,6 +75,10 @@ needed.
 
 - `src/main.rs`: CLI parsing and mode dispatch.
 - `src/agent.rs`: model/tool loop, system prompt, and root `AGENTS.md` loading.
+- `src/compaction/`: context projection, summary construction, safe boundaries,
+  and centralized compaction tuning.
+- `src/conversation.rs`: persistent Tokio conversation worker, typed command
+  handle, cancellation, authoritative snapshots, and serialized persistence.
 - `src/completion.rs`: shared slash-command, skill, and filesystem completion
   generation used directly by the TUI and exposed to the web client by the API.
 - `src/events.rs`: shared assistant-message and tool-activity events plus
@@ -109,20 +113,23 @@ The main flow is:
 TUI / run / web API
         |
         v
-      Agent ----> provider ----> OpenAI-compatible backend
-        |
-        +----> ToolBox ----> filesystem / shell
-        |
-        +----> SkillRegistry
-        |
-        v
-   SessionStore
+ ConversationHandle ----> persistent Tokio conversation worker
+                                   |
+                                   v
+                                 Agent ----> provider
+                                   |
+                                   +----> ToolBox
+                                   +----> SkillRegistry
+                                   +----> SessionStore
 ```
 
-`Agent` owns conversation behavior. UI code should collect input and render
-state; API code should translate HTTP requests and responses. Persist model,
-reasoning effort, and service tier in the active session so a selection applies
-to the current draft and all later turns until changed.
+The conversation worker exclusively owns its `Agent`, serializes typed commands
+and persistence, emits authoritative snapshots/events, and exposes out-of-band
+turn cancellation. Presentation code must never retain or lock an `Agent`.
+`Agent` owns conversation behavior; UI code collects input and renders state,
+while API code translates HTTP requests and responses. Persist model, reasoning
+effort, and service tier in the active session so a selection applies to the
+current draft and all later turns until changed.
 
 ## Agent Skills and project instructions
 

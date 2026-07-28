@@ -473,6 +473,9 @@ default_reasoning_level = "high"
 default_service_tier = "priority"
 input_modalities = ["text", "image"]
 output_modalities = ["text"]
+context_window_tokens = 200000
+maximum_output_tokens = 32000
+auto_compact_token_limit = 150000
 
 reasoning_levels = [
     { id = "low" },
@@ -488,8 +491,9 @@ service_tiers = [
 Quote model IDs in table names because IDs commonly contain `/`, `.`, or `:`.
 Declaring a `model_capabilities` table adds that model even when `GET /models`
 does not return it. `display_name`, `description`, defaults, reasoning levels,
-service tiers, and modalities are all optional, so the smallest useful manual
-model can be as simple as:
+service tiers, modalities, context window, maximum output, and auto-compaction
+limit are all optional, so the smallest useful manual model can be as simple
+as:
 
 ```toml
 [providers.example.model_capabilities."hidden-model"]
@@ -679,23 +683,69 @@ the web sidebar discover every project that has saved sessions. Empty projects
 are removed from that registry. The field is managed automatically and can
 also be edited manually.
 
+### Automatic context compaction
+
+Before model requests, CodeCrab compares the latest provider-reported input
+usage plus newly appended messages with the selected model's usable context.
+When needed, it asks the active model for one rolling structured summary and
+keeps a token-budgeted tail of complete recent turns verbatim. The same check
+runs before a user turn, between tool/model rounds, after selecting a smaller
+model, and when a provider reports a context-length overflow.
+
+If the whole historical head does not fit in one summary request, CodeCrab
+compacts the oldest complete-turn chunk that fits, keeps the omitted later
+turns raw, and then rolls additional chunks into the same latest summary until
+the normal request is safe. A context-window error from the summarizer retries
+with fewer final turns in that chunk.
+
+Large `read_file` results are omitted entirely from summarizer input while
+retaining the path, tool-call ID, and size marker. Large contents in
+`write_file` and `replace_in_file` arguments are similarly replaced with
+markers. The canonical tool calls and results remain untouched, so the agent
+can re-read the file when exact contents are needed.
+
+Compaction changes only the projection sent to the provider. Session JSON keeps
+the complete original messages, tool calls, results, activities, and ordering.
+It also stores every linked compaction checkpoint, its covered message range,
+trigger, model settings, summary, and reported token usage. Resuming continues
+from the latest checkpoint while terminal and web still display the full
+transcript.
+
+Both clients show shared persisted `Context compaction started`, completed, and
+failed activities. A failed or cancelled summary never replaces the previous
+projection. Compaction is intentionally automatic; there is no normal
+`/compact` command.
+
 ## Architecture
 
 ```text
-TUI ───────────────┐
-                   v
-embedded web ──> JSON API ──> agent loop ──> OpenAI-compatible model
-                         ^          |
-                         |       tool calls
-                         |          v
-                  session store <─ ToolBox
-                                   |
-                        read/search | write/shell
+TUI / run / JSON API
+         |
+         v
+ConversationHandle ──commands──> conversation worker (Tokio task)
+         ^                              |
+         |                         owns Agent
+   events/snapshots                      |
+                                        +──> provider
+                                        +──> ToolBox
+                                        +──> SkillRegistry
+                                        +──> SessionStore
 ```
+
+The persistent conversation worker is the exclusive owner of its `Agent`.
+Presentation layers communicate through typed commands, streamed events,
+authoritative snapshots, and an out-of-band cancellation signal; they never
+lock or borrow the agent while a turn is running. The current process exposes
+one active worker, providing the ownership boundary needed for future
+independent concurrent conversations without changing agent semantics.
 
 The code is intentionally split by responsibility:
 
 - `agent.rs`: model/tool loop and system policy.
+- `compaction/`: context projection, safe turn boundaries, summary prompt, and
+  all documented production tuning values.
+- `conversation.rs`: persistent Tokio worker that exclusively owns one agent,
+  serializes mutations and persistence, and exposes commands/events/snapshots.
 - `completion.rs`: shared slash, skill, and filesystem completion engine.
 - `events.rs`: ordered assistant-message events plus persisted tool activity
   and lifecycle labels shared by clients.
@@ -729,6 +779,6 @@ cargo test
 Production output is required to contain exactly `index.html`, `app.js`, and
 `app.css`, and those files are embedded into the executable at compile time.
 
-Good next steps are token-aware context compaction, unified diffs, and a
-provider trait with native Anthropic/Gemini adapters. The current module
-boundaries are designed so those can be added without rewriting the agent core.
+Good next steps are unified diffs and a provider trait with native
+Anthropic/Gemini adapters. The current module boundaries are designed so those
+can be added without rewriting the agent core.

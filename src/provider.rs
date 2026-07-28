@@ -57,6 +57,12 @@ pub(crate) struct ModelCatalogEntry {
     pub input_modalities: Vec<String>,
     #[serde(default)]
     pub output_modalities: Vec<String>,
+    #[serde(default, alias = "context_window")]
+    pub context_window_tokens: Option<u64>,
+    #[serde(default, alias = "max_output_tokens")]
+    pub maximum_output_tokens: Option<u64>,
+    #[serde(default, alias = "auto_compact_limit")]
+    pub auto_compact_token_limit: Option<u64>,
 }
 
 impl ModelCatalogEntry {
@@ -74,6 +80,9 @@ impl ModelCatalogEntry {
             default_service_tier: None,
             input_modalities: Vec::new(),
             output_modalities: Vec::new(),
+            context_window_tokens: None,
+            maximum_output_tokens: None,
+            auto_compact_token_limit: None,
         }
     }
 
@@ -180,6 +189,24 @@ pub(crate) struct Message {
     pub hidden: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub(crate) struct TokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Completion {
+    pub message: Message,
+    pub usage: TokenUsage,
+}
+
 impl Message {
     pub(crate) fn text(role: Role, content: impl Into<String>) -> Self {
         Self {
@@ -232,10 +259,18 @@ struct ChatRequest<'a> {
     tool_choice: &'static str,
     parallel_tool_calls: bool,
     stream: bool,
+    stream_options: ChatStreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -263,6 +298,8 @@ impl<'a> From<&'a Message> for ChatMessage<'a> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -473,8 +510,19 @@ impl OpenAiCompatible {
         &self,
         messages: &[Message],
         tools: &[Value],
+        on_text_delta: impl FnMut(&str),
+    ) -> Result<Completion> {
+        self.complete_with_max_output(messages, tools, None, on_text_delta)
+            .await
+    }
+
+    pub(crate) async fn complete_with_max_output(
+        &self,
+        messages: &[Message],
+        tools: &[Value],
+        maximum_output_tokens: Option<u64>,
         mut on_text_delta: impl FnMut(&str),
-    ) -> Result<Message> {
+    ) -> Result<Completion> {
         self.selected_model_is_allowed()?;
         match &self.backend {
             Backend::ChatCompletions { base_url, api_key } => {
@@ -483,13 +531,20 @@ impl OpenAiCompatible {
                     api_key.as_deref(),
                     messages,
                     tools,
+                    maximum_output_tokens,
                     &mut on_text_delta,
                 )
                 .await
             }
             Backend::ChatGptSubscription { auth } => {
-                self.complete_subscription(auth, messages, tools, &mut on_text_delta)
-                    .await
+                self.complete_subscription(
+                    auth,
+                    messages,
+                    tools,
+                    maximum_output_tokens,
+                    &mut on_text_delta,
+                )
+                .await
             }
         }
     }
@@ -500,8 +555,9 @@ impl OpenAiCompatible {
         api_key: Option<&str>,
         messages: &[Message],
         tools: &[Value],
+        maximum_output_tokens: Option<u64>,
         on_text_delta: &mut impl FnMut(&str),
-    ) -> Result<Message> {
+    ) -> Result<Completion> {
         let mut request = self
             .client
             .post(format!("{base_url}/chat/completions"))
@@ -512,6 +568,10 @@ impl OpenAiCompatible {
                 tool_choice: "auto",
                 parallel_tool_calls: true,
                 stream: true,
+                stream_options: ChatStreamOptions {
+                    include_usage: true,
+                },
+                max_completion_tokens: maximum_output_tokens,
                 reasoning_effort: self.reasoning_effort.as_deref(),
                 service_tier: self.service_tier.as_deref(),
             });
@@ -541,7 +601,14 @@ impl OpenAiCompatible {
                 .next()
                 .map(|choice| choice.message)
                 .context("model returned no choices")?;
-            return Ok(message);
+            return Ok(Completion {
+                message,
+                usage: parsed
+                    .usage
+                    .as_ref()
+                    .map(parse_token_usage)
+                    .unwrap_or_default(),
+            });
         }
         let mut stream = ChatCompletionStream::default();
         let body = read_sse(response, self.stream_idle_timeout, |data| {
@@ -557,14 +624,16 @@ impl OpenAiCompatible {
         auth: &OAuthStore,
         messages: &[Message],
         tools: &[Value],
+        maximum_output_tokens: Option<u64>,
         on_text_delta: &mut impl FnMut(&str),
-    ) -> Result<Message> {
+    ) -> Result<Completion> {
         let payload = responses_payload(
             &self.model,
             self.reasoning_effort.as_deref(),
             self.service_tier.as_deref(),
             messages,
             tools,
+            maximum_output_tokens,
             self.session_id,
         );
         let credentials = auth.credentials().await?;
@@ -658,6 +727,7 @@ fn responses_payload(
     service_tier: Option<&str>,
     messages: &[Message],
     tools: &[Value],
+    maximum_output_tokens: Option<u64>,
     session_id: Uuid,
 ) -> Value {
     let instructions = messages
@@ -745,6 +815,9 @@ fn responses_payload(
     if let Some(tier) = service_tier {
         payload["service_tier"] = json!(tier);
     }
+    if let Some(maximum_output_tokens) = maximum_output_tokens {
+        payload["max_output_tokens"] = json!(maximum_output_tokens);
+    }
     payload
 }
 
@@ -815,6 +888,15 @@ fn merge_model_capabilities(model: &mut ModelCatalogEntry, configured: &ModelCap
     merge_service_tiers(&mut model.service_tiers, &configured.service_tiers);
     merge_strings(&mut model.input_modalities, &configured.input_modalities);
     merge_strings(&mut model.output_modalities, &configured.output_modalities);
+    if configured.context_window_tokens.is_some() {
+        model.context_window_tokens = configured.context_window_tokens;
+    }
+    if configured.maximum_output_tokens.is_some() {
+        model.maximum_output_tokens = configured.maximum_output_tokens;
+    }
+    if configured.auto_compact_token_limit.is_some() {
+        model.auto_compact_token_limit = configured.auto_compact_token_limit;
+    }
     normalize_catalog_options(model);
 }
 
@@ -1083,6 +1165,7 @@ struct ResponsesStream {
     text: String,
     calls: Vec<ToolCall>,
     completed_output: Option<Vec<Value>>,
+    usage: TokenUsage,
 }
 
 impl ResponsesStream {
@@ -1108,6 +1191,9 @@ impl ResponsesStream {
                     .pointer("/response/output")
                     .and_then(Value::as_array)
                     .cloned();
+                if let Some(usage) = event.pointer("/response/usage") {
+                    self.usage = parse_token_usage(usage);
+                }
             }
             Some("response.failed" | "response.incomplete" | "error") => {
                 let message = event
@@ -1169,7 +1255,7 @@ impl ResponsesStream {
         }
     }
 
-    fn finish(mut self) -> Result<Message> {
+    fn finish(mut self) -> Result<Completion> {
         if self.text.is_empty()
             && self.calls.is_empty()
             && let Some(items) = self.completed_output.take()
@@ -1178,11 +1264,15 @@ impl ResponsesStream {
                 self.collect_item(&item, &mut |_| {});
             }
         }
-        completed_message(
+        let message = completed_message(
             self.text,
             self.calls,
             "ChatGPT returned no message or tool call",
-        )
+        )?;
+        Ok(Completion {
+            message,
+            usage: self.usage,
+        })
     }
 }
 
@@ -1197,6 +1287,7 @@ struct ChatToolCall {
 struct ChatCompletionStream {
     text: String,
     calls: Vec<ChatToolCall>,
+    usage: TokenUsage,
 }
 
 impl ChatCompletionStream {
@@ -1208,6 +1299,9 @@ impl ChatCompletionStream {
             serde_json::from_str(data).context("invalid Chat Completions stream event")?;
         if let Some(message) = event.pointer("/error/message").and_then(Value::as_str) {
             anyhow::bail!("{message}");
+        }
+        if let Some(usage) = event.get("usage").filter(|usage| !usage.is_null()) {
+            self.usage = parse_token_usage(usage);
         }
         let Some(delta) = event.pointer("/choices/0/delta") else {
             return Ok(());
@@ -1242,7 +1336,7 @@ impl ChatCompletionStream {
         Ok(())
     }
 
-    fn finish(self) -> Result<Message> {
+    fn finish(self) -> Result<Completion> {
         let calls = self
             .calls
             .into_iter()
@@ -1260,8 +1354,46 @@ impl ChatCompletionStream {
                 },
             })
             .collect();
-        completed_message(self.text, calls, "model returned no message or tool call")
+        let message =
+            completed_message(self.text, calls, "model returned no message or tool call")?;
+        Ok(Completion {
+            message,
+            usage: self.usage,
+        })
     }
+}
+
+fn parse_token_usage(value: &Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: value
+            .get("input_tokens")
+            .or_else(|| value.get("prompt_tokens"))
+            .and_then(Value::as_u64),
+        output_tokens: value
+            .get("output_tokens")
+            .or_else(|| value.get("completion_tokens"))
+            .and_then(Value::as_u64),
+        cached_input_tokens: value
+            .pointer("/input_tokens_details/cached_tokens")
+            .or_else(|| value.pointer("/prompt_tokens_details/cached_tokens"))
+            .and_then(Value::as_u64),
+        reasoning_output_tokens: value
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .or_else(|| value.pointer("/completion_tokens_details/reasoning_tokens"))
+            .and_then(Value::as_u64),
+    }
+}
+
+pub(crate) fn context_length_exceeded(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn completed_message(text: String, calls: Vec<ToolCall>, empty_error: &str) -> Result<Message> {
@@ -1311,12 +1443,70 @@ mod tests {
             tool_choice: "auto",
             parallel_tool_calls: true,
             stream: true,
+            stream_options: ChatStreamOptions {
+                include_usage: true,
+            },
+            max_completion_tokens: None,
             reasoning_effort: None,
             service_tier: None,
         };
 
         let payload = serde_json::to_value(request).unwrap();
         assert_eq!(payload["parallel_tool_calls"], true);
+        assert_eq!(payload["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn parses_usage_from_both_streaming_protocol_shapes() {
+        let responses = parse_token_usage(&json!({
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "input_tokens_details": {"cached_tokens": 80},
+            "output_tokens_details": {"reasoning_tokens": 12}
+        }));
+        assert_eq!(
+            responses,
+            TokenUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+                cached_input_tokens: Some(80),
+                reasoning_output_tokens: Some(12),
+            }
+        );
+
+        let chat = parse_token_usage(&json!({
+            "prompt_tokens": 90,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 50},
+            "completion_tokens_details": {"reasoning_tokens": 7}
+        }));
+        assert_eq!(chat.input_tokens, Some(90));
+        assert_eq!(chat.output_tokens, Some(20));
+        assert_eq!(chat.cached_input_tokens, Some(50));
+        assert_eq!(chat.reasoning_output_tokens, Some(7));
+    }
+
+    #[test]
+    fn catalog_retains_context_and_compaction_metadata() {
+        let model: ModelCatalogEntry = serde_json::from_value(json!({
+            "slug": "model",
+            "display_name": "Model",
+            "description": null,
+            "supported_reasoning_levels": [],
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 0,
+            "service_tiers": [],
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "context_window": 200000,
+            "max_output_tokens": 32000,
+            "auto_compact_limit": 150000
+        }))
+        .unwrap();
+        assert_eq!(model.context_window_tokens, Some(200_000));
+        assert_eq!(model.maximum_output_tokens, Some(32_000));
+        assert_eq!(model.auto_compact_token_limit, Some(150_000));
     }
 
     #[test]
@@ -1356,6 +1546,7 @@ mod tests {
             Some("fast"),
             &messages,
             &[],
+            Some(8_000),
             Uuid::nil(),
         );
         assert_eq!(payload["instructions"], "system");
@@ -1364,6 +1555,7 @@ mod tests {
         assert_eq!(payload["parallel_tool_calls"], true);
         assert_eq!(payload["reasoning"]["effort"], "high");
         assert_eq!(payload["service_tier"], "fast");
+        assert_eq!(payload["max_output_tokens"], 8_000);
     }
 
     #[test]
@@ -1380,7 +1572,7 @@ mod tests {
             "event: response.output_item.done\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"b.rs\\\"}\"}}\n\n",
             "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[],\"usage\":{\"input_tokens\":42,\"output_tokens\":9}}}\n\n"
         );
         let mut deltas = Vec::new();
         let mut decoder = SseDecoder::default();
@@ -1390,13 +1582,15 @@ mod tests {
                 .push(&data, &mut |delta| deltas.push(delta.to_owned()))
                 .unwrap();
         }
-        let message = stream.finish().unwrap();
-        assert_eq!(message.content.as_deref(), Some("hello"));
+        let completion = stream.finish().unwrap();
+        assert_eq!(completion.message.content.as_deref(), Some("hello"));
         assert_eq!(deltas, ["hel", "lo"]);
-        let calls = message.tool_calls.as_ref().unwrap();
+        let calls = completion.message.tool_calls.as_ref().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[1].id, "call_2");
+        assert_eq!(completion.usage.input_tokens, Some(42));
+        assert_eq!(completion.usage.output_tokens, Some(9));
     }
 
     #[test]
@@ -1407,20 +1601,23 @@ mod tests {
             r#"{"choices":[{"delta":{"role":"assistant","content":"hel"}}]}"#,
             r#"{"choices":[{"delta":{"content":"lo","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_","arguments":"{\"path\":"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":55,"completion_tokens":8}}"#,
         ] {
             stream
                 .push(data, &mut |delta| deltas.push(delta.to_owned()))
                 .unwrap();
         }
 
-        let message = stream.finish().unwrap();
+        let completion = stream.finish().unwrap();
 
-        assert_eq!(message.content.as_deref(), Some("hello"));
+        assert_eq!(completion.message.content.as_deref(), Some("hello"));
         assert_eq!(deltas, ["hel", "lo"]);
-        let call = &message.tool_calls.unwrap()[0];
+        let call = &completion.message.tool_calls.unwrap()[0];
         assert_eq!(call.id, "call_1");
         assert_eq!(call.function.name, "read_file");
         assert_eq!(call.function.arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(completion.usage.input_tokens, Some(55));
+        assert_eq!(completion.usage.output_tokens, Some(8));
     }
 
     #[tokio::test]
@@ -1484,8 +1681,8 @@ mod tests {
             .unwrap();
         assert_eq!(first, "hello ");
         release_tx.send(()).unwrap();
-        let message = completion.await.unwrap().unwrap();
-        assert_eq!(message.content.as_deref(), Some("hello world"));
+        let completion = completion.await.unwrap().unwrap();
+        assert_eq!(completion.message.content.as_deref(), Some("hello world"));
         let request = server.await.unwrap();
         assert!(request.contains("\"stream\":true"));
     }
@@ -1525,12 +1722,12 @@ mod tests {
         };
         let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
 
-        let message = provider
+        let completion = provider
             .complete(&[Message::text(Role::User, "Count")], &[], |_| {})
             .await
             .unwrap();
 
-        assert_eq!(message.content.as_deref(), Some("one two three"));
+        assert_eq!(completion.message.content.as_deref(), Some("one two three"));
         server.await.unwrap();
     }
 

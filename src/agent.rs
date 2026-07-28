@@ -14,12 +14,17 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::{
+    compaction::{
+        active_projection, compaction_threshold, estimate_message, estimate_messages,
+        reduce_compaction_end, select_compaction_end, select_tail_start, summarizer_messages,
+        tuning::CompactionTuning,
+    },
     events::{AgentActivity, AgentEvent},
     provider::{
         Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role, ToolCall,
-        default_model_selection,
+        context_length_exceeded, default_model_selection,
     },
-    session::{GoalStatus, Session},
+    session::{CompactionCheckpoint, CompactionTrigger, GoalStatus, RequestUsage, Session},
     skills::{Skill, SkillRegistry},
     tools::ToolBox,
 };
@@ -30,6 +35,10 @@ pub(crate) struct Agent {
     skills: SkillRegistry,
     session: Session,
     project_instructions: Option<ProjectInstructions>,
+    model_catalog: Vec<ModelCatalogEntry>,
+    compaction_tuning: CompactionTuning,
+    reported_missing_context_metadata: bool,
+    compaction_debounce_tokens: Option<u64>,
 }
 
 const GOAL_CONTINUATION_PROMPT: &str = "Continue working toward the active goal. Review the \
@@ -58,6 +67,16 @@ struct ProjectInstructions {
     content: String,
 }
 
+#[derive(Clone, Copy)]
+struct CompactionPreflight<'a> {
+    trigger: CompactionTrigger,
+    system: &'a str,
+    pending: Option<&'a Message>,
+    turn_message_index: usize,
+    force: bool,
+    events: Option<&'a mpsc::UnboundedSender<AgentEvent>>,
+}
+
 impl Agent {
     pub(crate) fn new(
         mut provider: OpenAiCompatible,
@@ -77,6 +96,10 @@ impl Agent {
             skills,
             session,
             project_instructions,
+            model_catalog: Vec::new(),
+            compaction_tuning: CompactionTuning::default(),
+            reported_missing_context_metadata: false,
+            compaction_debounce_tokens: None,
         })
     }
 
@@ -88,8 +111,10 @@ impl Agent {
         self.tools.root()
     }
 
-    pub(crate) async fn fetch_models(&self) -> Result<Vec<ModelCatalogEntry>> {
-        self.provider.fetch_models().await
+    pub(crate) async fn fetch_models(&mut self) -> Result<Vec<ModelCatalogEntry>> {
+        let catalog = self.provider.fetch_models().await?;
+        self.model_catalog.clone_from(&catalog);
+        Ok(catalog)
     }
 
     pub(crate) fn set_model_selection(&mut self, selection: ModelSelection) {
@@ -97,16 +122,9 @@ impl Agent {
         self.session.model = selection.model;
         self.session.reasoning_effort = selection.reasoning_effort;
         self.session.service_tier = selection.service_tier;
+        self.reported_missing_context_metadata = false;
+        self.compaction_debounce_tokens = None;
         self.session.updated_at = Utc::now();
-    }
-
-    pub(crate) fn replace_session(&mut self, session: Session) {
-        self.provider.set_selection(&ModelSelection {
-            model: session.model.clone(),
-            reasoning_effort: session.reasoning_effort.clone(),
-            service_tier: session.service_tier.clone(),
-        });
-        self.session = session;
     }
 
     pub(crate) fn resolve_auto_model(&mut self, catalog: &[ModelCatalogEntry]) -> bool {
@@ -130,23 +148,37 @@ impl Agent {
         self.session.activities.clear();
         self.session.reset_event_sequence();
         self.session.turns.clear();
+        self.session.compaction_checkpoints.clear();
+        self.session.latest_request_usage = None;
+        self.compaction_debounce_tokens = None;
         self.session.title = "New session".into();
         self.session.updated_at = Utc::now();
     }
 
+    #[cfg(test)]
     pub(crate) async fn turn(&mut self, prompt: &str) -> Result<String> {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         self.turn_inner(prompt, false, None, cancel_rx).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn turn_with_events(
         &mut self,
         prompt: &str,
         events: mpsc::UnboundedSender<AgentEvent>,
         cancellation: watch::Receiver<bool>,
     ) -> Result<String> {
-        self.turn_inner(prompt, false, Some(events), cancellation)
+        self.turn_controlled(prompt, Some(events), cancellation)
             .await
+    }
+
+    pub(crate) async fn turn_controlled(
+        &mut self,
+        prompt: &str,
+        events: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<String> {
+        self.turn_inner(prompt, false, events, cancellation).await
     }
 
     pub(crate) async fn continue_goal_with_events(
@@ -154,10 +186,19 @@ impl Agent {
         events: mpsc::UnboundedSender<AgentEvent>,
         cancellation: watch::Receiver<bool>,
     ) -> Result<String> {
+        self.continue_goal_controlled(Some(events), cancellation)
+            .await
+    }
+
+    pub(crate) async fn continue_goal_controlled(
+        &mut self,
+        events: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<String> {
         if self.session.active_goal().is_none() {
             anyhow::bail!("there is no active goal to continue");
         }
-        self.turn_inner(GOAL_CONTINUATION_PROMPT, true, Some(events), cancellation)
+        self.turn_inner(GOAL_CONTINUATION_PROMPT, true, events, cancellation)
             .await
     }
 
@@ -195,35 +236,73 @@ impl Agent {
         {
             explicit_skills.push_str(&self.skills.explicit_instructions(&goal.objective)?);
         }
-        if self.session.messages.is_empty() && !hidden_prompt {
-            self.session.title = prompt.chars().take(72).collect();
-        }
         let user_message = if hidden_prompt {
             Message::hidden_text(Role::User, prompt)
         } else {
             Message::text(Role::User, prompt)
         };
+        if self.session.messages.is_empty() && !hidden_prompt {
+            self.session.title = prompt.chars().take(72).collect();
+        }
         self.session.messages.push(user_message.clone());
         if !hidden_prompt && let Some(events) = &events {
             let _ = events.send(AgentEvent::UserMessage(user_message));
         }
         let turn_message_index = self.session.messages.len() - 1;
         self.session.start_turn(turn_message_index, turn_started_at);
+        let before_turn_system = self.system_context(&explicit_skills);
+        let before_turn_trigger = if self
+            .session
+            .latest_request_usage
+            .as_ref()
+            .is_some_and(|usage| usage.model != self.session.model)
+        {
+            CompactionTrigger::SmallerModel
+        } else {
+            CompactionTrigger::BeforeTurn
+        };
+        self.compact_until_safe(
+            CompactionPreflight {
+                trigger: before_turn_trigger,
+                system: &before_turn_system,
+                pending: None,
+                turn_message_index,
+                force: false,
+                events: events.as_ref(),
+            },
+            &mut cancellation,
+        )
+        .await?;
 
-        loop {
+        let mut overflow_recoveries = 0;
+        'agent_loop: loop {
             if *cancellation.borrow() {
                 self.session.updated_at = Utc::now();
                 return Err(TurnCancelled.into());
             }
-            let system = format!(
-                "{}{}{}{}",
-                system_prompt(self.tools.root(), self.project_instructions.as_ref()),
-                self.skills.catalog_prompt(),
-                explicit_skills,
-                goal_prompt(&self.session)
-            );
+            let system = self.system_context(&explicit_skills);
+            self.compact_until_safe(
+                CompactionPreflight {
+                    trigger: CompactionTrigger::BetweenModelRequests,
+                    system: &system,
+                    pending: None,
+                    turn_message_index,
+                    force: false,
+                    events: events.as_ref(),
+                },
+                &mut cancellation,
+            )
+            .await?;
             let mut messages = vec![Message::text(Role::System, system)];
-            messages.extend(self.session.messages.clone());
+            messages.extend(active_projection(
+                &self.session.messages,
+                self.session.latest_compaction(),
+            ));
+            let request_message_count = self.session.messages.len();
+            let request_checkpoint_id = self
+                .session
+                .latest_compaction()
+                .map(|checkpoint| checkpoint.id);
             let mut definitions = self.tools.definitions();
             definitions.extend(self.skills.definitions());
             if self.session.active_goal().is_some() {
@@ -283,12 +362,65 @@ impl Agent {
                     }
                 };
                 match result {
-                    Ok(response) => {
+                    Ok(completion) => {
+                        self.record_request_usage(
+                            completion.usage,
+                            request_message_count,
+                            request_checkpoint_id,
+                        );
                         break (
-                            response,
+                            completion.message,
                             streamed_text,
                             response_created_at,
                             response_sequence,
+                        );
+                    }
+                    Err(error)
+                        if context_length_exceeded(&error)
+                            && overflow_recoveries
+                                < self.compaction_tuning.maximum_overflow_recoveries =>
+                    {
+                        overflow_recoveries += 1;
+                        if !streamed_text
+                            .lock()
+                            .expect("streamed text mutex poisoned")
+                            .is_empty()
+                            && let Some(events) = &events
+                        {
+                            let _ = events.send(AgentEvent::AssistantStreamReset);
+                        }
+                        let compacted = self
+                            .compact_until_safe(
+                                CompactionPreflight {
+                                    trigger: CompactionTrigger::ContextLengthExceeded,
+                                    system: messages
+                                        .first()
+                                        .and_then(|message| message.content.as_deref())
+                                        .unwrap_or_default(),
+                                    pending: None,
+                                    turn_message_index,
+                                    force: true,
+                                    events: events.as_ref(),
+                                },
+                                &mut cancellation,
+                            )
+                            .await?;
+                        if compacted {
+                            continue 'agent_loop;
+                        }
+                        retry += 1;
+                        let error_text = format!("{error:#}");
+                        let retry_sequence = self.session.reserve_event_sequence();
+                        self.record_activity(
+                            AgentActivity::model_retry(
+                                format!("model-retry-{}", Uuid::new_v4()),
+                                turn_message_index,
+                                retry_sequence,
+                                retry,
+                                MAX_MODEL_RETRIES,
+                                error_text,
+                            ),
+                            events.as_ref(),
                         );
                     }
                     Err(error) if retry < MAX_MODEL_RETRIES => {
@@ -463,6 +595,339 @@ impl Agent {
                 });
             }
         }
+    }
+
+    fn system_context(&self, explicit_skills: &str) -> String {
+        format!(
+            "{}{}{}{}",
+            system_prompt(self.tools.root(), self.project_instructions.as_ref()),
+            self.skills.catalog_prompt(),
+            explicit_skills,
+            goal_prompt(&self.session)
+        )
+    }
+
+    fn selected_model_metadata(&self) -> Option<&ModelCatalogEntry> {
+        self.model_catalog
+            .iter()
+            .find(|model| model.slug == self.session.model)
+    }
+
+    fn estimated_active_tokens(&self, system: &str, pending: Option<&Message>) -> u64 {
+        let checkpoint_id = self
+            .session
+            .latest_compaction()
+            .map(|checkpoint| checkpoint.id);
+        let measured = self
+            .session
+            .latest_request_usage
+            .as_ref()
+            .filter(|usage| {
+                usage.model == self.session.model
+                    && usage.reasoning_effort == self.session.reasoning_effort
+                    && usage.service_tier == self.session.service_tier
+                    && usage.checkpoint_id == checkpoint_id
+                    && usage.canonical_message_count <= self.session.messages.len()
+            })
+            .and_then(|usage| usage.usage.input_tokens.map(|tokens| (usage, tokens)));
+        let mut estimate = if let Some((usage, tokens)) = measured {
+            tokens.saturating_add(estimate_messages(
+                &self.session.messages[usage.canonical_message_count..],
+                &self.compaction_tuning,
+            ))
+        } else {
+            let mut projection = vec![Message::text(Role::System, system)];
+            projection.extend(active_projection(
+                &self.session.messages,
+                self.session.latest_compaction(),
+            ));
+            estimate_messages(&projection, &self.compaction_tuning)
+        };
+        if let Some(pending) = pending {
+            estimate = estimate.saturating_add(estimate_message(pending, &self.compaction_tuning));
+        }
+        estimate
+    }
+
+    async fn compact_until_safe(
+        &mut self,
+        mut preflight: CompactionPreflight<'_>,
+        cancellation: &mut watch::Receiver<bool>,
+    ) -> Result<bool> {
+        let mut compacted = false;
+        for _ in 0..self
+            .compaction_tuning
+            .maximum_compaction_chunks_per_preflight
+        {
+            if !self.maybe_compact(preflight, cancellation).await? {
+                break;
+            }
+            compacted = true;
+            preflight.force = false;
+        }
+        Ok(compacted)
+    }
+
+    async fn maybe_compact(
+        &mut self,
+        preflight: CompactionPreflight<'_>,
+        cancellation: &mut watch::Receiver<bool>,
+    ) -> Result<bool> {
+        let CompactionPreflight {
+            trigger,
+            system,
+            pending,
+            turn_message_index,
+            force,
+            events,
+        } = preflight;
+        let model = self.selected_model_metadata();
+        let (threshold, metadata_available) = compaction_threshold(model, &self.compaction_tuning);
+        let before_tokens = self.estimated_active_tokens(system, pending);
+        if !force && before_tokens <= threshold {
+            return Ok(false);
+        }
+        if !metadata_available && !self.reported_missing_context_metadata {
+            eprintln!(
+                "CodeCrab context compaction is using the conservative fallback context window \
+because model {:?} publishes no context-window metadata",
+                self.session.model
+            );
+            self.reported_missing_context_metadata = true;
+        }
+        if !force
+            && self.compaction_debounce_tokens.is_some_and(|base| {
+                before_tokens <= base.saturating_add(self.compaction_tuning.hysteresis_tokens)
+            })
+        {
+            return Ok(false);
+        }
+
+        let normal_tail = self
+            .compaction_tuning
+            .recent_tail_tokens
+            .clamp(
+                self.compaction_tuning.minimum_recent_tail_tokens,
+                self.compaction_tuning.maximum_recent_tail_tokens,
+            )
+            .saturating_sub(self.compaction_tuning.hysteresis_tokens);
+        let tail_budget = if force {
+            normal_tail
+                .saturating_sub(self.compaction_tuning.overflow_recovery_reduction_tokens)
+                .max(self.compaction_tuning.minimum_recent_tail_tokens)
+        } else {
+            normal_tail
+        };
+        let previous = self.session.latest_compaction().cloned();
+        let Some(desired_tail_start) = select_tail_start(
+            &self.session.messages,
+            previous.as_ref(),
+            tail_budget,
+            &self.compaction_tuning,
+        ) else {
+            return Ok(false);
+        };
+        let summary_input_budget = threshold
+            .saturating_sub(self.compaction_tuning.maximum_summary_output_tokens)
+            .max(self.compaction_tuning.minimum_summarizer_input_tokens)
+            .min(threshold);
+        let mut tail_start = select_compaction_end(
+            &self.session.messages,
+            previous.as_ref(),
+            desired_tail_start,
+            summary_input_budget,
+            &self.compaction_tuning,
+        );
+
+        let mut activity = AgentActivity::compaction_started(
+            format!("context-compaction-{}", Uuid::new_v4()),
+            turn_message_index,
+            self.session.reserve_event_sequence(),
+            before_tokens,
+        );
+        self.record_activity(activity.clone(), events);
+        if events.is_none() {
+            eprintln!("\x1b[2m  crab → {}\x1b[0m", activity.title);
+        }
+
+        let mut summary_messages = summarizer_messages(
+            &self.session.messages,
+            previous.as_ref(),
+            tail_start,
+            &self.compaction_tuning,
+        );
+        let mut attempts = 0;
+        let completion = loop {
+            let result = tokio::select! {
+                result = self.provider.complete_with_max_output(
+                    &summary_messages,
+                    &[],
+                    Some(self.compaction_tuning.maximum_summary_output_tokens),
+                    |_| {},
+                ) => result,
+                () = wait_for_cancellation(cancellation) => {
+                    activity.finish_compaction(
+                        false,
+                        before_tokens,
+                        None,
+                        Some("cancelled by user"),
+                    );
+                    self.record_activity(activity, events);
+                    self.session.updated_at = Utc::now();
+                    return Err(TurnCancelled.into());
+                }
+            };
+            match result {
+                Ok(completion)
+                    if completion
+                        .message
+                        .content
+                        .as_deref()
+                        .is_some_and(|summary| !summary.trim().is_empty())
+                        && completion
+                            .message
+                            .tool_calls
+                            .as_ref()
+                            .is_none_or(Vec::is_empty) =>
+                {
+                    break completion;
+                }
+                Ok(_) => {
+                    attempts += 1;
+                    if attempts > self.compaction_tuning.maximum_summary_retries {
+                        self.compaction_debounce_tokens = Some(before_tokens);
+                        eprintln!(
+                            "CodeCrab context compaction failed: the model returned no usable summary"
+                        );
+                        activity.finish_compaction(
+                            false,
+                            before_tokens,
+                            None,
+                            Some("the model returned no usable summary"),
+                        );
+                        self.record_activity(activity, events);
+                        return Ok(false);
+                    }
+                    let error = "the model returned no usable summary".to_owned();
+                    eprintln!(
+                        "CodeCrab context compaction failed; retrying ({attempts}/{}): {error}",
+                        self.compaction_tuning.maximum_summary_retries
+                    );
+                    let retry_sequence = self.session.reserve_event_sequence();
+                    self.record_activity(
+                        AgentActivity::compaction_retry(
+                            format!("context-compaction-retry-{}", Uuid::new_v4()),
+                            turn_message_index,
+                            retry_sequence,
+                            attempts,
+                            self.compaction_tuning.maximum_summary_retries,
+                            error,
+                        ),
+                        events,
+                    );
+                }
+                Err(error) => {
+                    attempts += 1;
+                    let error_text = format!("{error:#}");
+                    let reduced = if context_length_exceeded(&error)
+                        && attempts <= self.compaction_tuning.maximum_summary_retries
+                        && let Some(smaller_end) = reduce_compaction_end(
+                            &self.session.messages,
+                            previous.as_ref(),
+                            tail_start,
+                        ) {
+                        tail_start = smaller_end;
+                        summary_messages = summarizer_messages(
+                            &self.session.messages,
+                            previous.as_ref(),
+                            tail_start,
+                            &self.compaction_tuning,
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    if attempts > self.compaction_tuning.maximum_summary_retries {
+                        self.compaction_debounce_tokens = Some(before_tokens);
+                        eprintln!(
+                            "CodeCrab context compaction failed after {} retries: {error_text}",
+                            self.compaction_tuning.maximum_summary_retries
+                        );
+                        activity.finish_compaction(false, before_tokens, None, Some(&error_text));
+                        self.record_activity(activity, events);
+                        return Ok(false);
+                    }
+                    eprintln!(
+                        "CodeCrab context compaction failed; retrying ({attempts}/{}): {error_text}",
+                        self.compaction_tuning.maximum_summary_retries
+                    );
+                    let retry_sequence = self.session.reserve_event_sequence();
+                    self.record_activity(
+                        AgentActivity::compaction_retry(
+                            format!("context-compaction-retry-{}", Uuid::new_v4()),
+                            turn_message_index,
+                            retry_sequence,
+                            attempts,
+                            self.compaction_tuning.maximum_summary_retries,
+                            error_text,
+                        ),
+                        events,
+                    );
+                    if reduced {
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let checkpoint = CompactionCheckpoint {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            trigger,
+            covered_from_message_index: 0,
+            covered_through_message_index: tail_start.saturating_sub(1),
+            recent_tail_starts_at_message_index: tail_start,
+            summary: completion
+                .message
+                .content
+                .expect("validated compaction summary content"),
+            provider: self.session.provider.clone(),
+            model: self.session.model.clone(),
+            reasoning_effort: self.session.reasoning_effort.clone(),
+            service_tier: self.session.service_tier.clone(),
+            usage: completion.usage,
+            previous_checkpoint_id: previous.as_ref().map(|checkpoint| checkpoint.id),
+        };
+        let mut compacted_projection = vec![Message::text(Role::System, system)];
+        compacted_projection.extend(active_projection(&self.session.messages, Some(&checkpoint)));
+        if let Some(pending) = pending {
+            compacted_projection.push(pending.clone());
+        }
+        let after_tokens = estimate_messages(&compacted_projection, &self.compaction_tuning);
+        self.session.compaction_checkpoints.push(checkpoint);
+        self.session.updated_at = Utc::now();
+        self.compaction_debounce_tokens = (after_tokens <= threshold).then_some(after_tokens);
+        activity.finish_compaction(true, before_tokens, Some(after_tokens), None);
+        self.record_activity(activity, events);
+        Ok(true)
+    }
+
+    fn record_request_usage(
+        &mut self,
+        usage: crate::provider::TokenUsage,
+        canonical_message_count: usize,
+        checkpoint_id: Option<Uuid>,
+    ) {
+        self.session.latest_request_usage = Some(RequestUsage {
+            recorded_at: Utc::now(),
+            provider: self.session.provider.clone(),
+            model: self.session.model.clone(),
+            reasoning_effort: self.session.reasoning_effort.clone(),
+            service_tier: self.session.service_tier.clone(),
+            canonical_message_count,
+            checkpoint_id,
+            usage,
+        });
     }
 
     fn record_activity(
@@ -1573,5 +2038,905 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_preserves_raw_history_and_sends_one_summary_plus_tail() {
+        let responses = [
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "## User objective\nPreserve the old verified decision."
+                    }
+                }],
+                "usage": {"prompt_tokens": 70, "completion_tokens": 12}
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Compaction worked."
+                    }
+                }],
+                "usage": {"prompt_tokens": 45, "completion_tokens": 4}
+            })
+            .to_string(),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for body in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65_536];
+                let read = socket.read(&mut request).await.unwrap();
+                request.truncate(read);
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        let old_secret = "old-verified-decision-".repeat(60);
+        session
+            .messages
+            .push(Message::text(Role::User, old_secret.clone()));
+        session.messages.push(Message::text(
+            Role::Assistant,
+            "old-exact-answer-".repeat(80),
+        ));
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        let original = session.messages.clone();
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_percent: 80,
+            fallback_context_window_tokens: 4_000,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 20,
+            minimum_recent_tail_tokens: 5,
+            maximum_recent_tail_tokens: 30,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Continue").await.unwrap();
+        assert_eq!(answer, "Compaction worked.");
+        assert_eq!(agent.session.messages.len(), original.len() + 2);
+        for (persisted, expected) in agent.session.messages.iter().zip(&original) {
+            assert_eq!(persisted.content, expected.content);
+            assert_eq!(persisted.tool_call_id, expected.tool_call_id);
+        }
+        assert_eq!(agent.session.compaction_checkpoints.len(), 1);
+        let checkpoint = &agent.session.compaction_checkpoints[0];
+        assert_eq!(checkpoint.covered_from_message_index, 0);
+        assert_eq!(checkpoint.covered_through_message_index, 1);
+        assert_eq!(checkpoint.recent_tail_starts_at_message_index, 2);
+        assert_eq!(checkpoint.usage.input_tokens, Some(70));
+        assert!(agent.session.activities.iter().any(|activity| {
+            activity.title == "Context compacted"
+                && activity.status == crate::events::ActivityStatus::Completed
+        }));
+
+        let summary_request = request_rx.recv().await.unwrap();
+        let active_request = request_rx.recv().await.unwrap();
+        assert!(summary_request.contains(&old_secret));
+        assert!(active_request.contains("rolling_conversation_summary"));
+        assert!(active_request.contains("recent"));
+        assert!(!active_request.contains(&old_secret));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn selecting_a_smaller_model_compacts_before_its_first_request() {
+        let responses = [
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "## User objective\nContinue on the smaller model."
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Continued on the smaller model."
+                    }
+                }]
+            })
+            .to_string(),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for body in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65_536];
+                let read = socket.read(&mut request).await.unwrap();
+                request.truncate(read);
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("small-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("small-model".into()).unwrap();
+        session
+            .messages
+            .push(Message::text(Role::User, "large-old-request-".repeat(100)));
+        session.messages.push(Message::text(
+            Role::Assistant,
+            "large-old-answer-".repeat(100),
+        ));
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        session.latest_request_usage = Some(RequestUsage {
+            recorded_at: Utc::now(),
+            provider: session.provider.clone(),
+            model: "large-model".into(),
+            reasoning_effort: None,
+            service_tier: None,
+            canonical_message_count: session.messages.len(),
+            checkpoint_id: None,
+            usage: crate::provider::TokenUsage {
+                input_tokens: Some(2_000),
+                ..crate::provider::TokenUsage::default()
+            },
+        });
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        let mut small_model = ModelCatalogEntry::from_id("small-model".into());
+        small_model.context_window_tokens = Some(4_000);
+        small_model.maximum_output_tokens = Some(100);
+        agent.model_catalog = vec![small_model];
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_percent: 80,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 20,
+            minimum_recent_tail_tokens: 5,
+            maximum_recent_tail_tokens: 30,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Continue").await.unwrap();
+        assert_eq!(answer, "Continued on the smaller model.");
+        assert_eq!(agent.session.compaction_checkpoints.len(), 1);
+        assert_eq!(
+            agent.session.compaction_checkpoints[0].trigger,
+            CompactionTrigger::SmallerModel
+        );
+        let _summary_request = request_rx.recv().await.unwrap();
+        let first_small_model_request = request_rx.recv().await.unwrap();
+        assert!(first_small_model_request.contains("rolling_conversation_summary"));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_runs_between_model_requests_after_tool_results_grow_context() {
+        let responses = [
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "I’ll inspect the project.",
+                        "tool_calls": [{
+                            "id": "list-1",
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "arguments": "{\"path\":\".\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 3_190, "completion_tokens": 20}
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "## User objective\nContinue after inspecting the project."
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Continued after mid-loop compaction."
+                    }
+                }]
+            })
+            .to_string(),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for body in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65_536];
+                let read = socket.read(&mut request).await.unwrap();
+                request.truncate(read);
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("entry.txt"), "small project entry").unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        session
+            .messages
+            .push(Message::text(Role::User, "old request"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "old answer"));
+        session
+            .messages
+            .push(Message::text(Role::User, "recent request"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "recent answer"));
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 4_000,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 20,
+            minimum_recent_tail_tokens: 5,
+            maximum_recent_tail_tokens: 30,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Inspect, then continue").await.unwrap();
+        assert_eq!(answer, "Continued after mid-loop compaction.");
+        assert_eq!(agent.session.compaction_checkpoints.len(), 1);
+        assert_eq!(
+            agent.session.compaction_checkpoints[0].trigger,
+            CompactionTrigger::BetweenModelRequests
+        );
+
+        let first_active_request = request_rx.recv().await.unwrap();
+        let summary_request = request_rx.recv().await.unwrap();
+        let second_active_request = request_rx.recv().await.unwrap();
+        assert!(!first_active_request.contains("rolling_conversation_summary"));
+        assert!(summary_request.contains("old request"));
+        assert!(second_active_request.contains("rolling_conversation_summary"));
+        assert!(second_active_request.contains("list-1"));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_history_is_compacted_in_multiple_oldest_first_chunks() {
+        let responses = [
+            json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "summary v1"}
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "summary v2"}
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Chunked compaction worked."}
+                }]
+            })
+            .to_string(),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for body in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65_536];
+                let read = socket.read(&mut request).await.unwrap();
+                request.truncate(read);
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        let first_secret = "FIRST_OLD_TURN_".repeat(70);
+        let second_secret = "SECOND_OLD_TURN_".repeat(70);
+        session
+            .messages
+            .push(Message::text(Role::User, first_secret.clone()));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "first answer ".repeat(70)));
+        session
+            .messages
+            .push(Message::text(Role::User, second_secret.clone()));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "second answer ".repeat(70)));
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 4_000,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 50,
+            minimum_recent_tail_tokens: 10,
+            maximum_recent_tail_tokens: 100,
+            maximum_summary_output_tokens: 200,
+            minimum_summarizer_input_tokens: 100,
+            maximum_compaction_chunks_per_preflight: 4,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Continue").await.unwrap();
+        assert_eq!(answer, "Chunked compaction worked.");
+        assert_eq!(agent.session.compaction_checkpoints.len(), 2);
+        assert_eq!(
+            agent.session.compaction_checkpoints[1].previous_checkpoint_id,
+            Some(agent.session.compaction_checkpoints[0].id)
+        );
+        assert_eq!(
+            agent.session.compaction_checkpoints[0].recent_tail_starts_at_message_index,
+            2
+        );
+        assert_eq!(
+            agent.session.compaction_checkpoints[1].recent_tail_starts_at_message_index,
+            4
+        );
+
+        let first_summary_request = request_rx.recv().await.unwrap();
+        let second_summary_request = request_rx.recv().await.unwrap();
+        let active_request = request_rx.recv().await.unwrap();
+        assert!(first_summary_request.contains(&first_secret));
+        assert!(!first_summary_request.contains(&second_secret));
+        assert!(second_summary_request.contains("summary v1"));
+        assert!(second_summary_request.contains(&second_secret));
+        assert!(!second_summary_request.contains(&first_secret));
+        assert!(active_request.contains("summary v2"));
+        assert!(!active_request.contains(&first_secret));
+        assert!(!active_request.contains(&second_secret));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn summarizer_context_error_retries_with_fewer_final_turns() {
+        let responses = [
+            (
+                "400 Bad Request",
+                json!({
+                    "error": {
+                        "message": "Your input exceeds the context window of this model."
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "summary v1"}
+                    }]
+                })
+                .to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "summary v2"}
+                    }]
+                })
+                .to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "Recovered summary."}
+                    }]
+                })
+                .to_string(),
+            ),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65_536];
+                let read = socket.read(&mut request).await.unwrap();
+                request.truncate(read);
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        let first = "FIRST_SMALL_".repeat(10);
+        let second = "SECOND_SMALL_".repeat(10);
+        let third = "THIRD_LARGE_".repeat(35);
+        for (user, assistant) in [
+            (&first, "first answer ".repeat(10)),
+            (&second, "second answer ".repeat(10)),
+            (&third, "third answer ".repeat(35)),
+        ] {
+            session
+                .messages
+                .push(Message::text(Role::User, user.clone()));
+            session
+                .messages
+                .push(Message::text(Role::Assistant, assistant));
+        }
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 4_000,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 50,
+            minimum_recent_tail_tokens: 10,
+            maximum_recent_tail_tokens: 100,
+            maximum_summary_output_tokens: 100,
+            minimum_summarizer_input_tokens: 100,
+            maximum_summary_retries: 2,
+            maximum_compaction_chunks_per_preflight: 4,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Continue").await.unwrap();
+        assert_eq!(answer, "Recovered summary.");
+        assert_eq!(agent.session.compaction_checkpoints.len(), 2);
+
+        let rejected_request = request_rx.recv().await.unwrap();
+        let reduced_request = request_rx.recv().await.unwrap();
+        let next_chunk_request = request_rx.recv().await.unwrap();
+        let _active_request = request_rx.recv().await.unwrap();
+        assert!(rejected_request.contains(&third));
+        assert!(!reduced_request.contains(&third));
+        assert!(reduced_request.contains(&first));
+        assert!(reduced_request.contains(&second));
+        assert!(next_chunk_request.contains("summary v1"));
+        assert!(next_chunk_request.contains(&third));
+        assert!(agent.session.activities.iter().any(|activity| {
+            activity.title == "Retrying context compaction (1/2)"
+                && activity.status == crate::events::ActivityStatus::Completed
+        }));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_length_error_runs_emergency_compaction_before_retrying() {
+        let responses = [
+            (
+                "400 Bad Request",
+                json!({
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "maximum context length exceeded"
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Emergency rolling summary"
+                        }
+                    }]
+                })
+                .to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Recovered after overflow."
+                        }
+                    }]
+                })
+                .to_string(),
+            ),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65_536];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        session
+            .messages
+            .push(Message::text(Role::User, "old request"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "old answer"));
+        session
+            .messages
+            .push(Message::text(Role::User, "recent request"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "recent answer"));
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 1_000_000,
+            recent_tail_tokens: 10,
+            minimum_recent_tail_tokens: 5,
+            maximum_recent_tail_tokens: 20,
+            overflow_recovery_reduction_tokens: 5,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Continue").await.unwrap();
+        assert_eq!(answer, "Recovered after overflow.");
+        assert_eq!(agent.session.compaction_checkpoints.len(), 1);
+        assert_eq!(
+            agent.session.compaction_checkpoints[0].trigger,
+            CompactionTrigger::ContextLengthExceeded
+        );
+        assert_eq!(
+            agent.session.compaction_checkpoints[0].recent_tail_starts_at_message_index,
+            4
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_keeps_the_original_projection_usable() {
+        let responses = [
+            (
+                "500 Internal Server Error",
+                json!({"error": {"message": "summary unavailable"}}).to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Continued with raw history."
+                        }
+                    }]
+                })
+                .to_string(),
+            ),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 65_536];
+                let read = socket.read(&mut request).await.unwrap();
+                request.truncate(read);
+                request_tx
+                    .send(String::from_utf8_lossy(&request).into_owned())
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        let old_secret = "raw-history-must-survive-".repeat(60);
+        session
+            .messages
+            .push(Message::text(Role::User, old_secret.clone()));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "old-answer-".repeat(100)));
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 4_000,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 200,
+            minimum_recent_tail_tokens: 50,
+            maximum_recent_tail_tokens: 300,
+            maximum_summary_retries: 0,
+            hysteresis_tokens: 100,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Continue").await.unwrap();
+        assert_eq!(answer, "Continued with raw history.");
+        assert!(agent.session.compaction_checkpoints.is_empty());
+        assert!(agent.session.activities.iter().any(|activity| {
+            activity.title == "Context compaction failed"
+                && activity.status == crate::events::ActivityStatus::Failed
+        }));
+        let _summary_request = request_rx.recv().await.unwrap();
+        let active_request = request_rx.recv().await.unwrap();
+        assert!(active_request.contains(&old_secret));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_compaction_keeps_the_user_prompt_and_no_checkpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_started = Arc::new(Notify::new());
+        let server_started = request_started.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 65_536];
+            let _ = socket.read(&mut request).await.unwrap();
+            server_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        session
+            .messages
+            .push(Message::text(Role::User, "large-old-request-".repeat(100)));
+        session.messages.push(Message::text(
+            Role::Assistant,
+            "large-old-answer-".repeat(100),
+        ));
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        let mut agent = Agent::new(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 4_000,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 20,
+            minimum_recent_tail_tokens: 5,
+            maximum_recent_tail_tokens: 30,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancellation) = watch::channel(false);
+        let turn = tokio::spawn(async move {
+            let result = agent
+                .turn_with_events("Keep this prompt", event_tx, cancellation)
+                .await;
+            (agent, result)
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), request_started.notified())
+            .await
+            .unwrap();
+        cancel_tx.send(true).unwrap();
+        let (agent, result) = tokio::time::timeout(Duration::from_secs(2), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(turn_was_cancelled(&result.unwrap_err()));
+        assert!(agent.session.compaction_checkpoints.is_empty());
+        assert_eq!(
+            agent
+                .session
+                .messages
+                .last()
+                .and_then(|message| message.content.as_deref()),
+            Some("Keep this prompt")
+        );
+        assert!(agent.session.activities.iter().any(|activity| {
+            activity.title == "Context compaction failed" && activity.detail == "cancelled by user"
+        }));
+        server.abort();
     }
 }

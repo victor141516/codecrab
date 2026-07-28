@@ -3,8 +3,10 @@
 mod agent;
 mod audio;
 mod auth;
+mod compaction;
 mod completion;
 mod config;
+mod conversation;
 mod events;
 mod http_debug;
 mod provider;
@@ -24,6 +26,7 @@ use crate::{
     agent::Agent,
     auth::OAuthStore,
     config::{Config, ConfigStore, ProviderConfig, SessionRegistry, validate_provider_name},
+    conversation::ConversationHandle,
     provider::OpenAiCompatible,
     session::{SessionStore, list_session_projects, resolve_global_session},
     skills::SkillRegistry,
@@ -250,10 +253,20 @@ async fn main() -> Result<()> {
                     return Err(error).context("cannot load the provider model catalog");
                 }
             }
-            let answer = agent.turn(prompt.trim()).await?;
-            println!("{answer}");
-            store.save(agent.session())?;
-            registry.register(&root)?;
+            let conversation = ConversationHandle::spawn(agent, registry.clone())?;
+            let turn = conversation.turn(prompt.trim().to_owned()).await?;
+            let result = turn.result;
+            let shutdown = conversation.shutdown().await;
+            match (result, shutdown) {
+                (Ok(answer), Ok(_)) => println!("{answer}"),
+                (Ok(_), Err(error)) => return Err(error),
+                (Err(error), Ok(_)) => return Err(error),
+                (Err(error), Err(shutdown)) => {
+                    return Err(error.context(format!(
+                        "the conversation also could not shut down cleanly: {shutdown:#}"
+                    )));
+                }
+            }
             return Ok(());
         }
         Some(Command::Resume { id }) => {

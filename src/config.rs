@@ -45,6 +45,12 @@ pub(crate) struct ModelCapabilitiesConfig {
     pub input_modalities: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub output_modalities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -321,6 +327,15 @@ impl ModelCapabilitiesConfig {
             .is_some_and(|value| value.trim().is_empty())
         {
             anyhow::bail!("provider {provider:?} model {model:?} has an empty display_name");
+        }
+        for (field, value) in [
+            ("context_window_tokens", self.context_window_tokens),
+            ("maximum_output_tokens", self.maximum_output_tokens),
+            ("auto_compact_token_limit", self.auto_compact_token_limit),
+        ] {
+            if value == Some(0) {
+                anyhow::bail!("provider {provider:?} model {model:?} configures {field} as zero");
+            }
         }
         validate_options(provider, model, "reasoning_levels", &self.reasoning_levels)?;
         validate_options(provider, model, "service_tiers", &self.service_tiers)?;

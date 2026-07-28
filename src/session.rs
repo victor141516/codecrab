@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     config::{SessionRegistry, normalized_root, paths_equal},
     events::AgentActivity,
-    provider::Message,
+    provider::{Message, TokenUsage},
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +42,68 @@ pub(crate) struct AgentTurn {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompactionTrigger {
+    BeforeTurn,
+    BetweenModelRequests,
+    SmallerModel,
+    ContextLengthExceeded,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct CompactionCheckpoint {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub trigger: CompactionTrigger,
+    pub covered_from_message_index: usize,
+    pub covered_through_message_index: usize,
+    pub recent_tail_starts_at_message_index: usize,
+    pub summary: String,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    #[serde(default)]
+    pub usage: TokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_checkpoint_id: Option<Uuid>,
+}
+
+impl CompactionCheckpoint {
+    #[cfg(test)]
+    pub(crate) fn test(recent_tail_starts_at_message_index: usize, summary: &str) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            trigger: CompactionTrigger::BeforeTurn,
+            covered_from_message_index: 0,
+            covered_through_message_index: recent_tail_starts_at_message_index.saturating_sub(1),
+            recent_tail_starts_at_message_index,
+            summary: summary.into(),
+            provider: "test".into(),
+            model: "test".into(),
+            reasoning_effort: None,
+            service_tier: None,
+            usage: TokenUsage::default(),
+            previous_checkpoint_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct RequestUsage {
+    pub recorded_at: DateTime<Utc>,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub canonical_message_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<Uuid>,
+    pub usage: TokenUsage,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Session {
     pub id: Uuid,
@@ -62,6 +124,10 @@ pub(crate) struct Session {
     pub goals: Vec<Goal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_goal_id: Option<Uuid>,
+    #[serde(default)]
+    pub compaction_checkpoints: Vec<CompactionCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_request_usage: Option<RequestUsage>,
 }
 
 fn default_provider() -> String {
@@ -214,6 +280,10 @@ impl Session {
         self.updated_at = Utc::now();
         true
     }
+
+    pub(crate) fn latest_compaction(&self) -> Option<&CompactionCheckpoint> {
+        self.compaction_checkpoints.last()
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -264,6 +334,8 @@ impl SessionStore {
             turns: Vec::new(),
             goals: Vec::new(),
             visible_goal_id: None,
+            compaction_checkpoints: Vec::new(),
+            latest_request_usage: None,
         })
     }
 
@@ -414,6 +486,55 @@ mod tests {
         let loaded = store.load(Some(&session.id.to_string())).unwrap();
         assert_eq!(loaded.provider, "example");
         assert_eq!(loaded.model, "example-model");
+    }
+
+    #[test]
+    fn compaction_checkpoints_reload_without_rewriting_raw_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "original request",
+        ));
+        session.messages.push(Message::text(
+            crate::provider::Role::Assistant,
+            "original exact answer",
+        ));
+        let checkpoint = CompactionCheckpoint::test(1, "rolling summary");
+        let checkpoint_id = checkpoint.id;
+        session.compaction_checkpoints.push(checkpoint);
+        session.latest_request_usage = Some(RequestUsage {
+            recorded_at: Utc::now(),
+            provider: session.provider.clone(),
+            model: session.model.clone(),
+            reasoning_effort: None,
+            service_tier: None,
+            canonical_message_count: session.messages.len(),
+            checkpoint_id: Some(checkpoint_id),
+            usage: TokenUsage {
+                input_tokens: Some(42),
+                output_tokens: Some(7),
+                ..TokenUsage::default()
+            },
+        });
+        store.save(&session).unwrap();
+
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(
+            loaded.messages[1].content.as_deref(),
+            Some("original exact answer")
+        );
+        assert_eq!(loaded.compaction_checkpoints.len(), 1);
+        assert_eq!(loaded.compaction_checkpoints[0].id, checkpoint_id);
+        assert_eq!(
+            loaded
+                .latest_request_usage
+                .as_ref()
+                .and_then(|usage| usage.usage.input_tokens),
+            Some(42)
+        );
     }
 
     #[test]

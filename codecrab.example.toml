@@ -44,6 +44,11 @@ default_reasoning_level = "high"
 default_service_tier = "priority"
 input_modalities = ["text", "image"]
 output_modalities = ["text"]
+# Optional context metadata for providers whose /models response omits it.
+# CodeCrab uses these values for automatic context compaction.
+context_window_tokens = 200000
+maximum_output_tokens = 32000
+auto_compact_token_limit = 150000
 reasoning_levels = [
     { id = "low" },
     { id = "high", name = "Deep", description = "More reasoning for complex tasks" },

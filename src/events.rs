@@ -131,6 +131,75 @@ impl AgentActivity {
             detail: error,
         }
     }
+
+    pub(crate) fn compaction_started(
+        id: String,
+        turn_message_index: usize,
+        sequence: u64,
+        estimated_tokens: u64,
+    ) -> Self {
+        Self {
+            id,
+            turn_message_index,
+            sequence: Some(sequence),
+            started_at: Some(Utc::now()),
+            completed_at: None,
+            tool: "context_compaction".into(),
+            kind: ActivityKind::Other,
+            status: ActivityStatus::Running,
+            title: "Context compaction started".into(),
+            detail: format!("Estimated active context: {estimated_tokens} tokens"),
+        }
+    }
+
+    pub(crate) fn compaction_retry(
+        id: String,
+        turn_message_index: usize,
+        sequence: u64,
+        retry: usize,
+        max_retries: usize,
+        error: String,
+    ) -> Self {
+        Self {
+            id,
+            turn_message_index,
+            sequence: Some(sequence),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            tool: "context_compaction".into(),
+            kind: ActivityKind::Network,
+            status: ActivityStatus::Completed,
+            title: format!("Retrying context compaction ({retry}/{max_retries})"),
+            detail: error,
+        }
+    }
+
+    pub(crate) fn finish_compaction(
+        &mut self,
+        succeeded: bool,
+        before_tokens: u64,
+        after_tokens: Option<u64>,
+        error: Option<&str>,
+    ) {
+        self.status = if succeeded {
+            ActivityStatus::Completed
+        } else {
+            ActivityStatus::Failed
+        };
+        self.completed_at = Some(Utc::now());
+        if succeeded {
+            self.title = "Context compacted".into();
+            self.detail = format!(
+                "{before_tokens} → {} tokens",
+                after_tokens.unwrap_or_default()
+            );
+        } else {
+            self.title = "Context compaction failed".into();
+            self.detail = error
+                .unwrap_or("the provider returned no usable summary")
+                .into();
+        }
+    }
 }
 
 fn activity_labels(tool: &str) -> (ActivityKind, &'static str, &'static str, &'static str) {
