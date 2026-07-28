@@ -2,16 +2,35 @@
 #   Windows: %APPDATA%\codecrab\config\config.toml
 #   Linux:   ~/.config/codecrab/config.toml
 #   macOS:   ~/Library/Application Support/codecrab/config.toml
+#
+# API keys are stored as plain text in this file. Protect it with the normal
+# permissions of your operating-system account. `codecrab config`, the TUI,
+# and the web API redact configured keys from their output.
 
-# auto selects GPT-5.6 Sol, high reasoning, and Fast when the provider offers it.
+active_provider = "openai"
+# Maximum time without receiving new model response data. Each chunk resets the timer.
+request_timeout_seconds = 180
+
+[providers.openai]
+# auto selects GPT-5.6 Sol, high reasoning, and Fast when offered.
 model = "auto"
 base_url = "https://api.openai.com/v1"
-# auto: use ChatGPT OAuth when logged in, otherwise use api_key_env.
-# Other accepted values: oauth, api_key.
+# auto uses ChatGPT OAuth when logged in and otherwise uses api_key.
+# Other accepted values: oauth, api_key, none.
 auth = "auto"
-api_key_env = "OPENAI_API_KEY"
-# Set api_key_env = "" for a trusted local provider that needs no Authorization header.
-request_timeout_seconds = 180
+api_key = ""
+
+[providers.example]
+model = "provider-model-name"
+base_url = "https://provider.example/v1"
+auth = "api_key"
+api_key = "provider-secret"
+
+[providers.local]
+model = "local-model"
+base_url = "http://localhost:11434/v1"
+auth = "none"
+api_key = ""
 
 # Managed automatically as projects acquire or lose saved sessions.
 # Paths may also be added manually.

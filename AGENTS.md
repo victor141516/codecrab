@@ -18,6 +18,10 @@ needed.
 - Agent turns have no tool-round limit. Continue the model/tool loop until the
   model returns a final response or a real provider/tool error occurs; do not
   reintroduce a configurable or hidden iteration cap.
+- `request_timeout_seconds` is a model-response inactivity timeout, not a total
+  request deadline. Reset it for every received response chunk. Retry model
+  timeouts and errors at most five times, emitting and persisting each retry;
+  persist the terminal error and write it to stderr when all retries fail.
 - CodeCrab does not provide a sandbox or filesystem boundary. Relative paths
   resolve from the selected working directory, but parent paths, absolute
   paths, other drives, and symbolic links are valid. The operating-system
@@ -134,6 +138,15 @@ to the current draft and all later turns until changed.
   characters; this is required for AltGr and international keyboards.
 - `Shift+Enter`, `Alt+Enter`, and `Ctrl+J` insert a newline. Up/down arrows move
   between editor lines unless an interactive menu is open.
+- Soft-wrap terminal composer text by terminal cell width without mutating the
+  prompt. Render and vertical movement must consume the same Unicode-aware row
+  layout so wide characters, the caret, preferred columns, and six-row
+  scrolling remain aligned.
+- Normalize decoded terminal events into editor actions rather than branching
+  on the operating system or physical keyboard. Support word movement/deletion,
+  logical-line start/end, and deletion to either line boundary through
+  Crossterm modifiers plus traditional Readline sequences, while preserving
+  printable AltGr characters.
 - `/model` presents provider-returned model, reasoning, and speed choices as a
   hierarchy rather than a flat Cartesian-product list.
 - Session management must retain parity: `/sessions` in the terminal and the
@@ -202,7 +215,15 @@ to the current draft and all later turns until changed.
   overflow, and shows an expand/collapse control only when detail is clipped.
 - Voice dictation must remain available in both composers. Terminal capture
   uses `Ctrl+Shift+S`; web capture uses `MediaRecorder`. Transcribed text is
-  inserted at the current cursor and never sent automatically.
+  inserted at the current cursor. The normal stop action never sends it;
+  submission happens only through the explicit Send/Enter variants below.
+- While web dictation is recording, show a live waveform from the same
+  `MediaStream`. Keep the normal microphone action as stop-and-insert, while
+  the active Send control stops, transcribes, inserts, and immediately sends.
+- While terminal dictation is recording, replace the composer contents with a
+  left/right-inset `▁▂▃▄▅▆▇█` volume history. `Ctrl+Shift+S` stops,
+  transcribes, and inserts; plain `Enter` stops, transcribes, inserts, and
+  immediately submits through the normal queue-aware composer path.
 - Dictation uses the private ChatGPT subscription endpoint through the same
   OAuth store as Codex responses. Keep this isolated in `src/transcription.rs`,
   retain the public-contract warning in the README, and preserve a manually
@@ -263,6 +284,16 @@ to the current draft and all later turns until changed.
 - Every web user message and every individual assistant text segment has its
   own copy action. Copy the original plain/Markdown message content, never
   rendered HTML or adjacent tool activity, and show brief success feedback.
+- Web transcript rows use only the compact `U` and `C` identity badges; keep
+  message content aligned directly with its badge instead of restoring
+  redundant `You`, `User`, or `CodeCrab` labels. When clearing the controlled
+  web textarea programmatically, wait for Vue's DOM update before measuring
+  `scrollHeight` so an empty composer cannot retain the previous draft height.
+- Keep active web turns fully expanded. Once a turn completes successfully,
+  collapse its intermediate assistant progress and tool activity into a
+  one-line persisted duration/operation summary while leaving the final
+  assistant message visible; users must be able to expand and collapse that
+  progress again.
 - Web controls use `@lucide/vue` components. Do not use Nerd Font private-use
   glyphs for buttons or status icons because browsers do not inherit the
   terminal font; Nerd Font glyphs remain intentional only for file completion.

@@ -264,6 +264,7 @@ enum Backend {
 pub(crate) struct OpenAiCompatible {
     client: Client,
     backend: Backend,
+    stream_idle_timeout: Duration,
     model: String,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
@@ -272,12 +273,12 @@ pub(crate) struct OpenAiCompatible {
 }
 
 impl OpenAiCompatible {
-    pub(crate) fn new(config: &Config) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.request_timeout_seconds))
-            .build()?;
-        let official_openai = config.base_url.trim_end_matches('/') == "https://api.openai.com/v1";
-        let auth_mode = config.auth.trim().to_ascii_lowercase();
+    pub(crate) fn new(config: &Config, provider_name: &str) -> Result<Self> {
+        let provider = config.provider(provider_name)?;
+        let client = Client::builder().build()?;
+        let official_openai =
+            provider.base_url.trim_end_matches('/') == "https://api.openai.com/v1";
+        let auth_mode = provider.auth.trim().to_ascii_lowercase();
         let oauth = OAuthStore::new()?;
         let use_oauth = match auth_mode.as_str() {
             "auto" => official_openai && oauth.is_logged_in(),
@@ -292,22 +293,30 @@ impl OpenAiCompatible {
                 }
                 true
             }
-            "api_key" => false,
-            other => anyhow::bail!("invalid auth mode {other:?}; expected auto, oauth, or api_key"),
+            "api_key" | "none" => false,
+            other => {
+                anyhow::bail!("invalid auth mode {other:?}; expected auto, oauth, api_key, or none")
+            }
         };
 
         let backend = if use_oauth {
             Backend::ChatGptSubscription { auth: oauth }
         } else {
-            let api_key = config.api_key().with_context(|| {
-                if official_openai {
-                    "not authenticated; run `codecrab auth login` to use ChatGPT Pro, or set OPENAI_API_KEY"
-                } else {
-                    "provider API credential is unavailable"
+            let api_key = match auth_mode.as_str() {
+                "none" => None,
+                "auto" | "api_key" if !provider.api_key.is_empty() => {
+                    Some(provider.api_key.clone())
                 }
-            })?;
+                "auto" if official_openai => anyhow::bail!(
+                    "not authenticated; run `codecrab auth login` to use ChatGPT Pro, or configure providers.{provider_name}.api_key"
+                ),
+                "auto" | "api_key" => {
+                    anyhow::bail!("provider {provider_name:?} does not have an API key configured")
+                }
+                _ => unreachable!("OAuth was handled above"),
+            };
             Backend::ChatCompletions {
-                base_url: config.base_url.trim_end_matches('/').to_owned(),
+                base_url: provider.base_url.trim_end_matches('/').to_owned(),
                 api_key,
             }
         };
@@ -315,7 +324,8 @@ impl OpenAiCompatible {
         Ok(Self {
             client,
             backend,
-            model: config.model.clone(),
+            stream_idle_timeout: Duration::from_secs(config.request_timeout_seconds),
+            model: provider.model.clone(),
             reasoning_effort: None,
             service_tier: None,
             session_id: Uuid::new_v4(),
@@ -356,7 +366,7 @@ impl OpenAiCompatible {
                     .await?;
                 if response.status() == StatusCode::UNAUTHORIZED {
                     if self.debug_openai {
-                        log_discarded_response(response).await?;
+                        log_discarded_response(response, Duration::from_secs(8)).await?;
                     }
                     let credentials = auth.refresh_credentials().await?;
                     response = self
@@ -458,22 +468,18 @@ impl OpenAiCompatible {
         }
         let request = request.build().context("cannot build model request")?;
         http_debug::request(self.debug_openai, &request);
-        let response = self
-            .client
-            .execute(request)
-            .await
-            .context("model request failed")?;
+        let response = self.execute_model_request(request, "model request").await?;
         let status = response.status();
         let version = response.version();
         let url = response.url().clone();
         let headers = response.headers().clone();
         if !status.is_success() {
-            let body = response.text().await?;
+            let body = read_response_body(response, self.stream_idle_timeout).await?;
             http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
             anyhow::bail!("model returned {status}: {}", compact_error(&body));
         }
         if !is_event_stream(&headers) {
-            let body = response.text().await?;
+            let body = read_response_body(response, self.stream_idle_timeout).await?;
             http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
             let parsed: ChatResponse =
                 serde_json::from_str(&body).context("model returned an invalid response")?;
@@ -486,7 +492,10 @@ impl OpenAiCompatible {
             return Ok(message);
         }
         let mut stream = ChatCompletionStream::default();
-        let body = read_sse(response, |data| stream.push(data, on_text_delta)).await?;
+        let body = read_sse(response, self.stream_idle_timeout, |data| {
+            stream.push(data, on_text_delta)
+        })
+        .await?;
         http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
         stream.finish()
     }
@@ -510,7 +519,7 @@ impl OpenAiCompatible {
         let mut response = self.send_subscription(&credentials, &payload).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             if self.debug_openai {
-                log_discarded_response(response).await?;
+                log_discarded_response(response, self.stream_idle_timeout).await?;
             }
             let credentials = auth.refresh_credentials().await?;
             response = self.send_subscription(&credentials, &payload).await?;
@@ -520,7 +529,7 @@ impl OpenAiCompatible {
         let url = response.url().clone();
         let headers = response.headers().clone();
         if !status.is_success() {
-            let body = response.text().await?;
+            let body = read_response_body(response, self.stream_idle_timeout).await?;
             http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
             anyhow::bail!(
                 "ChatGPT subscription returned {status}: {}",
@@ -528,7 +537,10 @@ impl OpenAiCompatible {
             );
         }
         let mut stream = ResponsesStream::default();
-        let body = read_sse(response, |data| stream.push(data, on_text_delta)).await?;
+        let body = read_sse(response, self.stream_idle_timeout, |data| {
+            stream.push(data, on_text_delta)
+        })
+        .await?;
         http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
         stream.finish()
     }
@@ -559,19 +571,31 @@ impl OpenAiCompatible {
             .build()
             .context("cannot build ChatGPT subscription request")?;
         http_debug::request(self.debug_openai, &request);
-        self.client
-            .execute(request)
+        self.execute_model_request(request, "ChatGPT subscription request")
             .await
-            .context("ChatGPT subscription request failed")
+    }
+
+    async fn execute_model_request(
+        &self,
+        request: reqwest::Request,
+        description: &str,
+    ) -> Result<Response> {
+        match tokio::time::timeout(self.stream_idle_timeout, self.client.execute(request)).await {
+            Ok(response) => response.with_context(|| format!("{description} failed")),
+            Err(_) => anyhow::bail!(
+                "{description} received no data for {} seconds",
+                self.stream_idle_timeout.as_secs()
+            ),
+        }
     }
 }
 
-async fn log_discarded_response(response: Response) -> Result<()> {
+async fn log_discarded_response(response: Response, idle_timeout: Duration) -> Result<()> {
     let status = response.status();
     let version = response.version();
     let url = response.url().clone();
     let headers = response.headers().clone();
-    let body = response.text().await?;
+    let body = read_response_body(response, idle_timeout).await?;
     http_debug::response(true, &url, version, status, &headers, &body);
     Ok(())
 }
@@ -741,11 +765,12 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
 
 async fn read_sse(
     mut response: Response,
+    idle_timeout: Duration,
     mut on_event: impl FnMut(&str) -> Result<()>,
 ) -> Result<String> {
     let mut decoder = SseDecoder::default();
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = next_response_chunk(&mut response, idle_timeout).await? {
         body.extend_from_slice(&chunk);
         for data in decoder.push(&chunk)? {
             on_event(&data)?;
@@ -755,6 +780,27 @@ async fn read_sse(
         on_event(&data)?;
     }
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn read_response_body(mut response: Response, idle_timeout: Duration) -> Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = next_response_chunk(&mut response, idle_timeout).await? {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn next_response_chunk(
+    response: &mut Response,
+    idle_timeout: Duration,
+) -> Result<Option<bytes::Bytes>> {
+    match tokio::time::timeout(idle_timeout, response.chunk()).await {
+        Ok(chunk) => chunk.context("cannot read model response stream"),
+        Err(_) => anyhow::bail!(
+            "model response stream received no data for {} seconds",
+            idle_timeout.as_secs()
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -1166,14 +1212,18 @@ mod tests {
             String::from_utf8_lossy(&request[..read]).into_owned()
         });
         let config = Config {
-            model: "mock-model".into(),
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
             request_timeout_seconds: 5,
             session_directories: Vec::new(),
+            ..Config::default()
         };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
         let completion = tokio::spawn(async move {
             provider
@@ -1193,6 +1243,87 @@ mod tests {
         assert_eq!(message.content.as_deref(), Some("hello world"));
         let request = server.await.unwrap();
         assert!(request.contains("\"stream\":true"));
+    }
+
+    #[tokio::test]
+    async fn stream_timeout_resets_after_each_received_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16_384];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for content in [
+                "{\"choices\":[{\"delta\":{\"content\":\"one \"}}]}",
+                "{\"choices\":[{\"delta\":{\"content\":\"two \"}}]}",
+                "{\"choices\":[{\"delta\":{\"content\":\"three\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]",
+            ] {
+                let event = format!("data: {content}\n\n");
+                socket
+                    .write_all(format!("{:X}\r\n{event}\r\n", event.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        let config = Config {
+            request_timeout_seconds: 1,
+            ..Config::test("mock-model", format!("http://{address}/v1"))
+        };
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+
+        let message = provider
+            .complete(&[Message::text(Role::User, "Count")], &[], |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(message.content.as_deref(), Some("one two three"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_times_out_only_after_a_full_idle_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16_384];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let config = Config {
+            request_timeout_seconds: 1,
+            ..Config::test("mock-model", format!("http://{address}/v1"))
+        };
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+
+        let error = match provider
+            .complete(&[Message::text(Role::User, "Wait")], &[], |_| {})
+            .await
+        {
+            Ok(_) => panic!("idle stream unexpectedly completed"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("received no data for 1 seconds"),
+            "{error:#}"
+        );
+        server.abort();
     }
 
     #[test]
@@ -1293,12 +1424,13 @@ mod tests {
             String::from_utf8_lossy(&request[..read]).into_owned()
         });
         let config = Config {
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test("auto".into(), format!("http://{address}/v1")),
+            )]),
             ..Config::default()
         };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
 
         let models = provider.fetch_models().await.unwrap();
 
@@ -1315,7 +1447,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires an interactive ChatGPT OAuth login and network access"]
     async fn fetches_the_live_chatgpt_catalog() {
-        let provider = OpenAiCompatible::new(&Config::default()).unwrap();
+        let provider =
+            OpenAiCompatible::new(&Config::default(), crate::config::DEFAULT_PROVIDER).unwrap();
         let models = provider.fetch_models().await.unwrap();
         assert!(!models.is_empty());
         assert!(

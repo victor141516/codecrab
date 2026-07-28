@@ -15,6 +15,9 @@ terminal interface and an optional embedded web application.
 - JSON/NDJSON API for conversations, sessions, models, skills, and agent state.
 - Live, persisted tool activity in both clients: reads, searches, writes,
   edits, shell commands, and skill loading are visible while they happen.
+- Completed web turns collapse their intermediate progress into a one-line
+  duration and operation summary; the final answer remains visible and the
+  complete progress can be expanded again.
 - Overflowing web tool rows can be expanded to reveal their complete command,
   path, query, or other recorded detail.
 - Concise progress messages appear in the same language as the user's latest
@@ -79,8 +82,8 @@ platform and creates the corresponding release. The tag should match the
 package version, for example:
 
 ```console
-git tag -a v0.9.0 -m "CodeCrab v0.9.0"
-git push origin v0.9.0
+git tag -a v1.0.0 -m "CodeCrab v1.0.0"
+git push origin v1.0.0
 ```
 
 Sign in with the OpenAI account that owns your ChatGPT subscription:
@@ -208,13 +211,16 @@ Keyboard shortcuts:
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Complete the selected menu item, advance the model picker, or send |
+| `Enter` | Complete a selection, send text, or stop, transcribe, and send an active recording |
 | `Tab` | Complete the selected menu item |
 | `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` | Insert a newline |
 | `Ctrl+Shift+S` | Start or stop voice dictation |
 | `Up` / `Down` | Navigate an open menu, otherwise move between editor lines |
+| `Ctrl`/`Alt` + `Left`/`Right` | Move by word |
+| `Ctrl`/`Alt` + `Backspace` | Delete the previous word |
+| `Home`/`End`, `Ctrl+A`/`Ctrl+E` | Move to the start or end of the logical line |
+| `Ctrl+U`/`Ctrl+K` | Delete to the start or end of the logical line |
 | `PgUp` / `PgDn`, mouse wheel | Navigate an open menu, otherwise scroll |
-| `Ctrl+U` | Clear the editor |
 | `F1` or `?` | Open help |
 | `F2` | Show available skills |
 | `Delete` / `Backspace` | Delete the selected session in `/sessions` |
@@ -224,6 +230,11 @@ Keyboard shortcuts:
 Printable input uses the character resolved by the terminal and active keyboard
 layout. This includes `AltGr` combinations on international keyboards; CodeCrab
 does not map physical keys such as `2` to layout-specific symbols.
+Long composer lines wrap visually to the terminal width without inserting
+newlines into the prompt. Up/down navigation uses those visual rows. Word and
+line editing consumes Crossterm's decoded terminal events and traditional
+Readline sequences rather than checking the operating system; terminal-level
+remappings that emit the same sequences therefore keep working.
 
 Mouse interaction inside the terminal conversation uses the operating-system
 clipboard on Windows, macOS, Linux/X11, and supported Wayland compositors.
@@ -418,15 +429,22 @@ Environment variables override the file:
 
 | Variable | Meaning |
 | --- | --- |
-| `CODECRAB_MODEL` | Model name (`auto` selects CodeCrab's preferred catalog-backed default) |
-| `CODECRAB_BASE_URL` | OpenAI-compatible `/v1` base URL |
-| `CODECRAB_AUTH` | `auto`, `oauth`, or `api_key` |
-| `CODECRAB_API_KEY_ENV` | Name of the environment variable holding the key |
+| `CODECRAB_PROVIDER` | Active provider profile for new sessions |
+| `CODECRAB_MODEL` | Active profile's model (`auto` selects CodeCrab's catalog-backed default) |
+| `CODECRAB_BASE_URL` | Active profile's OpenAI-compatible `/v1` base URL |
+| `CODECRAB_AUTH` | Active profile's `auto`, `oauth`, `api_key`, or `none` mode |
+| `CODECRAB_API_KEY` | Active profile's API key for this process only |
 | `CODECRAB_SKILLS_DIR` | Extra skill directories, separated like `PATH` |
 
 CLI `--model` and `--base-url` flags have the highest priority. Run
 `codecrab config` to print two clearly labelled sections: the platform-global
 configuration file path and the effective non-secret configuration content.
+
+`request_timeout_seconds` is the maximum time a model request may receive no
+new response data. Every streamed chunk resets the timer, so a response may run
+for longer than this value while it remains active. CodeCrab retries model
+timeouts and other request errors up to five times, showing and persisting each
+retry; a terminal failure is persisted in the session and logged to `stderr`.
 
 ### ChatGPT Plus/Pro authentication
 
@@ -441,9 +459,10 @@ PKCE and stores the access token, refresh token, and metadata as separate
 entries in the operating system credential store. Tokens are never written
 inside the project.
 
-The default `auth = "auto"` chooses the ChatGPT subscription whenever a
-CodeCrab OAuth login exists. Use `auth = "oauth"` to require subscription
-authentication or `auth = "api_key"` to force usage-based API authentication.
+The default OpenAI profile's `auth = "auto"` chooses the ChatGPT subscription
+whenever a CodeCrab OAuth login exists. Use `auth = "oauth"` to require
+subscription authentication or `auth = "api_key"` to force usage-based API
+authentication.
 
 The subscription path uses OpenAI's Codex Responses backend and your ChatGPT
 plan's Codex allowance. It does not silently fall back to an API key when OAuth
@@ -451,22 +470,37 @@ is selected.
 
 ### API-key and compatible providers
 
-API keys remain supported for automation or another OpenAI-compatible
-provider. Set the environment variable named by `api_key_env`:
+Provider profiles keep their model, OpenAI-compatible base URL, authentication
+mode, and API key together. API keys are deliberately stored as plain text in
+the platform-global `config.toml`; protect that file using the normal
+permissions of your operating-system account. Keys are never copied into
+sessions or returned by `codecrab config`, provider listings, or the web API.
 
-```powershell
-$env:OPENAI_API_KEY = "sk-..."
-```
-
-For another compatible provider, for example:
+Manage profiles from the CLI:
 
 ```console
-codecrab --base-url https://provider.example/v1 --model provider-model-name
+codecrab provider add example --base-url https://provider.example/v1 --model provider-model-name
+codecrab provider list
+codecrab provider show example
+codecrab provider use example
+codecrab provider remove example
 ```
 
-Set `CODECRAB_API_KEY_ENV` to the name of the variable containing that
-provider's token. For a trusted local provider that requires no Authorization
-header, set `auth = "api_key"` and `api_key_env = ""` in the config file.
+`provider add` prompts for the API key without echo when it is omitted. For
+automation, use `--api-key-stdin`; `--api-key` is also accepted but can expose
+the key in shell history and process listings. Provider management is also
+available through `/providers` and `/provider ...` in the terminal UI and the
+Providers dialog in the web client.
+
+Each session records its provider name, model, reasoning, and service tier.
+Resuming therefore uses the profile's current key without copying the secret
+into session JSON. Removing an active profile is rejected; removing a profile
+that still has sessions makes those sessions unavailable until that profile is
+created again.
+
+For a trusted local provider that requires no Authorization header, use
+`auth = "none"`. `CODECRAB_API_KEY` can temporarily override the active
+profile's saved key for one process.
 
 ## Execution model
 

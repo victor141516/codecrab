@@ -74,6 +74,51 @@ impl AudioRecording {
         }
         pcm16_wav(&samples, self.sample_rate, self.channels)
     }
+
+    pub(crate) fn waveform(&self, points: usize) -> Vec<u8> {
+        let Ok(samples) = self.samples.lock() else {
+            return vec![0; points];
+        };
+        waveform_levels(&samples, self.sample_rate, self.channels, points)
+    }
+}
+
+fn waveform_levels(samples: &[i16], sample_rate: u32, channels: u16, points: usize) -> Vec<u8> {
+    if points == 0 {
+        return Vec::new();
+    }
+    let window_samples = usize::try_from(sample_rate)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(usize::from(channels))
+        .saturating_mul(2);
+    let samples_per_point = window_samples.saturating_div(points).max(1);
+    let available_points = samples.len().div_ceil(samples_per_point).min(points);
+    let visible_samples = available_points.saturating_mul(samples_per_point);
+    let start = samples.len().saturating_sub(visible_samples);
+    let mut levels = vec![0; points.saturating_sub(available_points)];
+    levels.extend(
+        samples[start..]
+            .chunks(samples_per_point)
+            .take(available_points)
+            .map(|chunk| {
+                let peak = chunk
+                    .iter()
+                    .map(|sample| sample.unsigned_abs())
+                    .max()
+                    .unwrap_or(0);
+                amplitude_level(peak)
+            }),
+    );
+    levels.resize(points, 0);
+    levels
+}
+
+fn amplitude_level(peak: u16) -> u8 {
+    if peak < 128 {
+        return 0;
+    }
+    let normalized = f64::from(peak) / 32_768.0;
+    (normalized.sqrt() * 7.0).round().clamp(1.0, 7.0) as u8
 }
 
 fn build_stream<T>(
@@ -153,5 +198,17 @@ mod tests {
         assert_eq!(&wav[36..40], b"data");
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 6);
         assert_eq!(wav.len(), 50);
+    }
+
+    #[test]
+    fn waveform_is_flat_without_audio_and_tracks_recent_peaks() {
+        assert_eq!(waveform_levels(&[], 10, 1, 5), [0, 0, 0, 0, 0]);
+
+        let levels = waveform_levels(&[0, 0, 8_192, 8_192, i16::MAX], 5, 1, 5);
+
+        assert_eq!(levels[..2], [0, 0]);
+        assert_eq!(levels[2], 0);
+        assert!(levels[3] > 0);
+        assert_eq!(levels[4], 7);
     }
 }

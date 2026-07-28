@@ -12,6 +12,7 @@ import {
   LoaderCircle,
   Menu,
   Mic,
+  Settings,
   Pause,
   Pencil,
   Play,
@@ -34,6 +35,7 @@ const error = ref("");
 const sidebarOpen = ref(false);
 const composer = ref(null);
 const conversation = ref(null);
+const waveformCanvas = ref(null);
 const autocomplete = ref(null);
 const autocompleteSelection = ref(0);
 const sidebarView = ref("sessions");
@@ -41,7 +43,10 @@ const selectedProjectRoot = ref("");
 const copiedMessageKey = ref("");
 const expandedActivityKeys = ref(new Set());
 const overflowingActivityKeys = ref(new Set());
+const expandedTurnKeys = ref(new Set());
 const goalsOpen = ref(false);
+const providersOpen = ref(false);
+const providerDraft = ref(null);
 const describedGoal = ref(null);
 const editingGoal = ref(null);
 const goalDraft = ref("");
@@ -54,6 +59,12 @@ let mediaRecorder = null;
 let microphoneStream = null;
 let recordingChunks = [];
 let discardRecording = false;
+let sendAfterTranscription = false;
+let audioContext = null;
+let microphoneSource = null;
+let audioAnalyser = null;
+let waveformFrame = null;
+let waveformData = null;
 let lastEscapeAt = 0;
 let pendingGoalAction = null;
 
@@ -71,6 +82,7 @@ const models = computed(() => state.value?.models ?? []);
 const dictationAvailable = computed(
   () => state.value?.dictation_available ?? false
 );
+const providers = computed(() => state.value?.providers ?? []);
 const goals = computed(() => session.value?.goals ?? []);
 const goalHistory = computed(() =>
   [...goals.value].sort(
@@ -132,32 +144,65 @@ function assistantTurnEvents(messages, activities, turnMessageIndex) {
   return events;
 }
 
+function assistantTurnItem(key, events, turn = null) {
+  const finalEventIndex = events.findLastIndex(
+    (event) => event.type === "message"
+  );
+  const completed = turn
+    ? Boolean(turn.completed_at)
+    : finalEventIndex !== -1 && finalEventIndex === events.length - 1;
+  const finalEvent = completed ? events[finalEventIndex] : null;
+  const progressEvents = finalEvent
+    ? events.filter((_, index) => index !== finalEventIndex)
+    : events;
+  const startedAt = Date.parse(turn?.started_at ?? "");
+  const completedAt = Date.parse(turn?.completed_at ?? "");
+
+  return {
+    type: "assistant_turn",
+    key,
+    events,
+    completed,
+    finalEvent,
+    progressEvents,
+    operationCount: progressEvents.filter(
+      (event) =>
+        event.type === "activity" &&
+        event.activity.tool !== "model_request"
+    ).length,
+    durationMs:
+      Number.isFinite(startedAt) && Number.isFinite(completedAt)
+        ? Math.max(0, completedAt - startedAt)
+        : null
+  };
+}
+
 const timeline = computed(() => {
   const messages = session.value?.messages ?? [];
   const activities = session.value?.activities ?? [];
+  const turns = session.value?.turns ?? [];
+  const sessionKey = session.value?.id ?? "session";
   const items = [];
   let messageIndex = 0;
   while (messageIndex < messages.length) {
     const message = messages[messageIndex];
     if (message.role !== "user") {
       if (message.role === "assistant" && message.content?.trim()) {
-        items.push({
-          type: "assistant_turn",
-          key: `assistant-${messageIndex}`,
-          events: [
+        items.push(
+          assistantTurnItem(`assistant-${sessionKey}-${messageIndex}`, [
             {
               type: "message",
               key: `message-orphan-${messageIndex}`,
               message
             }
-          ]
-        });
+          ])
+        );
       }
       messageIndex += 1;
       continue;
     }
 
-    if (message.content?.trim()) {
+    if (!message.hidden && message.content?.trim()) {
       items.push({
         type: "message",
         key: `message-${messageIndex}`,
@@ -178,11 +223,13 @@ const timeline = computed(() => {
       messageIndex
     );
     if (turnEvents.length) {
-      items.push({
-        type: "assistant_turn",
-        key: `assistant-turn-${messageIndex}`,
-        events: turnEvents
-      });
+      items.push(
+        assistantTurnItem(
+          `assistant-turn-${sessionKey}-${messageIndex}`,
+          turnEvents,
+          turns.find((turn) => turn.message_index === messageIndex)
+        )
+      );
     }
     messageIndex = nextUser;
   }
@@ -193,6 +240,52 @@ const activeAssistantTurnKey = computed(() => {
   const last = timeline.value.at(-1);
   return last?.type === "assistant_turn" ? last.key : null;
 });
+
+function turnHasCollapsibleProgress(item) {
+  return (
+    item.completed &&
+    item.finalEvent &&
+    item.progressEvents.length > 0 &&
+    activeAssistantTurnKey.value !== item.key
+  );
+}
+
+function turnIsExpanded(item) {
+  return expandedTurnKeys.value.has(item.key);
+}
+
+function visibleTurnEvents(item) {
+  if (!turnHasCollapsibleProgress(item) || turnIsExpanded(item)) {
+    if (item.completed && item.finalEvent) {
+      return [...item.progressEvents, item.finalEvent];
+    }
+    return item.events;
+  }
+  return [item.finalEvent];
+}
+
+function toggleTurnProgress(key) {
+  const next = new Set(expandedTurnKeys.value);
+  if (!next.delete(key)) next.add(key);
+  expandedTurnKeys.value = next;
+}
+
+function formatTurnDuration(milliseconds) {
+  if (milliseconds == null) return "";
+  const seconds = Math.max(1, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+}
+
+function turnSummary(item) {
+  const operations = `${item.operationCount} ${
+    item.operationCount === 1 ? "operation" : "operations"
+  }`;
+  const duration = formatTurnDuration(item.durationMs);
+  return duration ? `Worked for ${duration} · ${operations}` : operations;
+}
 const selectedModel = computed(() =>
   models.value.find((model) => model.slug === session.value?.model)
 );
@@ -214,6 +307,49 @@ async function api(path, options = {}) {
     throw new Error(body.error || `Request failed with ${response.status}`);
   }
   return body;
+}
+
+function editProvider(provider = null) {
+  providerDraft.value = provider
+    ? { ...provider, api_key: "", clear_api_key: false }
+    : {
+        name: "",
+        model: "auto",
+        base_url: "https://api.openai.com/v1",
+        auth: "api_key",
+        api_key: "",
+        clear_api_key: false
+      };
+}
+
+async function saveProvider() {
+  const draft = providerDraft.value;
+  if (!draft?.name.trim() || !draft.base_url.trim()) return;
+  await runAction(() =>
+    api("/api/providers", {
+      method: "POST",
+      body: JSON.stringify(draft)
+    })
+  );
+  providerDraft.value = null;
+}
+
+async function useProvider(provider) {
+  await runAction(() =>
+    api("/api/providers/use", {
+      method: "POST",
+      body: JSON.stringify({ name: provider.name })
+    })
+  );
+}
+
+async function deleteProvider(provider) {
+  await runAction(() =>
+    api("/api/providers/delete", {
+      method: "POST",
+      body: JSON.stringify({ name: provider.name })
+    })
+  );
 }
 
 async function loadState({ resumeGoal = false } = {}) {
@@ -502,14 +638,85 @@ function compactGoal(goal, length = 96) {
 }
 
 function stopMicrophoneTracks() {
+  stopWaveform();
   microphoneStream?.getTracks().forEach((track) => track.stop());
   microphoneStream = null;
   recording.value = false;
 }
 
+function stopWaveform() {
+  if (waveformFrame !== null) {
+    window.cancelAnimationFrame(waveformFrame);
+    waveformFrame = null;
+  }
+  microphoneSource?.disconnect();
+  audioAnalyser?.disconnect();
+  microphoneSource = null;
+  audioAnalyser = null;
+  waveformData = null;
+  if (audioContext) {
+    void audioContext.close();
+    audioContext = null;
+  }
+}
+
+function drawWaveform() {
+  if (!audioAnalyser || !waveformData || !recording.value) return;
+  const canvas = waveformCanvas.value;
+  if (!canvas) {
+    waveformFrame = window.requestAnimationFrame(drawWaveform);
+    return;
+  }
+  const bounds = canvas.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(bounds.width * scale));
+  const height = Math.max(1, Math.round(bounds.height * scale));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+
+  audioAnalyser.getByteTimeDomainData(waveformData);
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  context.clearRect(0, 0, width, height);
+  context.lineWidth = Math.max(1, 1.25 * scale);
+  context.strokeStyle = "rgb(248 113 113 / 0.9)";
+  context.beginPath();
+  const step = width / Math.max(1, waveformData.length - 1);
+  for (let index = 0; index < waveformData.length; index += 1) {
+    const value = (waveformData[index] - 128) / 128;
+    const x = index * step;
+    const y = height / 2 + value * height * 0.42;
+    if (index === 0) context.moveTo(x, y);
+    else context.lineTo(x, y);
+  }
+  context.stroke();
+  waveformFrame = window.requestAnimationFrame(drawWaveform);
+}
+
+async function startWaveform(stream) {
+  stopWaveform();
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return;
+  audioContext = new AudioContext();
+  if (audioContext.state === "suspended") await audioContext.resume();
+  if (!recording.value || microphoneStream !== stream) {
+    stopWaveform();
+    return;
+  }
+  microphoneSource = audioContext.createMediaStreamSource(stream);
+  audioAnalyser = audioContext.createAnalyser();
+  audioAnalyser.fftSize = 1024;
+  waveformData = new Uint8Array(audioAnalyser.fftSize);
+  microphoneSource.connect(audioAnalyser);
+  await nextTick();
+  waveformFrame = window.requestAnimationFrame(drawWaveform);
+}
+
 async function insertTranscript(text) {
   const transcript = text.trim();
-  if (!transcript) return;
+  if (!transcript) return false;
   const element = composer.value;
   const start = element?.selectionStart ?? draft.value.length;
   const end = element?.selectionEnd ?? start;
@@ -525,11 +732,14 @@ async function insertTranscript(text) {
   element?.setSelectionRange(cursor, cursor);
   resizeComposer();
   await refreshAutocomplete(element);
+  return true;
 }
 
 async function transcribeRecording() {
   const discard = discardRecording;
   discardRecording = false;
+  const shouldSend = sendAfterTranscription;
+  sendAfterTranscription = false;
   const contentType =
     mediaRecorder?.mimeType || recordingChunks[0]?.type || "audio/webm";
   const blob = new Blob(recordingChunks, { type: contentType });
@@ -544,6 +754,7 @@ async function transcribeRecording() {
 
   transcribing.value = true;
   error.value = "";
+  let transcriptInserted = false;
   try {
     const response = await fetch("/api/transcribe", {
       method: "POST",
@@ -554,16 +765,20 @@ async function transcribeRecording() {
     if (!response.ok) {
       throw new Error(body.error || `Request failed with ${response.status}`);
     }
-    await insertTranscript(body.text);
+    transcriptInserted = await insertTranscript(body.text);
   } catch (cause) {
     error.value = `Dictation failed: ${cause.message}`;
   } finally {
     transcribing.value = false;
   }
+  if (shouldSend && transcriptInserted) {
+    await sendPrompt();
+  }
 }
 
 async function toggleDictation() {
   if (recording.value) {
+    sendAfterTranscription = false;
     mediaRecorder?.stop();
     return;
   }
@@ -571,6 +786,7 @@ async function toggleDictation() {
   error.value = "";
   try {
     discardRecording = false;
+    sendAfterTranscription = false;
     microphoneStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1 }
     });
@@ -598,6 +814,11 @@ async function toggleDictation() {
     );
     mediaRecorder.start();
     recording.value = true;
+    try {
+      await startWaveform(microphoneStream);
+    } catch {
+      stopWaveform();
+    }
   } catch (cause) {
     stopMicrophoneTracks();
     error.value = `Dictation failed: ${cause.message}`;
@@ -684,6 +905,20 @@ function applyAssistantTextDelta(delta, start) {
   };
 }
 
+function applyAssistantStreamReset() {
+  const messages = [...(session.value?.messages ?? [])];
+  if (messages.at(-1)?.role === "assistant") {
+    messages.pop();
+  }
+  state.value = {
+    ...state.value,
+    session: {
+      ...session.value,
+      messages
+    }
+  };
+}
+
 function applyAssistantMessageCompleted(message) {
   const messages = [...(session.value?.messages ?? [])];
   const index = messages.findLastIndex((item) => item.role === "assistant");
@@ -707,6 +942,10 @@ async function handleChatStreamEvent(event) {
   if (event.type === "assistant_text_delta") {
     applyAssistantTextDelta(event.delta, event.start);
     await scrollToBottom();
+    return false;
+  }
+  if (event.type === "assistant_stream_reset") {
+    applyAssistantStreamReset();
     return false;
   }
   if (event.type === "assistant_message_completed") {
@@ -772,13 +1011,17 @@ async function streamChat(prompt, { continuation = false } = {}) {
 }
 
 async function sendPrompt() {
-  if (recording.value || transcribing.value) return;
+  if (recording.value) {
+    sendAfterTranscription = true;
+    mediaRecorder?.stop();
+    return;
+  }
+  if (transcribing.value) return;
   const prompt = draft.value.trim();
   if (!prompt) return;
   if (prompt === "/goals") {
-    draft.value = "";
+    await clearComposer();
     closeAutocomplete();
-    resizeComposer();
     goalsOpen.value = true;
     return;
   }
@@ -788,23 +1031,20 @@ async function sendPrompt() {
   }
   const goalMatch = prompt.match(/^\/goal\s+([\s\S]+)$/);
   if (goalMatch) {
-    draft.value = "";
+    await clearComposer();
     closeAutocomplete();
-    resizeComposer();
     await createGoal(goalMatch[1].trim());
     return;
   }
   if (sending.value) {
     if (!queuedPrompt.value) {
       queuedPrompt.value = prompt;
-      draft.value = "";
+      await clearComposer();
       closeAutocomplete();
-      resizeComposer();
     }
     return;
   }
-  draft.value = "";
-  resizeComposer();
+  await clearComposer();
   await runPrompt(prompt);
 }
 
@@ -834,8 +1074,9 @@ async function runPrompt(prompt, { continuation = false } = {}) {
     await streamChat(prompt, { continuation });
     completed = true;
   } catch (cause) {
-    error.value = cause.message;
+    const streamError = cause.message;
     await loadState();
+    error.value = streamError;
   } finally {
     sending.value = false;
     cancelling.value = false;
@@ -1056,6 +1297,12 @@ function resizeComposer() {
   composer.value.style.height = `${Math.min(composer.value.scrollHeight, 192)}px`;
 }
 
+async function clearComposer() {
+  draft.value = "";
+  await nextTick();
+  resizeComposer();
+}
+
 async function scrollToBottom() {
   await nextTick();
   if (conversation.value) {
@@ -1145,6 +1392,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(copiedMessageTimer);
   for (const observer of activityDetailObservers.values()) observer.disconnect();
   discardRecording = true;
+  sendAfterTranscription = false;
   if (mediaRecorder?.state === "recording") mediaRecorder.stop();
   stopMicrophoneTracks();
 });
@@ -1157,6 +1405,55 @@ onBeforeUnmount(() => {
       class="fixed inset-0 z-30 bg-black/60 backdrop-blur-sm lg:hidden"
       @click="sidebarOpen = false"
     />
+
+    <div
+      v-if="providersOpen"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
+      @click.self="providersOpen = false"
+    >
+      <section class="flex max-h-[80vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-cyan-400/20 bg-[#15131a] shadow-2xl shadow-black/60">
+        <header class="flex items-center gap-3 border-b border-white/7 px-4 py-3">
+          <Settings class="size-4 text-cyan-300" aria-hidden="true" />
+          <div class="flex-1">
+            <h2 class="text-sm font-semibold text-zinc-100">Providers</h2>
+            <p class="mt-0.5 text-[10px] text-zinc-600">API keys are saved in the platform configuration file.</p>
+          </div>
+          <button class="rounded-md px-3 py-1.5 text-xs text-cyan-300 hover:bg-cyan-400/10" @click="editProvider()">Add</button>
+          <button class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-white/5 hover:text-zinc-200" @click="providersOpen = false"><X class="size-4" /></button>
+        </header>
+        <div class="min-h-0 overflow-y-auto p-2">
+          <article v-for="provider in providers" :key="provider.name" class="mb-1 flex items-center gap-3 rounded-lg px-3 py-2.5 hover:bg-white/3">
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2 text-xs font-semibold text-zinc-200">
+                {{ provider.name }}
+                <span v-if="provider.active" class="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[8px] uppercase text-cyan-300">active</span>
+              </div>
+              <div class="mt-1 truncate font-mono text-[9px] text-zinc-600">{{ provider.model }} · {{ provider.auth }} · key {{ provider.api_key_configured ? 'configured' : 'none' }} · {{ provider.base_url }}</div>
+            </div>
+            <button v-if="!provider.active" class="rounded px-2 py-1 text-[10px] text-cyan-300 hover:bg-cyan-400/10" @click="useProvider(provider)">Use</button>
+            <button class="grid size-7 place-items-center rounded-md text-zinc-500 hover:bg-white/5" @click="editProvider(provider)"><Pencil class="size-3.5" /></button>
+            <button :disabled="provider.active" class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-25" @click="deleteProvider(provider)"><Trash2 class="size-3.5" /></button>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div
+      v-if="providerDraft"
+      class="fixed inset-0 z-[60] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"
+      @click.self="providerDraft = null"
+    >
+      <section class="w-full max-w-lg space-y-3 rounded-xl border border-cyan-400/20 bg-[#15131a] p-4">
+        <h2 class="text-sm font-semibold text-cyan-200">Provider profile</h2>
+        <label class="block text-[10px] text-zinc-500">Name<input v-model="providerDraft.name" :disabled="providers.some(p => p.name === providerDraft.name)" class="control mt-1 w-full" /></label>
+        <label class="block text-[10px] text-zinc-500">Base URL<input v-model="providerDraft.base_url" class="control mt-1 w-full" /></label>
+        <label class="block text-[10px] text-zinc-500">Model<input v-model="providerDraft.model" class="control mt-1 w-full" /></label>
+        <label class="block text-[10px] text-zinc-500">Authentication<select v-model="providerDraft.auth" class="control mt-1 w-full"><option value="auto">auto</option><option value="oauth">oauth</option><option value="api_key">api_key</option><option value="none">none</option></select></label>
+        <label class="block text-[10px] text-zinc-500">API key<input v-model="providerDraft.api_key" type="password" autocomplete="new-password" placeholder="Leave empty to keep the current key" class="control mt-1 w-full" /></label>
+        <label v-if="providerDraft.api_key_configured" class="flex items-center gap-2 text-[10px] text-zinc-500"><input v-model="providerDraft.clear_api_key" type="checkbox" /> Remove configured API key</label>
+        <div class="flex justify-end gap-2 pt-2"><button class="rounded px-3 py-1.5 text-xs text-zinc-500 hover:bg-white/5" @click="providerDraft = null">Cancel</button><button class="rounded bg-cyan-300 px-3 py-1.5 text-xs font-semibold text-cyan-950" @click="saveProvider">Save</button></div>
+      </section>
+    </div>
 
     <div
       v-if="goalsOpen"
@@ -1446,6 +1743,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="ml-auto flex items-center gap-2">
+          <button class="grid size-8 place-items-center rounded-md text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300" title="Providers" aria-label="Manage providers" @click="providersOpen = true"><Settings class="size-4" /></button>
           <select
             v-if="session"
             class="control max-w-44"
@@ -1513,14 +1811,11 @@ onBeforeUnmount(() => {
           <template v-for="item in timeline" :key="item.key">
             <article v-if="item.type === 'message'" class="message-row group">
               <div
-                class="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md bg-white/7 text-[10px] font-bold text-zinc-300"
+                class="grid size-6 shrink-0 place-items-center rounded-md bg-white/7 text-[10px] font-bold text-zinc-300"
               >
-                Y
+                U
               </div>
               <div class="min-w-0 flex-1">
-                <div class="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
-                  You
-                </div>
                 <div class="message-content">
                   {{ item.message.content }}
                 </div>
@@ -1548,15 +1843,47 @@ onBeforeUnmount(() => {
             </article>
 
             <article v-else class="message-row group">
-              <div class="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md bg-coral/12 text-[10px] font-bold text-coral">
+              <div class="grid size-6 shrink-0 place-items-center rounded-md bg-coral/12 text-[10px] font-bold text-coral">
                 C
               </div>
               <div class="min-w-0 flex-1">
-                <div class="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
-                  CodeCrab
+                <div
+                  v-if="turnHasCollapsibleProgress(item)"
+                  class="turn-summary"
+                >
+                  <span class="min-w-0 flex-1 truncate">{{
+                    turnSummary(item)
+                  }}</span>
+                  <button
+                    type="button"
+                    class="grid size-6 shrink-0 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
+                    :aria-expanded="turnIsExpanded(item)"
+                    :aria-label="
+                      turnIsExpanded(item)
+                        ? 'Collapse turn progress'
+                        : 'Expand turn progress'
+                    "
+                    :title="
+                      turnIsExpanded(item)
+                        ? 'Collapse progress'
+                        : 'Expand progress'
+                    "
+                    @click="toggleTurnProgress(item.key)"
+                  >
+                    <ChevronUp
+                      v-if="turnIsExpanded(item)"
+                      class="size-3.5"
+                      aria-hidden="true"
+                    />
+                    <ChevronDown
+                      v-else
+                      class="size-3.5"
+                      aria-hidden="true"
+                    />
+                  </button>
                 </div>
                 <template
-                  v-for="(event, eventIndex) in item.events"
+                  v-for="(event, eventIndex) in visibleTurnEvents(item)"
                   :key="event.key"
                 >
                   <div
@@ -1639,7 +1966,13 @@ onBeforeUnmount(() => {
                       />
                     </button>
                   </div>
-                  <div v-else :class="{ 'mt-3': eventIndex > 0 }">
+                  <div
+                    v-else
+                    :class="{
+                      'mt-3':
+                        eventIndex > 0 || turnHasCollapsibleProgress(item)
+                    }"
+                  >
                     <div
                       class="markdown-body"
                       v-html="renderMarkdown(event.message.content)"
@@ -1859,8 +2192,14 @@ onBeforeUnmount(() => {
                 @blur="handleComposerBlur"
                 @keydown="handleComposerKey"
               />
-              <div class="flex items-center justify-end px-2 pb-2">
-                <div class="flex items-center gap-1">
+              <div class="flex items-center gap-2 px-2 pb-2">
+                <canvas
+                  v-show="recording"
+                  ref="waveformCanvas"
+                  class="h-7 min-w-0 flex-1"
+                  aria-hidden="true"
+                />
+                <div class="ml-auto flex items-center gap-1">
                   <button
                     class="grid size-7 place-items-center rounded-md text-sm transition disabled:cursor-not-allowed disabled:text-zinc-700"
                     :class="
@@ -1889,16 +2228,36 @@ onBeforeUnmount(() => {
                   <button
                     class="grid size-7 place-items-center rounded-md bg-zinc-100 text-sm text-zinc-950 transition hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-600"
                     :disabled="
-                      sending
+                      recording
+                        ? false
+                        : sending
                         ? cancelling
-                        : !draft.trim() || recording || transcribing
+                        : transcribing || !draft.trim()
                     "
-                    :aria-label="sending ? 'Stop agent' : 'Send message'"
-                    :title="sending ? 'Stop agent' : 'Send message'"
-                    @click="sending ? cancelTurn() : sendPrompt()"
+                    :aria-label="
+                      recording
+                        ? 'Stop dictation and send'
+                        : sending
+                        ? 'Stop agent'
+                        : 'Send message'
+                    "
+                    :title="
+                      recording
+                        ? 'Stop dictation and send'
+                        : sending
+                        ? 'Stop agent'
+                        : 'Send message'
+                    "
+                    @click="
+                      recording
+                        ? sendPrompt()
+                        : sending
+                          ? cancelTurn()
+                          : sendPrompt()
+                    "
                   >
                     <Square
-                      v-if="sending"
+                      v-if="sending && !recording"
                       class="size-3 fill-current"
                       aria-hidden="true"
                     />

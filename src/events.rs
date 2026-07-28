@@ -7,6 +7,7 @@ use crate::provider::Message;
 pub(crate) enum AgentEvent {
     AssistantMessage(Message),
     AssistantTextDelta { delta: String, start: bool },
+    AssistantStreamReset,
     AssistantMessageCompleted(Message),
     Activity(AgentActivity),
 }
@@ -19,6 +20,7 @@ pub(crate) enum ActivityKind {
     Write,
     Shell,
     Skill,
+    Network,
     Other,
 }
 
@@ -68,6 +70,36 @@ impl AgentActivity {
             ActivityStatus::Failed
         };
         self.title = if succeeded { completed } else { failed }.to_owned();
+    }
+
+    pub(crate) fn model_retry(
+        id: String,
+        turn_message_index: usize,
+        retry: usize,
+        max_retries: usize,
+        error: String,
+    ) -> Self {
+        Self {
+            id,
+            turn_message_index,
+            tool: "model_request".into(),
+            kind: ActivityKind::Network,
+            status: ActivityStatus::Completed,
+            title: format!("Retrying model request ({retry}/{max_retries})"),
+            detail: error,
+        }
+    }
+
+    pub(crate) fn model_error(id: String, turn_message_index: usize, error: String) -> Self {
+        Self {
+            id,
+            turn_message_index,
+            tool: "model_request".into(),
+            kind: ActivityKind::Network,
+            status: ActivityStatus::Failed,
+            title: "Model request failed".into(),
+            detail: error,
+        }
     }
 }
 

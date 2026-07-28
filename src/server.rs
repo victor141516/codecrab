@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     future::{Future, IntoFuture},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -32,7 +32,10 @@ use crate::{
     agent::{Agent, turn_was_cancelled},
     auth::OAuthStore,
     completion::{CompletionItem, complete as complete_input},
-    config::{Config, SessionRegistry, paths_equal},
+    config::{
+        Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry, paths_equal,
+        validate_provider_name,
+    },
     events::{AgentActivity, AgentEvent},
     provider::{
         Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, default_model_selection,
@@ -64,11 +67,11 @@ struct ServerState {
 }
 
 struct ServerInner {
-    config: Config,
+    config: RwLock<Config>,
     registry: SessionRegistry,
     debug_openai: bool,
-    models: Vec<ModelCatalogEntry>,
-    catalog_error: Option<String>,
+    models: RwLock<Vec<ModelCatalogEntry>>,
+    catalog_error: RwLock<Option<String>>,
     dictation_available: bool,
     workspace: Mutex<ServerWorkspace>,
     active_turn: Mutex<Option<watch::Sender<bool>>>,
@@ -88,6 +91,7 @@ struct StateResponse {
     models: Vec<ModelCatalogEntry>,
     catalog_error: Option<String>,
     dictation_available: bool,
+    providers: Vec<ProviderSummary>,
 }
 
 #[derive(Serialize)]
@@ -130,6 +134,17 @@ struct GoalRequest {
     objective: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ProviderRequest {
+    name: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    auth: Option<String>,
+    api_key: Option<String>,
+    #[serde(default)]
+    clear_api_key: bool,
+}
+
 #[derive(Serialize)]
 struct CompletionResponse {
     items: Vec<CompletionItem>,
@@ -142,6 +157,7 @@ struct CompletionResponse {
 enum ChatStreamMessage {
     AssistantMessage { message: Message },
     AssistantTextDelta { delta: String, start: bool },
+    AssistantStreamReset,
     AssistantMessageCompleted { message: Message },
     Activity { activity: AgentActivity },
     Done { state: StateResponse },
@@ -159,7 +175,9 @@ pub(crate) async fn serve(
     let store = SessionStore::new(&root)?;
     let registry = SessionRegistry::global();
     let dictation_available = OAuthStore::new()?.is_logged_in();
-    let session = store.create(config.model.clone())?;
+    let active = config.provider(&config.active_provider)?;
+    let session =
+        store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
     let mut agent = build_agent(&root, &config, debug_openai, session)?;
     let (models, catalog_error) = match agent.fetch_models().await {
         Ok(models) => {
@@ -172,11 +190,11 @@ pub(crate) async fn serve(
 
     let state = ServerState {
         inner: Arc::new(ServerInner {
-            config,
+            config: RwLock::new(config),
             registry,
             debug_openai,
-            models,
-            catalog_error,
+            models: RwLock::new(models),
+            catalog_error: RwLock::new(catalog_error),
             dictation_available,
             workspace: Mutex::new(ServerWorkspace {
                 root,
@@ -202,6 +220,9 @@ pub(crate) async fn serve(
                     post(transcribe).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
                 )
                 .route("/model", put(set_model))
+                .route("/providers", post(save_provider))
+                .route("/providers/use", post(use_provider))
+                .route("/providers/delete", post(delete_provider))
                 .route("/session/clear", post(clear_session))
                 .route("/sessions", post(new_session))
                 .route("/sessions/delete", post(delete_session))
@@ -242,10 +263,24 @@ fn build_agent(
     debug_openai: bool,
     session: Session,
 ) -> Result<Agent> {
-    let mut provider = OpenAiCompatible::new(config)?;
+    let mut provider = OpenAiCompatible::new(config, &session.provider)?;
     provider.set_debug_openai(debug_openai);
     let tools = ToolBox::new(root.to_path_buf());
     Agent::new(provider, tools, SkillRegistry::discover(root), session)
+}
+
+async fn refresh_catalog(inner: &ServerInner, agent: &mut Agent) {
+    match agent.fetch_models().await {
+        Ok(models) => {
+            agent.resolve_auto_model(&models);
+            *inner.models.write().unwrap() = models;
+            *inner.catalog_error.write().unwrap() = None;
+        }
+        Err(error) => {
+            *inner.models.write().unwrap() = Vec::new();
+            *inner.catalog_error.write().unwrap() = Some(format!("{error:#}"));
+        }
+    }
 }
 
 fn save_agent_session(inner: &ServerInner, agent: &Agent) -> Result<()> {
@@ -295,14 +330,16 @@ async fn snapshot(state: &ServerState) -> Result<StateResponse> {
         .first()
         .map(|project| project.root.display().to_string())
         .unwrap_or_else(|| root.display().to_string());
+    let providers = state.inner.config.read().unwrap().summaries();
     Ok(StateResponse {
         project,
         session,
         projects,
         skills,
-        models: state.inner.models.clone(),
-        catalog_error: state.inner.catalog_error.clone(),
+        models: state.inner.models.read().unwrap().clone(),
+        catalog_error: state.inner.catalog_error.read().unwrap().clone(),
         dictation_available: state.inner.dictation_available,
+        providers,
     })
 }
 
@@ -423,6 +460,7 @@ async fn chat(
                     AgentEvent::AssistantTextDelta { delta, start } => {
                         ChatStreamMessage::AssistantTextDelta { delta, start }
                     }
+                    AgentEvent::AssistantStreamReset => ChatStreamMessage::AssistantStreamReset,
                     AgentEvent::AssistantMessageCompleted(message) => {
                         ChatStreamMessage::AssistantMessageCompleted { message }
                     }
@@ -463,19 +501,13 @@ async fn chat(
         let message = match result {
             Ok(()) => match snapshot(&state).await {
                 Ok(state) => ChatStreamMessage::Done { state },
-                Err(error) => ChatStreamMessage::Error {
-                    error: format!("{error:#}"),
-                },
+                Err(error) => stream_error(error),
             },
             Err(error) if turn_was_cancelled(&error) => match snapshot(&state).await {
                 Ok(state) => ChatStreamMessage::Cancelled { state },
-                Err(error) => ChatStreamMessage::Error {
-                    error: format!("{error:#}"),
-                },
+                Err(error) => stream_error(error),
             },
-            Err(error) => ChatStreamMessage::Error {
-                error: format!("{error:#}"),
-            },
+            Err(error) => stream_error(error),
         };
         let _ = send_stream_message(&output_tx, message).await;
     });
@@ -490,6 +522,12 @@ async fn chat(
         HeaderValue::from_static("no-store, no-cache"),
     );
     Ok(response)
+}
+
+fn stream_error(error: anyhow::Error) -> ChatStreamMessage {
+    let error = format!("{error:#}");
+    eprintln!("CodeCrab agent turn failed: {error}");
+    ChatStreamMessage::Error { error }
 }
 
 async fn cancel_chat(State(state): State<ServerState>) -> Json<serde_json::Value> {
@@ -522,6 +560,8 @@ async fn set_model(
     if let Some(model) = state
         .inner
         .models
+        .read()
+        .unwrap()
         .iter()
         .find(|model| model.slug == request.model)
     {
@@ -544,7 +584,7 @@ async fn set_model(
                 "service tier is not supported by this model",
             ));
         }
-    } else if !state.inner.models.is_empty() {
+    } else if !state.inner.models.read().unwrap().is_empty() {
         return Err(ApiError::message(
             StatusCode::BAD_REQUEST,
             "model is not in the provider catalog",
@@ -568,6 +608,74 @@ async fn set_model(
     Ok(Json(snapshot(&state).await?))
 }
 
+async fn save_provider(
+    State(state): State<ServerState>,
+    Json(request): Json<ProviderRequest>,
+) -> ApiResult<StateResponse> {
+    validate_provider_name(&request.name)?;
+    {
+        let store = ConfigStore::global()?;
+        let mut config = store.load()?;
+        let existing = config.providers.get(&request.name);
+        let api_key = if request.clear_api_key {
+            String::new()
+        } else {
+            request
+                .api_key
+                .filter(|key| !key.is_empty())
+                .or_else(|| existing.map(|provider| provider.api_key.clone()))
+                .unwrap_or_default()
+        };
+        let provider = ProviderConfig {
+            model: request.model.unwrap_or_else(|| "auto".into()),
+            base_url: request.base_url.context("base_url is required")?,
+            auth: request.auth.unwrap_or_else(|| "api_key".into()),
+            api_key,
+        };
+        provider.validate(&request.name)?;
+        config.providers.insert(request.name, provider);
+        store.save(&config)?;
+        *state.inner.config.write().unwrap() = config;
+    }
+    Ok(Json(snapshot(&state).await?))
+}
+
+async fn use_provider(
+    State(state): State<ServerState>,
+    Json(request): Json<ProviderRequest>,
+) -> ApiResult<StateResponse> {
+    {
+        let store = ConfigStore::global()?;
+        let mut config = store.load()?;
+        config.provider(&request.name)?;
+        config.active_provider = request.name;
+        store.save(&config)?;
+        *state.inner.config.write().unwrap() = config;
+    }
+    Ok(Json(snapshot(&state).await?))
+}
+
+async fn delete_provider(
+    State(state): State<ServerState>,
+    Json(request): Json<ProviderRequest>,
+) -> ApiResult<StateResponse> {
+    {
+        let store = ConfigStore::global()?;
+        let mut config = store.load()?;
+        config.provider(&request.name)?;
+        if config.active_provider == request.name {
+            return Err(ApiError::message(
+                StatusCode::CONFLICT,
+                "select another active provider before deleting this one",
+            ));
+        }
+        config.providers.remove(&request.name);
+        store.save(&config)?;
+        *state.inner.config.write().unwrap() = config;
+    }
+    Ok(Json(snapshot(&state).await?))
+}
+
 async fn clear_session(State(state): State<ServerState>) -> ApiResult<StateResponse> {
     let mut workspace = state.inner.workspace.lock().await;
     let Some(agent) = workspace.agent.as_mut() else {
@@ -585,21 +693,25 @@ async fn clear_session(State(state): State<ServerState>) -> ApiResult<StateRespo
 async fn new_session(State(state): State<ServerState>) -> ApiResult<StateResponse> {
     let root = state.inner.workspace.lock().await.root.clone();
     let session = configured_new_session(&state, &root)?;
-    let agent = build_agent(
+    let mut agent = build_agent(
         &root,
-        &state.inner.config,
+        &state.inner.config.read().unwrap(),
         state.inner.debug_openai,
         session,
     )?;
+    refresh_catalog(&state.inner, &mut agent).await;
     save_agent_session(&state.inner, &agent)?;
     state.inner.workspace.lock().await.agent = Some(agent);
     Ok(Json(snapshot(&state).await?))
 }
 
 fn configured_new_session(state: &ServerState, root: &std::path::Path) -> Result<Session> {
-    let mut session = SessionStore::new(root)?.create(state.inner.config.model.clone())?;
+    let config = state.inner.config.read().unwrap();
+    let active = config.provider(&config.active_provider)?;
+    let mut session = SessionStore::new(root)?
+        .create_for_provider(config.active_provider.clone(), active.model.clone())?;
     if session.model == "auto"
-        && let Some(selection) = default_model_selection(&state.inner.models)
+        && let Some(selection) = default_model_selection(&state.inner.models.read().unwrap())
     {
         session.model = selection.model;
         session.reasoning_effort = selection.reasoning_effort;
@@ -616,12 +728,13 @@ async fn resume_session(
     let root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
     let store = SessionStore::new(&root)?;
     let session = store.load(Some(&request.id))?;
-    let agent = build_agent(
+    let mut agent = build_agent(
         &root,
-        &state.inner.config,
+        &state.inner.config.read().unwrap(),
         state.inner.debug_openai,
         session,
     )?;
+    refresh_catalog(&state.inner, &mut agent).await;
     let mut workspace = state.inner.workspace.lock().await;
     workspace.root = root;
     workspace.agent = Some(agent);
@@ -662,7 +775,7 @@ async fn delete_session(
             .map(|session| {
                 build_agent(
                     &root,
-                    &state.inner.config,
+                    &state.inner.config.read().unwrap(),
                     state.inner.debug_openai,
                     session,
                 )
@@ -945,22 +1058,26 @@ mod tests {
     async fn cancel_endpoint_signals_the_active_turn() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let config = Config {
-            auth: "api_key".into(),
-            api_key_env: String::new(),
-            ..Config::default()
-        };
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
         let (cancel_tx, mut cancellation) = watch::channel(false);
         let state = ServerState {
             inner: Arc::new(ServerInner {
-                config,
+                config: RwLock::new(config),
                 registry: SessionRegistry::at(root.join("test-global-config.toml")),
                 debug_openai: false,
-                models: Vec::new(),
-                catalog_error: None,
+                models: RwLock::new(Vec::new()),
+                catalog_error: RwLock::new(None),
                 dictation_available: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root,
@@ -980,21 +1097,25 @@ mod tests {
     async fn goal_api_keeps_history_but_only_one_goal_active() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let config = Config {
-            auth: "api_key".into(),
-            api_key_env: String::new(),
-            ..Config::default()
-        };
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
         let state = ServerState {
             inner: Arc::new(ServerInner {
-                config,
+                config: RwLock::new(config),
                 registry: SessionRegistry::at(root.join("test-global-config.toml")),
                 debug_openai: false,
-                models: Vec::new(),
-                catalog_error: None,
+                models: RwLock::new(Vec::new()),
+                catalog_error: RwLock::new(None),
                 dictation_available: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root,
@@ -1117,6 +1238,11 @@ mod tests {
         assert_eq!(value["delta"], "hello");
         assert_eq!(value["start"], true);
 
+        assert!(send_stream_message(&sender, ChatStreamMessage::AssistantStreamReset).await);
+        let bytes = receiver.recv().await.unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["type"], "assistant_stream_reset");
+
         let activity = AgentActivity {
             id: "call-1".into(),
             turn_message_index: 0,
@@ -1184,23 +1310,35 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("note.txt"), "hello").unwrap();
         let config = Config {
-            model: "mock-model".into(),
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
             request_timeout_seconds: 5,
             session_directories: Vec::new(),
+            ..Config::default()
         };
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
         let state = ServerState {
             inner: Arc::new(ServerInner {
-                config,
+                config: RwLock::new(config),
                 registry: SessionRegistry::at(root.join("test-global-config.toml")),
                 debug_openai: false,
-                models: Vec::new(),
-                catalog_error: None,
+                models: RwLock::new(Vec::new()),
+                catalog_error: RwLock::new(None),
                 dictation_available: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: root.clone(),
@@ -1260,21 +1398,25 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("hello.txt"), "hello").unwrap();
 
-        let config = Config {
-            auth: "api_key".into(),
-            api_key_env: String::new(),
-            ..Config::default()
-        };
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
         let state = ServerState {
             inner: Arc::new(ServerInner {
-                config,
+                config: RwLock::new(config),
                 registry: SessionRegistry::at(root.join("test-global-config.toml")),
                 debug_openai: false,
-                models: Vec::new(),
-                catalog_error: None,
+                models: RwLock::new(Vec::new()),
+                catalog_error: RwLock::new(None),
                 dictation_available: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: root.clone(),
@@ -1336,13 +1478,17 @@ mod tests {
         std::fs::create_dir_all(&other_root).unwrap();
         std::fs::write(other_root.join("only-in-other.txt"), "hello").unwrap();
 
-        let config = Config {
-            auth: "api_key".into(),
-            api_key_env: String::new(),
-            ..Config::default()
-        };
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
         let current_store = SessionStore::new(&current_root).unwrap();
-        let current = current_store.create(config.model.clone()).unwrap();
+        let current = current_store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let other_store = SessionStore::new(&other_root).unwrap();
         let mut other = other_store.create("other-model".into()).unwrap();
         other.title = "Other project session".into();
@@ -1353,11 +1499,11 @@ mod tests {
         let agent = build_agent(&current_root, &config, false, current).unwrap();
         let state = ServerState {
             inner: Arc::new(ServerInner {
-                config,
+                config: RwLock::new(config),
                 registry,
                 debug_openai: false,
-                models: Vec::new(),
-                catalog_error: None,
+                models: RwLock::new(Vec::new()),
+                catalog_error: RwLock::new(None),
                 dictation_available: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: current_root.clone(),
@@ -1411,11 +1557,7 @@ mod tests {
     async fn deleting_the_active_web_session_selects_the_next_or_leaves_none() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let config = Config {
-            auth: "api_key".into(),
-            api_key_env: String::new(),
-            ..Config::default()
-        };
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
         let store = SessionStore::new(&root).unwrap();
         let mut next = store.create("next-model".into()).unwrap();
         next.updated_at = chrono::Utc::now() - chrono::Duration::seconds(1);
@@ -1439,11 +1581,11 @@ mod tests {
         let agent = build_agent(&root, &config, false, active).unwrap();
         let state = ServerState {
             inner: Arc::new(ServerInner {
-                config,
+                config: RwLock::new(config),
                 registry: SessionRegistry::at(root.join("test-global-config.toml")),
                 debug_openai: false,
-                models: Vec::new(),
-                catalog_error: None,
+                models: RwLock::new(Vec::new()),
+                catalog_error: RwLock::new(None),
                 dictation_available: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: root.clone(),

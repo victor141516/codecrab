@@ -34,10 +34,20 @@ pub(crate) struct Goal {
     pub status_detail: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct AgentTurn {
+    pub message_index: usize,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Session {
     pub id: Uuid,
     pub updated_at: DateTime<Utc>,
+    #[serde(default = "default_provider")]
+    pub provider: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
@@ -45,12 +55,37 @@ pub(crate) struct Session {
     pub messages: Vec<Message>,
     pub activities: Vec<AgentActivity>,
     #[serde(default)]
+    pub turns: Vec<AgentTurn>,
+    #[serde(default)]
     pub goals: Vec<Goal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_goal_id: Option<Uuid>,
 }
 
+fn default_provider() -> String {
+    crate::config::DEFAULT_PROVIDER.into()
+}
+
 impl Session {
+    pub(crate) fn start_turn(&mut self, message_index: usize, started_at: DateTime<Utc>) {
+        self.turns.push(AgentTurn {
+            message_index,
+            started_at,
+            completed_at: None,
+        });
+    }
+
+    pub(crate) fn complete_turn(&mut self, message_index: usize, completed_at: DateTime<Utc>) {
+        if let Some(turn) = self
+            .turns
+            .iter_mut()
+            .rev()
+            .find(|turn| turn.message_index == message_index)
+        {
+            turn.completed_at = Some(completed_at);
+        }
+    }
+
     pub(crate) fn active_goal(&self) -> Option<&Goal> {
         self.goals
             .iter()
@@ -196,17 +231,24 @@ impl SessionStore {
         Ok(Self { dir })
     }
 
+    #[cfg(test)]
     pub(crate) fn create(&self, model: String) -> Result<Session> {
+        self.create_for_provider(default_provider(), model)
+    }
+
+    pub(crate) fn create_for_provider(&self, provider: String, model: String) -> Result<Session> {
         let now = Utc::now();
         Ok(Session {
             id: Uuid::new_v4(),
             updated_at: now,
+            provider,
             model,
             reasoning_effort: None,
             service_tier: None,
             title: "New session".into(),
             messages: Vec::new(),
             activities: Vec::new(),
+            turns: Vec::new(),
             goals: Vec::new(),
             visible_goal_id: None,
         })
@@ -346,6 +388,38 @@ pub(crate) fn resolve_global_session(
 mod tests {
     use super::*;
     use crate::events::{ActivityKind, ActivityStatus, AgentActivity};
+
+    #[test]
+    fn provider_is_persisted_with_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let session = store
+            .create_for_provider("example".into(), "example-model".into())
+            .unwrap();
+        store.save(&session).unwrap();
+
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.provider, "example");
+        assert_eq!(loaded.model, "example-model");
+    }
+
+    #[test]
+    fn completed_turn_timing_is_persisted_with_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let started_at = Utc::now();
+        let completed_at = started_at + chrono::Duration::seconds(7);
+        session.start_turn(3, started_at);
+        session.complete_turn(3, completed_at);
+        store.save(&session).unwrap();
+
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.turns[0].message_index, 3);
+        assert_eq!(loaded.turns[0].started_at, started_at);
+        assert_eq!(loaded.turns[0].completed_at, Some(completed_at));
+    }
 
     #[test]
     fn a_session_can_be_saved_more_than_once() {

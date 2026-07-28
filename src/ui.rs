@@ -41,10 +41,15 @@ use crate::{
         CompletionKind, CompletionMenu, builtin_command_from_input, complete as complete_input,
         goal_objective_from_input,
     },
-    config::{SessionRegistry, normalized_root, paths_equal},
+    config::{
+        Config, ConfigStore, ProviderConfig, SessionRegistry, normalized_root, paths_equal,
+        validate_provider_name,
+    },
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
-    provider::{Message, ModelCatalogEntry, ModelSelection, Role},
+    provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role},
     session::{Goal, GoalStatus, SessionProject, SessionStore, list_session_projects},
+    skills::SkillRegistry,
+    tools::ToolBox,
     transcription::Transcriber,
 };
 use uuid::Uuid;
@@ -62,6 +67,7 @@ const MARKDOWN_LIST: Color = Color::Rgb(244, 99, 86);
 const MARKDOWN_LINK: Color = Color::Rgb(100, 180, 255);
 const MARKDOWN_FENCE: Color = Color::Rgb(105, 115, 130);
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const WAVEFORM: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 struct SkillView {
     name: String,
     description: String,
@@ -73,6 +79,24 @@ enum ModelPickerStep {
     Model,
     Reasoning,
     Speed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorAction {
+    MoveWordLeft,
+    MoveWordRight,
+    DeleteWordLeft,
+    DeleteWordRight,
+    MoveLineStart,
+    MoveLineEnd,
+    DeleteToLineStart,
+    DeleteToLineEnd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ComposerRow {
+    start: usize,
+    end: usize,
 }
 
 struct ModelPicker {
@@ -616,12 +640,15 @@ struct App {
     event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     recording: Option<AudioRecording>,
     transcription: Option<JoinHandle<Result<String>>>,
+    send_after_transcription: bool,
     debug_openai: bool,
+    config: Config,
     clipboard: Option<arboard::Clipboard>,
     markdown: Arc<MarkdownHighlighter>,
     input: String,
     cursor: usize,
     preferred_column: Option<usize>,
+    composer_width: usize,
     pending_user: Option<String>,
     queued_prompt: Option<String>,
     goals: Vec<Goal>,
@@ -664,6 +691,7 @@ impl App {
         model_catalog: Vec<ModelCatalogEntry>,
         catalog_error: Option<String>,
         debug_openai: bool,
+        config: Config,
     ) -> Self {
         let project_root = agent.project_root().to_path_buf();
         let project = project_root.display().to_string();
@@ -695,12 +723,15 @@ impl App {
             event_rx: None,
             recording: None,
             transcription: None,
+            send_after_transcription: false,
             debug_openai,
+            config,
             clipboard: arboard::Clipboard::new().ok(),
             markdown: shared_markdown_highlighter(),
             input: String::new(),
             cursor: 0,
             preferred_column: None,
+            composer_width: 80,
             pending_user: None,
             queued_prompt: None,
             goals,
@@ -783,7 +814,11 @@ impl App {
         self.refresh_completion();
     }
 
-    fn insert_transcript(&mut self, transcript: &str) {
+    fn insert_transcript(&mut self, transcript: &str) -> bool {
+        let transcript = transcript.trim();
+        if transcript.is_empty() {
+            return false;
+        }
         let leading_space = self.cursor > 0
             && !self.input[..self.cursor]
                 .chars()
@@ -798,35 +833,47 @@ impl App {
         if leading_space {
             insertion.push(' ');
         }
-        insertion.push_str(transcript.trim());
+        insertion.push_str(transcript);
         if trailing_space {
             insertion.push(' ');
         }
         self.insert(&insertion);
         self.completion = None;
+        true
     }
 
     fn toggle_dictation(&mut self) -> Result<()> {
         if self.transcription.is_some() {
             return Ok(());
         }
-        if let Some(recording) = self.recording.take() {
-            let audio = recording.finish()?;
-            let debug_openai = self.debug_openai;
-            self.transcription = Some(tokio::spawn(async move {
-                Transcriber::new(debug_openai)?
-                    .transcribe(audio, "audio/wav")
-                    .await
-            }));
+        if self.recording.is_some() {
+            self.stop_dictation(false)?;
         } else {
             self.error = None;
             self.completion = None;
+            self.send_after_transcription = false;
             self.recording = Some(AudioRecording::start()?);
         }
         Ok(())
     }
 
-    async fn finish_transcription_if_ready(&mut self) -> Result<()> {
+    fn stop_dictation(&mut self, send_after_transcription: bool) -> Result<()> {
+        let Some(recording) = self.recording.take() else {
+            return Ok(());
+        };
+        self.send_after_transcription = false;
+        let audio = recording.finish()?;
+        self.send_after_transcription = send_after_transcription;
+        let debug_openai = self.debug_openai;
+        self.transcription = Some(tokio::spawn(async move {
+            Transcriber::new(debug_openai)?
+                .transcribe(audio, "audio/wav")
+                .await
+        }));
+        Ok(())
+    }
+
+    async fn finish_transcription_if_ready(&mut self, registry: &SessionRegistry) -> Result<()> {
         if !self
             .transcription
             .as_ref()
@@ -835,10 +882,14 @@ impl App {
             return Ok(());
         }
         let task = self.transcription.take().expect("checked above");
+        let send_after_transcription = std::mem::take(&mut self.send_after_transcription);
         match task.await.context("dictation task failed")? {
             Ok(transcript) => {
-                self.insert_transcript(&transcript);
+                let inserted = self.insert_transcript(&transcript);
                 self.error = None;
+                if send_after_transcription && inserted {
+                    self.submit(registry)?;
+                }
             }
             Err(error) => self.error = Some(format!("Dictation failed: {error:#}")),
         }
@@ -896,25 +947,51 @@ impl App {
         self.refresh_completion();
     }
 
+    fn apply_editor_action(&mut self, action: EditorAction) {
+        match action {
+            EditorAction::MoveWordLeft => self.cursor = word_left_index(&self.input, self.cursor),
+            EditorAction::MoveWordRight => self.cursor = word_right_index(&self.input, self.cursor),
+            EditorAction::DeleteWordLeft => {
+                let start = word_left_index(&self.input, self.cursor);
+                self.input.drain(start..self.cursor);
+                self.cursor = start;
+            }
+            EditorAction::DeleteWordRight => {
+                let end = word_right_index(&self.input, self.cursor);
+                self.input.drain(self.cursor..end);
+            }
+            EditorAction::MoveLineStart => {
+                self.cursor = hard_line_start(&self.input, self.cursor);
+            }
+            EditorAction::MoveLineEnd => {
+                self.cursor = hard_line_end(&self.input, self.cursor);
+            }
+            EditorAction::DeleteToLineStart => {
+                let start = hard_line_start(&self.input, self.cursor);
+                self.input.drain(start..self.cursor);
+                self.cursor = start;
+            }
+            EditorAction::DeleteToLineEnd => {
+                let end = hard_line_end(&self.input, self.cursor);
+                self.input.drain(self.cursor..end);
+            }
+        }
+        self.preferred_column = None;
+        self.refresh_completion();
+    }
+
     fn move_vertical(&mut self, delta: isize) -> bool {
-        let starts = line_starts(&self.input);
-        let current = starts
-            .partition_point(|start| *start <= self.cursor)
-            .saturating_sub(1);
+        let rows = composer_rows(&self.input, self.composer_width);
+        let current = composer_cursor_position(&self.input, &rows, self.cursor).0;
         let target = current as isize + delta;
-        if target < 0 || target >= starts.len() as isize {
+        if target < 0 || target >= rows.len() as isize {
             return false;
         }
         let column = self
             .preferred_column
-            .unwrap_or_else(|| cursor_line_column(&self.input, self.cursor).1);
+            .unwrap_or_else(|| composer_cursor_position(&self.input, &rows, self.cursor).1);
         self.preferred_column = Some(column);
-        let start = starts[target as usize];
-        let end = self.input[start..]
-            .find('\n')
-            .map(|offset| start + offset)
-            .unwrap_or(self.input.len());
-        self.cursor = byte_index_at_char_column(&self.input, start, end, column);
+        self.cursor = byte_index_at_display_column(&self.input, rows[target as usize], column);
         self.refresh_completion();
         true
     }
@@ -1462,10 +1539,14 @@ impl App {
             (project.root.clone(), project.sessions[session_index].id)
         };
         let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
-        self.agent
-            .as_mut()
-            .context("agent is unavailable")?
-            .switch_project(root, session)?;
+        let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
+        provider.set_debug_openai(self.debug_openai);
+        self.agent = Some(Agent::new(
+            provider,
+            ToolBox::new(root.clone()),
+            SkillRegistry::discover(&root),
+            session,
+        )?);
         self.sync_active_session()?;
         self.session_picker = None;
         if self.active_goal_id().is_some() {
@@ -1498,7 +1579,14 @@ impl App {
         store.delete(&id.to_string())?;
 
         if id == current_id && paths_equal(&root, &self.project_root) {
-            let mut session = store.create(self.model.clone())?;
+            let provider = self
+                .agent
+                .as_ref()
+                .context("agent is unavailable")?
+                .session()
+                .provider
+                .clone();
+            let mut session = store.create_for_provider(provider, self.model.clone())?;
             session.reasoning_effort.clone_from(&self.reasoning_effort);
             session.service_tier.clone_from(&self.service_tier);
             self.agent
@@ -1626,6 +1714,15 @@ impl App {
                             .push(Message::text(Role::Assistant, delta));
                     } else if let Some(message) = self.live_messages.last_mut() {
                         message.content.get_or_insert_default().push_str(&delta);
+                    }
+                }
+                AgentEvent::AssistantStreamReset => {
+                    if self
+                        .live_messages
+                        .last()
+                        .is_some_and(|message| matches!(message.role, Role::Assistant))
+                    {
+                        self.live_messages.pop();
                     }
                 }
                 AgentEvent::AssistantMessageCompleted(message) => {
@@ -2008,6 +2105,13 @@ impl App {
             self.completion = None;
             return self.command(&prompt, registry);
         }
+        if prompt == "/providers" || prompt.starts_with("/provider ") {
+            self.input.clear();
+            self.cursor = 0;
+            self.preferred_column = None;
+            self.completion = None;
+            return self.provider_command(&prompt);
+        }
         if self.is_running() {
             if self.queued_prompt.is_none() {
                 self.input.clear();
@@ -2079,6 +2183,90 @@ impl App {
         if let Some(cancel_tx) = &self.cancel_tx {
             let _ = cancel_tx.send(true);
         }
+    }
+
+    fn provider_command(&mut self, command: &str) -> Result<()> {
+        if self.is_running() {
+            self.error = Some("Wait for the active turn before changing providers.".into());
+            return Ok(());
+        }
+        let parts = command.split_whitespace().collect::<Vec<_>>();
+        let store = ConfigStore::global()?;
+        let mut persisted = store.load()?;
+        match parts.as_slice() {
+            ["/providers"] => {
+                self.error = Some(
+                    persisted
+                        .summaries()
+                        .into_iter()
+                        .map(|provider| {
+                            format!(
+                                "{}{}: {} · {} · key {}",
+                                if provider.active { "* " } else { "" },
+                                provider.name,
+                                provider.model,
+                                provider.base_url,
+                                if provider.api_key_configured {
+                                    "configured"
+                                } else {
+                                    "none"
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+            ["/provider", "use", name] => {
+                persisted.provider(name)?;
+                persisted.active_provider = (*name).into();
+                store.save(&persisted)?;
+                self.config = persisted.clone();
+                self.error = Some(format!(
+                    "Provider {name:?} selected for new sessions. The current session keeps provider {:?}.",
+                    self.agent.as_ref().unwrap().session().provider
+                ));
+            }
+            ["/provider", "remove", name] => {
+                persisted.provider(name)?;
+                if persisted.active_provider == *name {
+                    anyhow::bail!("select another active provider before removing this one");
+                }
+                persisted.providers.remove(*name);
+                store.save(&persisted)?;
+                self.config = persisted.clone();
+                self.error = Some(format!("Provider {name:?} removed."));
+            }
+            [
+                "/provider",
+                "add",
+                name,
+                base_url,
+                model,
+                auth,
+                api_key @ ..,
+            ] if !api_key.is_empty() => {
+                validate_provider_name(name)?;
+                let provider = ProviderConfig {
+                    model: (*model).into(),
+                    base_url: (*base_url).into(),
+                    auth: (*auth).into(),
+                    api_key: api_key.join(" "),
+                };
+                provider.validate(name)?;
+                persisted.providers.insert((*name).into(), provider);
+                store.save(&persisted)?;
+                self.config = persisted.clone();
+                self.error = Some(format!("Provider {name:?} saved."));
+            }
+            _ => {
+                self.error = Some(
+                    "Usage: /providers | /provider use NAME | /provider remove NAME | /provider add NAME BASE_URL MODEL AUTH API_KEY"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn command(&mut self, command: &str, registry: &SessionRegistry) -> Result<()> {
@@ -2224,6 +2412,18 @@ impl App {
             return Ok(());
         }
 
+        if self.recording.is_some() {
+            if key.code == KeyCode::Enter
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT)
+                && let Err(error) = self.stop_dictation(true)
+            {
+                self.error = Some(format!("Dictation failed: {error:#}"));
+            }
+            return Ok(());
+        }
+
         if self.completion.is_some()
             && !key
                 .modifiers
@@ -2262,27 +2462,16 @@ impl App {
             }
         }
 
+        if let Some(action) = editor_action(&key) {
+            self.apply_editor_action(action);
+            return Ok(());
+        }
+
         if key.modifiers == KeyModifiers::CONTROL {
             match key.code {
                 KeyCode::Char('c' | 'd') if !self.is_busy() => self.should_quit = true,
                 KeyCode::Char('c') => {}
                 KeyCode::Char('j') => self.insert("\n"),
-                KeyCode::Char('u') => {
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.preferred_column = None;
-                    self.completion = None;
-                }
-                KeyCode::Char('a') => {
-                    self.cursor = 0;
-                    self.preferred_column = None;
-                    self.refresh_completion();
-                }
-                KeyCode::Char('e') => {
-                    self.cursor = self.input.len();
-                    self.preferred_column = None;
-                    self.refresh_completion();
-                }
                 _ => {}
             }
             return Ok(());
@@ -2312,17 +2501,6 @@ impl App {
             KeyCode::Delete => self.delete(),
             KeyCode::Left => self.move_left(),
             KeyCode::Right => self.move_right(),
-            KeyCode::Home => {
-                self.cursor = 0;
-                self.preferred_column = None;
-                self.refresh_completion();
-            }
-            KeyCode::End => {
-                self.cursor = self.input.len();
-                self.preferred_column = None;
-                self.auto_scroll = true;
-                self.refresh_completion();
-            }
             KeyCode::Up => {
                 if !self.move_vertical(-1) {
                     self.scroll_up(2);
@@ -2353,6 +2531,7 @@ pub(crate) async fn interactive(
     mut agent: Agent,
     registry: &SessionRegistry,
     debug_openai: bool,
+    config: Config,
 ) -> Result<()> {
     let (model_catalog, catalog_error) = match agent.fetch_models().await {
         Ok(catalog) => {
@@ -2375,7 +2554,7 @@ pub(crate) async fn interactive(
 
     let result = run_tui(
         &mut terminal,
-        App::new(agent, model_catalog, catalog_error, debug_openai),
+        App::new(agent, model_catalog, catalog_error, debug_openai, config),
         registry,
     )
     .await;
@@ -2408,7 +2587,7 @@ async fn run_tui(
         if !app.is_running() {
             app.apply_pending_goal_action(registry)?;
         }
-        app.finish_transcription_if_ready().await?;
+        app.finish_transcription_if_ready(registry).await?;
         app.update_drag_autoscroll();
         app.spinner = app.spinner.wrapping_add(1);
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -2435,7 +2614,10 @@ async fn run_tui(
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    let input_lines = app.input.lines().count().clamp(1, 6) as u16;
+    app.composer_width = area.width.saturating_sub(2).max(1) as usize;
+    let input_lines = composer_rows(&app.input, app.composer_width)
+        .len()
+        .clamp(1, 6) as u16;
     let queued_height = if app.queued_prompt.is_some() { 3 } else { 0 };
     let goal_height = if app.visible_goal().is_some() { 3 } else { 0 };
     let [header, body, queued, goal, composer] = Layout::vertical([
@@ -2888,6 +3070,7 @@ fn push_activity_line(source: &mut ConversationSource, app: &App, activity: &Age
         ActivityKind::Write => Color::Yellow,
         ActivityKind::Shell => Color::Magenta,
         ActivityKind::Skill => CRAB,
+        ActivityKind::Network => Color::LightRed,
         ActivityKind::Other => MUTED,
     };
     let (icon, icon_color) = match activity.status {
@@ -3039,7 +3222,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         AQUA
     };
     let title = if app.recording.is_some() {
-        " Recording · Ctrl+Shift+S to stop "
+        " Recording · Ctrl+Shift+S to stop · Enter to send "
     } else if app.transcription.is_some() {
         " Transcribing voice… "
     } else if app.is_running() {
@@ -3056,15 +3239,33 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let (line_index, column) = cursor_line_column(&app.input, app.cursor);
-    let all_lines = app.input.split('\n').collect::<Vec<_>>();
+    if let Some(recording) = &app.recording {
+        let waveform = inner.inner(Margin {
+            horizontal: 2,
+            vertical: 0,
+        });
+        let waveform = Rect::new(
+            waveform.x,
+            waveform.y + waveform.height.saturating_sub(1) / 2,
+            waveform.width,
+            waveform.height.min(1),
+        );
+        frame.render_widget(
+            Paragraph::new(waveform_line(recording.waveform(waveform.width as usize))),
+            waveform,
+        );
+        return;
+    }
+
+    let rows = composer_rows(&app.input, inner.width.max(1) as usize);
+    let (line_index, column) = composer_cursor_position(&app.input, &rows, app.cursor);
     let visible = inner.height.max(1) as usize;
     let start = line_index.saturating_sub(visible - 1);
-    let shown = all_lines
+    let shown = rows
         .iter()
         .skip(start)
         .take(visible)
-        .map(|line| Line::from((*line).to_owned()))
+        .map(|row| Line::from(app.input[row.start..row.end].to_owned()))
         .collect::<Vec<_>>();
     if app.input.is_empty() {
         frame.render_widget(
@@ -3088,6 +3289,20 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             inner.y + line_index.saturating_sub(start) as u16,
         ));
     }
+}
+
+fn waveform_line(levels: impl IntoIterator<Item = u8>) -> Line<'static> {
+    Line::from(
+        levels
+            .into_iter()
+            .map(|level| {
+                Span::styled(
+                    WAVEFORM[usize::from(level.min((WAVEFORM.len() - 1) as u8))].to_string(),
+                    Style::default().fg(if level == 0 { Color::DarkGray } else { CRAB }),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rect) {
@@ -3208,13 +3423,13 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             "Keyboard",
             Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Enter                 complete selection or send"),
+        Line::from("  Enter                 complete, send, or send recording"),
         Line::from("  Tab                   complete slash selection"),
         Line::from("  Shift+Enter / Ctrl+J  insert newline"),
         Line::from("  Ctrl+Shift+S          start or stop voice dictation"),
         Line::from("  ↑ / ↓                 navigate menu or move between lines"),
         Line::from("  PgUp / PgDn           scroll conversation"),
-        Line::from("  Ctrl+U                clear composer"),
+        Line::from("  Ctrl+U / Ctrl+K       delete to line start / end"),
         Line::from("  F2                    show available skills"),
         Line::from("  Ctrl+D / Ctrl+C       save and quit"),
         Line::default(),
@@ -3663,34 +3878,168 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
         })
 }
 
-fn cursor_line_column(input: &str, cursor: usize) -> (usize, usize) {
-    let before = &input[..cursor];
-    let line = before.bytes().filter(|byte| *byte == b'\n').count();
-    let column = before
-        .rsplit('\n')
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .count();
-    (line, column)
+fn composer_rows(input: &str, width: usize) -> Vec<ComposerRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut used = 0_usize;
+    for (index, character) in input.char_indices() {
+        if character == '\n' {
+            rows.push(ComposerRow { start, end: index });
+            start = index + character.len_utf8();
+            used = 0;
+            continue;
+        }
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used > 0 && used.saturating_add(character_width) > width {
+            rows.push(ComposerRow { start, end: index });
+            start = index;
+            used = 0;
+        }
+        used = used.saturating_add(character_width);
+    }
+    rows.push(ComposerRow {
+        start,
+        end: input.len(),
+    });
+    if used >= width && start < input.len() {
+        rows.push(ComposerRow {
+            start: input.len(),
+            end: input.len(),
+        });
+    }
+    rows
 }
 
-fn line_starts(input: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    starts.extend(
-        input
-            .match_indices('\n')
-            .map(|(index, _)| index.saturating_add(1)),
-    );
-    starts
+fn composer_cursor_position(input: &str, rows: &[ComposerRow], cursor: usize) -> (usize, usize) {
+    let row = rows
+        .partition_point(|row| row.start <= cursor)
+        .saturating_sub(1)
+        .min(rows.len().saturating_sub(1));
+    let range = rows[row];
+    let cursor = cursor.clamp(range.start, range.end);
+    (row, display_width(&input[range.start..cursor]))
 }
 
-fn byte_index_at_char_column(input: &str, start: usize, end: usize, column: usize) -> usize {
-    input[start..end]
-        .char_indices()
-        .nth(column)
-        .map(|(offset, _)| start + offset)
-        .unwrap_or(end)
+fn byte_index_at_display_column(input: &str, row: ComposerRow, column: usize) -> usize {
+    let mut used = 0_usize;
+    for (offset, character) in input[row.start..row.end].char_indices() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used.saturating_add(character_width) > column {
+            return row.start + offset;
+        }
+        used = used.saturating_add(character_width);
+    }
+    row.end
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum()
+}
+
+fn editor_action(key: &KeyEvent) -> Option<EditorAction> {
+    let word_modifier = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let control_sequence =
+        key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+    let alt_sequence =
+        key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL);
+    let line_modifier = key
+        .modifiers
+        .intersects(KeyModifiers::SUPER | KeyModifiers::META);
+    match key.code {
+        KeyCode::Left if word_modifier => Some(EditorAction::MoveWordLeft),
+        KeyCode::Right if word_modifier => Some(EditorAction::MoveWordRight),
+        KeyCode::Backspace if word_modifier => Some(EditorAction::DeleteWordLeft),
+        KeyCode::Delete if word_modifier => Some(EditorAction::DeleteWordRight),
+        KeyCode::Char('b' | 'B') if alt_sequence => Some(EditorAction::MoveWordLeft),
+        KeyCode::Char('f' | 'F') if alt_sequence => Some(EditorAction::MoveWordRight),
+        KeyCode::Char('d' | 'D') if alt_sequence => Some(EditorAction::DeleteWordRight),
+        KeyCode::Char('w' | 'W') if control_sequence => Some(EditorAction::DeleteWordLeft),
+        KeyCode::Home | KeyCode::Char('a' | 'A')
+            if matches!(key.code, KeyCode::Home) || control_sequence =>
+        {
+            Some(EditorAction::MoveLineStart)
+        }
+        KeyCode::End | KeyCode::Char('e' | 'E')
+            if matches!(key.code, KeyCode::End) || control_sequence =>
+        {
+            Some(EditorAction::MoveLineEnd)
+        }
+        KeyCode::Left if line_modifier => Some(EditorAction::MoveLineStart),
+        KeyCode::Right if line_modifier => Some(EditorAction::MoveLineEnd),
+        KeyCode::Backspace if line_modifier => Some(EditorAction::DeleteToLineStart),
+        KeyCode::Delete if line_modifier => Some(EditorAction::DeleteToLineEnd),
+        KeyCode::Char('u' | 'U') if control_sequence => Some(EditorAction::DeleteToLineStart),
+        KeyCode::Char('k' | 'K') if control_sequence => Some(EditorAction::DeleteToLineEnd),
+        _ => None,
+    }
+}
+
+fn word_left_index(input: &str, cursor: usize) -> usize {
+    let mut position = cursor;
+    while let Some((index, character)) = previous_character(input, position) {
+        if is_word_character(character) {
+            break;
+        }
+        position = index;
+    }
+    while let Some((index, character)) = previous_character(input, position) {
+        if !is_word_character(character) {
+            break;
+        }
+        position = index;
+    }
+    position
+}
+
+fn word_right_index(input: &str, cursor: usize) -> usize {
+    let mut position = cursor;
+    let starts_in_word = next_character(input, position).is_some_and(is_word_character);
+    if starts_in_word {
+        while let Some(character) = next_character(input, position) {
+            if !is_word_character(character) {
+                break;
+            }
+            position += character.len_utf8();
+        }
+    }
+    while let Some(character) = next_character(input, position) {
+        if is_word_character(character) {
+            break;
+        }
+        position += character.len_utf8();
+    }
+    position
+}
+
+fn previous_character(input: &str, position: usize) -> Option<(usize, char)> {
+    input[..position].char_indices().next_back()
+}
+
+fn next_character(input: &str, position: usize) -> Option<char> {
+    input[position..].chars().next()
+}
+
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn hard_line_start(input: &str, cursor: usize) -> usize {
+    input[..cursor]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn hard_line_end(input: &str, cursor: usize) -> usize {
+    input[cursor..]
+        .find('\n')
+        .map(|offset| cursor + offset)
+        .unwrap_or(input.len())
 }
 
 fn speed_tier_index(model: &ModelCatalogEntry, selected: Option<&str>) -> usize {
@@ -3816,20 +4165,25 @@ mod tests {
     }
 
     fn test_app(root: &std::path::Path) -> App {
-        let config = Config {
-            auth: "api_key".into(),
-            api_key_env: String::new(),
-            ..Config::default()
-        };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let store = SessionStore::new(root).unwrap();
-        let session = store.create(config.model).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let tools = ToolBox::new(root.to_path_buf());
         App::new(
             Agent::new(provider, tools, SkillRegistry::default(), session).unwrap(),
             Vec::new(),
             None,
             false,
+            config,
         )
     }
 
@@ -3850,8 +4204,10 @@ mod tests {
 
     #[test]
     fn composer_edits_unicode_at_character_boundaries() {
-        let (line, column) = cursor_line_column("hola\n🦀", "hola\n🦀".len());
-        assert_eq!((line, column), (1, 1));
+        let input = "hola\n🦀";
+        let rows = composer_rows(input, 20);
+        let (line, column) = composer_cursor_position(input, &rows, input.len());
+        assert_eq!((line, column), (1, 2));
     }
 
     #[test]
@@ -3866,6 +4222,43 @@ mod tests {
         assert_eq!(app.input, "Review the project this");
         assert_eq!(app.cursor, "Review the project ".len());
         assert!(app.pending_user.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_transcript_can_be_inserted_and_submitted_immediately() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(root.path());
+        let mut app = test_app(root.path());
+        app.send_after_transcription = true;
+        app.transcription = Some(tokio::spawn(async {
+            Ok::<_, anyhow::Error>("spoken prompt".to_owned())
+        }));
+        for _ in 0..10 {
+            if app
+                .transcription
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        app.finish_transcription_if_ready(&registry).await.unwrap();
+
+        assert_eq!(app.pending_user.as_deref(), Some("spoken prompt"));
+        assert!(app.input.is_empty());
+        assert!(app.running.is_some());
+        app.running.take().unwrap().abort();
+    }
+
+    #[test]
+    fn terminal_waveform_starts_at_the_bottom_and_grows_with_volume() {
+        let line = waveform_line([0, 3, 7]);
+
+        assert_eq!(line.to_string(), "▁▄█");
+        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(line.spans[1].style.fg, Some(CRAB));
     }
 
     #[test]
@@ -3895,6 +4288,25 @@ mod tests {
             Some("A long answer")
         );
         assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn retry_reset_removes_the_partial_streamed_message() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        app.event_rx = Some(event_rx);
+        event_tx
+            .send(AgentEvent::AssistantTextDelta {
+                delta: "incomplete".into(),
+                start: true,
+            })
+            .unwrap();
+        event_tx.send(AgentEvent::AssistantStreamReset).unwrap();
+
+        app.drain_agent_events();
+
+        assert!(app.live_messages.is_empty());
     }
 
     #[tokio::test]
@@ -4421,8 +4833,16 @@ mod tests {
             &registry,
         )
         .unwrap();
+        app.handle_key(
+            KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            &registry,
+        )
+        .unwrap();
 
-        assert_eq!(app.input, "@@€");
+        assert_eq!(app.input, "@@€b");
 
         // An unknown Ctrl-only chord remains a control chord rather than text.
         app.handle_key(
@@ -4430,7 +4850,7 @@ mod tests {
             &registry,
         )
         .unwrap();
-        assert_eq!(app.input, "@@€");
+        assert_eq!(app.input, "@@€b");
     }
 
     #[test]
@@ -4684,6 +5104,95 @@ mod tests {
         assert_eq!(app.cursor, app.input.len());
         assert!(app.move_vertical(-1));
         assert_eq!(app.cursor, 6);
+    }
+
+    #[test]
+    fn composer_soft_wraps_without_changing_the_prompt() {
+        let input = "abcdefghij";
+        let rows = composer_rows(input, 4);
+        let rendered = rows
+            .iter()
+            .map(|row| &input[row.start..row.end])
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, ["abcd", "efgh", "ij"]);
+        assert_eq!(input, "abcdefghij");
+
+        let exact = composer_rows("abcd", 4);
+        assert_eq!(exact.len(), 2);
+        assert_eq!(exact[1], ComposerRow { start: 4, end: 4 });
+    }
+
+    #[test]
+    fn vertical_arrows_navigate_soft_wrapped_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.input = "abcdefghij".into();
+        app.cursor = 2;
+        app.composer_width = 4;
+
+        assert!(app.move_vertical(1));
+        assert_eq!(app.cursor, 6);
+        assert!(app.move_vertical(1));
+        assert_eq!(app.cursor, 10);
+        assert!(app.move_vertical(-1));
+        assert_eq!(app.cursor, 6);
+        assert_eq!(app.input, "abcdefghij");
+    }
+
+    #[test]
+    fn soft_wrap_and_cursor_columns_use_terminal_character_width() {
+        let input = "a🦀bc";
+        let rows = composer_rows(input, 3);
+        let rendered = rows
+            .iter()
+            .map(|row| &input[row.start..row.end])
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, ["a🦀", "bc"]);
+        assert_eq!(composer_cursor_position(input, &rows, "a🦀".len()), (1, 0));
+    }
+
+    #[test]
+    fn decoded_terminal_sequences_drive_word_and_line_actions() {
+        assert_eq!(
+            editor_action(&KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)),
+            Some(EditorAction::MoveWordLeft)
+        );
+        assert_eq!(
+            editor_action(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Some(EditorAction::DeleteWordLeft)
+        );
+        assert_eq!(
+            editor_action(&KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)),
+            Some(EditorAction::MoveWordRight)
+        );
+        assert_eq!(
+            editor_action(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)),
+            Some(EditorAction::DeleteToLineStart)
+        );
+        assert_eq!(
+            editor_action(&KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            Some(EditorAction::MoveLineStart)
+        );
+    }
+
+    #[test]
+    fn word_and_line_actions_edit_unicode_text_at_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.input = "uno 🦀 dos\núltima línea".into();
+        app.cursor = "uno 🦀 dos".len();
+
+        app.apply_editor_action(EditorAction::MoveWordLeft);
+        assert_eq!(&app.input[app.cursor..], "dos\núltima línea");
+        app.apply_editor_action(EditorAction::DeleteWordLeft);
+        assert_eq!(app.input, "dos\núltima línea");
+
+        app.cursor = app.input.len();
+        app.apply_editor_action(EditorAction::DeleteToLineStart);
+        assert_eq!(app.input, "dos\n");
+        assert_eq!(app.cursor, "dos\n".len());
     }
 
     #[test]

@@ -34,6 +34,7 @@ const GOAL_CONTINUATION_PROMPT: &str = "Continue working toward the active goal.
 conversation and current workspace state, identify what remains, and make concrete progress. \
 Do not repeat completed work. Call complete_goal only after you have verified every completion \
 criterion. Call block_goal only when an external decision or state genuinely prevents progress.";
+const MAX_MODEL_RETRIES: usize = 5;
 
 #[derive(Debug)]
 pub(crate) struct TurnCancelled;
@@ -106,16 +107,6 @@ impl Agent {
         self.session = session;
     }
 
-    pub(crate) fn switch_project(&mut self, root: PathBuf, session: Session) -> Result<()> {
-        let project_instructions = load_project_instructions(&root)?;
-        let skills = SkillRegistry::discover(&root);
-        self.tools = ToolBox::new(root);
-        self.skills = skills;
-        self.project_instructions = project_instructions;
-        self.replace_session(session);
-        Ok(())
-    }
-
     pub(crate) fn resolve_auto_model(&mut self, catalog: &[ModelCatalogEntry]) -> bool {
         if self.session.model != "auto" {
             return false;
@@ -135,6 +126,7 @@ impl Agent {
         self.session.pause_active_goal();
         self.session.messages.clear();
         self.session.activities.clear();
+        self.session.turns.clear();
         self.session.title = "New session".into();
         self.session.updated_at = Utc::now();
     }
@@ -193,6 +185,7 @@ impl Agent {
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         mut cancellation: watch::Receiver<bool>,
     ) -> Result<String> {
+        let turn_started_at = Utc::now();
         let mut explicit_skills = self.skills.explicit_instructions(prompt)?;
         if let Some(goal) = self.session.active_goal()
             && goal.objective != prompt
@@ -208,6 +201,7 @@ impl Agent {
             Message::text(Role::User, prompt)
         });
         let turn_message_index = self.session.messages.len() - 1;
+        self.session.start_turn(turn_message_index, turn_started_at);
 
         loop {
             if *cancellation.borrow() {
@@ -228,38 +222,79 @@ impl Agent {
             if self.session.active_goal().is_some() {
                 definitions.extend(goal_definitions());
             }
-            let streamed_text = Arc::new(Mutex::new(String::new()));
-            let callback_text = streamed_text.clone();
-            let callback_events = events.clone();
-            let response = tokio::select! {
-                response = self.provider.complete(
-                    &messages,
-                    &definitions,
-                    move |delta| {
-                        let mut text = callback_text
-                            .lock()
-                            .expect("streamed text mutex poisoned");
-                        let start = text.is_empty();
-                        text.push_str(delta);
-                        if let Some(events) = &callback_events {
-                            let _ = events.send(AgentEvent::AssistantTextDelta {
-                                delta: delta.to_owned(),
-                                start,
-                            });
-                        }
-                    },
-                ) => match response {
-                    Ok(response) => response,
-                    Err(error) => {
+            let mut retry = 0;
+            let (response, streamed_text) = loop {
+                let streamed_text = Arc::new(Mutex::new(String::new()));
+                let callback_text = streamed_text.clone();
+                let callback_events = events.clone();
+                let result = tokio::select! {
+                    response = self.provider.complete(
+                        &messages,
+                        &definitions,
+                        move |delta| {
+                            let mut text = callback_text
+                                .lock()
+                                .expect("streamed text mutex poisoned");
+                            let start = text.is_empty();
+                            text.push_str(delta);
+                            if let Some(events) = &callback_events {
+                                let _ = events.send(AgentEvent::AssistantTextDelta {
+                                    delta: delta.to_owned(),
+                                    start,
+                                });
+                            }
+                        },
+                    ) => response,
+                    () = wait_for_cancellation(&mut cancellation) => {
                         preserve_partial_assistant(&mut self.session.messages, &streamed_text);
+                        self.session.updated_at = Utc::now();
+                        return Err(TurnCancelled.into());
+                    }
+                };
+                match result {
+                    Ok(response) => break (response, streamed_text),
+                    Err(error) if retry < MAX_MODEL_RETRIES => {
+                        retry += 1;
+                        let error_text = format!("{error:#}");
+                        eprintln!(
+                            "CodeCrab model request failed; retrying ({retry}/{MAX_MODEL_RETRIES}): {error_text}"
+                        );
+                        if !streamed_text
+                            .lock()
+                            .expect("streamed text mutex poisoned")
+                            .is_empty()
+                            && let Some(events) = &events
+                        {
+                            let _ = events.send(AgentEvent::AssistantStreamReset);
+                        }
+                        self.record_activity(
+                            AgentActivity::model_retry(
+                                format!("model-retry-{}", Uuid::new_v4()),
+                                turn_message_index,
+                                retry,
+                                MAX_MODEL_RETRIES,
+                                error_text,
+                            ),
+                            events.as_ref(),
+                        );
+                    }
+                    Err(error) => {
+                        let error_text = format!("{error:#}");
+                        eprintln!(
+                            "CodeCrab model request failed after {MAX_MODEL_RETRIES} retries: {error_text}"
+                        );
+                        preserve_partial_assistant(&mut self.session.messages, &streamed_text);
+                        self.record_activity(
+                            AgentActivity::model_error(
+                                format!("model-error-{}", Uuid::new_v4()),
+                                turn_message_index,
+                                error_text,
+                            ),
+                            events.as_ref(),
+                        );
                         self.session.updated_at = Utc::now();
                         return Err(error);
                     }
-                },
-                () = wait_for_cancellation(&mut cancellation) => {
-                    preserve_partial_assistant(&mut self.session.messages, &streamed_text);
-                    self.session.updated_at = Utc::now();
-                    return Err(TurnCancelled.into());
                 }
             };
             let calls = response.tool_calls.clone().unwrap_or_default();
@@ -279,7 +314,9 @@ impl Agent {
             self.session.messages.push(response);
 
             if calls.is_empty() {
-                self.session.updated_at = Utc::now();
+                let completed_at = Utc::now();
+                self.session.complete_turn(turn_message_index, completed_at);
+                self.session.updated_at = completed_at;
                 return Ok(if content.trim().is_empty() {
                     "(The model returned an empty answer.)".into()
                 } else {
@@ -612,17 +649,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = Config {
-            model: "mock-model".into(),
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
             request_timeout_seconds: 30,
             session_directories: Vec::new(),
+            ..Config::default()
         };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.clone());
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let mut agent = Agent::new(provider, tools, SkillRegistry::default(), session).unwrap();
         let (events, _received) = mpsc::unbounded_channel();
         let (cancel_tx, cancellation) = watch::channel(false);
@@ -646,6 +695,129 @@ mod tests {
         assert_eq!(agent.session().messages.len(), 1);
         assert!(matches!(agent.session().messages[0].role, Role::User));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn retries_a_failed_model_request_and_persists_the_retry_activity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 16_384];
+                let _ = socket.read(&mut request).await.unwrap();
+                let (status, body) = if attempt == 0 {
+                    (
+                        "500 Internal Server Error",
+                        json!({"error": {"message": "temporary failure"}}).to_string(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Recovered."
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config {
+            request_timeout_seconds: 5,
+            ..Config::test("mock-model", format!("http://{address}/v1"))
+        };
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let tools = ToolBox::new(root.clone());
+        let store = SessionStore::new(&root).unwrap();
+        let session = store.create("mock-model".into()).unwrap();
+        let mut agent = Agent::new(provider, tools, SkillRegistry::default(), session).unwrap();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancellation) = watch::channel(false);
+
+        let answer = agent
+            .turn_with_events("Recover", events, cancellation)
+            .await
+            .unwrap();
+
+        assert_eq!(answer, "Recovered.");
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            AgentEvent::Activity(AgentActivity {
+                kind: crate::events::ActivityKind::Network,
+                status: crate::events::ActivityStatus::Completed,
+                ref title,
+                ..
+            }) if title == "Retrying model request (1/5)"
+        ));
+        assert_eq!(agent.session().activities.len(), 1);
+        assert!(
+            agent.session().activities[0]
+                .detail
+                .contains("temporary failure")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stops_after_five_retries_and_persists_the_final_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let body = json!({"error": {"message": "still unavailable"}}).to_string();
+            for _ in 0..=MAX_MODEL_RETRIES {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 16_384];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config {
+            request_timeout_seconds: 5,
+            ..Config::test("mock-model", format!("http://{address}/v1"))
+        };
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let tools = ToolBox::new(root.clone());
+        let store = SessionStore::new(&root).unwrap();
+        let session = store.create("mock-model".into()).unwrap();
+        let mut agent = Agent::new(provider, tools, SkillRegistry::default(), session).unwrap();
+
+        let error = agent.turn("Fail").await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("still unavailable"));
+        assert_eq!(agent.session().activities.len(), MAX_MODEL_RETRIES + 1);
+        assert_eq!(
+            agent.session().activities.last().unwrap().status,
+            crate::events::ActivityStatus::Failed
+        );
+        assert_eq!(
+            agent.session().activities.last().unwrap().title,
+            "Model request failed"
+        );
+        store.save(agent.session()).unwrap();
+        let resumed = store.load(Some(&agent.session().id.to_string())).unwrap();
+        assert_eq!(
+            resumed.activities.last().unwrap().detail,
+            agent.session().activities.last().unwrap().detail
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -698,17 +870,29 @@ mod tests {
         fs::write(temp.path().join("note.txt"), "hello from the project").unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = Config {
-            model: "mock-model".into(),
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
             request_timeout_seconds: 5,
             session_directories: Vec::new(),
+            ..Config::default()
         };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.clone());
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let mut agent = Agent::new(provider, tools, SkillRegistry::default(), session).unwrap();
 
         let (events, mut received) = mpsc::unbounded_channel();
@@ -825,17 +1009,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = Config {
-            model: "mock-model".into(),
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
             request_timeout_seconds: 5,
             session_directories: Vec::new(),
+            ..Config::default()
         };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.clone());
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let mut agent = Agent::new(provider, tools, SkillRegistry::default(), session).unwrap();
         agent.create_goal("Ship the release with every check passing".into());
         let (events, _received) = mpsc::unbounded_channel();
@@ -926,17 +1122,29 @@ mod tests {
         fs::write(temp.path().join("note.txt"), "hello").unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = Config {
-            model: "mock-model".into(),
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
             request_timeout_seconds: 5,
             session_directories: Vec::new(),
+            ..Config::default()
         };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.clone());
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let mut agent = Agent::new(provider, tools, SkillRegistry::default(), session).unwrap();
         let (events, _received) = mpsc::unbounded_channel();
         let (_cancel_tx, cancellation) = watch::channel(false);
@@ -1011,18 +1219,30 @@ mod tests {
         )
         .unwrap();
         let config = Config {
-            model: "mock-model".into(),
-            base_url: format!("http://{address}/v1"),
-            auth: "api_key".into(),
-            api_key_env: String::new(),
+            providers: std::collections::BTreeMap::from([(
+                "openai".into(),
+                crate::config::ProviderConfig::test(
+                    "mock-model".into(),
+                    format!("http://{address}/v1"),
+                ),
+            )]),
             request_timeout_seconds: 5,
             session_directories: Vec::new(),
+            ..Config::default()
         };
-        let provider = OpenAiCompatible::new(&config).unwrap();
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.clone());
         let skills = SkillRegistry::discover(&root);
         let store = SessionStore::new(&root).unwrap();
-        let session = store.create(config.model.clone()).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
         let mut agent = Agent::new(provider, tools, skills, session).unwrap();
 
         let answer = agent.turn("Review this").await.unwrap();
