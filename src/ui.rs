@@ -50,7 +50,10 @@ use crate::{
     },
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role},
-    session::{AgentTurn, Goal, GoalStatus, SessionProject, SessionStore, list_session_projects},
+    session::{
+        AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionProject, SessionStore,
+        list_session_projects,
+    },
     skills::SkillRegistry,
     tools::ToolBox,
     transcription::Transcriber,
@@ -175,6 +178,7 @@ struct ConversationSource {
     lines: Vec<Line<'static>>,
     copy_targets: Vec<CopyTarget>,
     turn_toggles: Vec<TurnToggleTarget>,
+    node_lines: Vec<(Uuid, usize)>,
 }
 
 #[derive(Clone)]
@@ -205,6 +209,24 @@ struct ConversationView {
     scroll: usize,
     copy_targets: Vec<CopyTarget>,
     turn_toggles: Vec<TurnToggleTarget>,
+}
+
+struct BranchNavigator {
+    nodes: Vec<ConversationGraphNode>,
+    rows: Vec<BranchRow>,
+    selected: usize,
+    original_path: HashSet<Uuid>,
+    preview_path: HashSet<Uuid>,
+    original_scroll: u16,
+    original_auto_scroll: bool,
+    offset: usize,
+}
+
+struct BranchRow {
+    id: Uuid,
+    depth: usize,
+    ancestor_continues: Vec<bool>,
+    is_last: bool,
 }
 
 impl ConversationView {
@@ -664,6 +686,7 @@ struct App {
     conversations: ConversationManager,
     conversation: ConversationHandle,
     transcript: Vec<Message>,
+    transcript_node_ids: Vec<Uuid>,
     live_messages: Vec<Message>,
     activities: Vec<AgentActivity>,
     turns: Vec<AgentTurn>,
@@ -709,6 +732,7 @@ struct App {
     model_catalog: Vec<ModelCatalogEntry>,
     model_picker: Option<ModelPicker>,
     session_picker: Option<SessionPicker>,
+    branch_navigator: Option<BranchNavigator>,
     should_quit: bool,
     project: String,
     project_root: PathBuf,
@@ -721,6 +745,7 @@ struct App {
     session_id: Uuid,
     expanded_turns: HashSet<TurnKey>,
     pending_turn_anchor: Option<TurnAnchor>,
+    pending_branch_node: Option<Uuid>,
 }
 
 struct BackgroundTurn {
@@ -756,6 +781,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         let transcript = agent.session().messages.to_vec();
+        let transcript_node_ids = agent.session().messages.active_node_ids().to_vec();
         let activities = agent.session().activities.clone();
         let turns = agent.session().turns.clone();
         let goals = agent.session().goals.clone();
@@ -772,6 +798,7 @@ impl App {
             conversations,
             conversation,
             transcript,
+            transcript_node_ids,
             live_messages: Vec::new(),
             activities,
             turns,
@@ -817,6 +844,7 @@ impl App {
             model_catalog,
             model_picker: None,
             session_picker: None,
+            branch_navigator: None,
             should_quit: false,
             project,
             project_root,
@@ -829,6 +857,7 @@ impl App {
             session_id,
             expanded_turns: HashSet::new(),
             pending_turn_anchor: None,
+            pending_branch_node: None,
         })
     }
 
@@ -1407,6 +1436,7 @@ impl App {
 
     fn apply_snapshot(&mut self, snapshot: ConversationSnapshot) {
         self.transcript = snapshot.session.messages.to_vec();
+        self.transcript_node_ids = snapshot.session.messages.active_node_ids().to_vec();
         self.activities.clone_from(&snapshot.session.activities);
         self.turns.clone_from(&snapshot.session.turns);
         self.goals.clone_from(&snapshot.session.goals);
@@ -1427,6 +1457,127 @@ impl App {
                 scope: skill.scope,
             })
             .collect();
+    }
+
+    fn apply_branch_session(&mut self, session: &Session) {
+        self.transcript = session.messages.to_vec();
+        self.transcript_node_ids = session.messages.active_node_ids().to_vec();
+        self.activities.clone_from(&session.activities);
+        self.turns.clone_from(&session.turns);
+    }
+
+    fn open_branch_navigator(&mut self) {
+        if self.is_busy() {
+            self.error = Some("Wait for the active operation before browsing branches.".into());
+            return;
+        }
+        let snapshot = self.conversation.snapshot();
+        let nodes = snapshot.session.messages.visible_user_nodes();
+        if nodes.is_empty() {
+            self.error = Some("This conversation has no visible user messages.".into());
+            return;
+        }
+        let active_path = snapshot
+            .session
+            .messages
+            .active_node_ids()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let selected = nodes
+            .iter()
+            .rposition(|node| active_path.contains(&node.id))
+            .unwrap_or(0);
+        let rows = branch_rows(&nodes);
+        self.branch_navigator = Some(BranchNavigator {
+            nodes,
+            rows,
+            selected,
+            original_path: active_path.clone(),
+            preview_path: active_path,
+            original_scroll: self.scroll,
+            original_auto_scroll: self.auto_scroll,
+            offset: 0,
+        });
+        self.show_help = false;
+        self.show_skills = false;
+        self.model_picker = None;
+        self.session_picker = None;
+        self.goal_picker = None;
+        self.close_completion();
+        self.error = None;
+    }
+
+    fn move_branch_selection(&mut self, direction: KeyCode) -> Result<()> {
+        let Some(navigator) = self.branch_navigator.as_ref() else {
+            return Ok(());
+        };
+        let selected_id = navigator.nodes[navigator.selected].id;
+        let target = match direction {
+            KeyCode::Up => navigator.selected.checked_sub(1),
+            KeyCode::Down => {
+                (navigator.selected + 1 < navigator.nodes.len()).then_some(navigator.selected + 1)
+            }
+            KeyCode::Left => navigator.nodes[navigator.selected]
+                .parent_id
+                .and_then(|parent_id| navigator.nodes.iter().position(|node| node.id == parent_id)),
+            KeyCode::Right => navigator
+                .nodes
+                .iter()
+                .position(|node| node.parent_id == Some(selected_id)),
+            _ => None,
+        };
+        let Some(target) = target else {
+            return Ok(());
+        };
+        if let Some(navigator) = &mut self.branch_navigator {
+            navigator.selected = target;
+        }
+        self.preview_selected_branch()
+    }
+
+    fn preview_selected_branch(&mut self) -> Result<()> {
+        let Some(navigator) = self.branch_navigator.as_ref() else {
+            return Ok(());
+        };
+        let selected_id = navigator.nodes[navigator.selected].id;
+        let preview = self
+            .conversation
+            .snapshot()
+            .session
+            .preview_branch(selected_id)?;
+        let preview_path = preview.messages.active_node_ids().iter().copied().collect();
+        self.apply_branch_session(&preview);
+        if let Some(navigator) = &mut self.branch_navigator {
+            navigator.preview_path = preview_path;
+        }
+        self.pending_branch_node = Some(selected_id);
+        self.auto_scroll = false;
+        Ok(())
+    }
+
+    fn cancel_branch_navigator(&mut self) {
+        let snapshot = self.conversation.snapshot();
+        self.apply_branch_session(&snapshot.session);
+        if let Some(navigator) = self.branch_navigator.take() {
+            self.scroll = navigator.original_scroll;
+            self.auto_scroll = navigator.original_auto_scroll;
+        }
+        self.pending_branch_node = None;
+    }
+
+    async fn confirm_branch_selection(&mut self) -> Result<()> {
+        let Some(navigator) = self.branch_navigator.as_ref() else {
+            return Ok(());
+        };
+        let node_id = navigator.nodes[navigator.selected].id;
+        let snapshot = self.conversation.select_branch(node_id).await?;
+        self.apply_snapshot(snapshot);
+        self.branch_navigator = None;
+        self.pending_branch_node = Some(node_id);
+        self.auto_scroll = false;
+        self.error = None;
+        Ok(())
     }
 
     fn visible_goal(&self) -> Option<&Goal> {
@@ -2430,6 +2581,7 @@ impl App {
             "/model" | "/models" => self.open_model_picker(),
             "/skills" => self.open_skill_picker(),
             "/sessions" => self.open_session_picker().await?,
+            "/branches" => self.open_branch_navigator(),
             "/goals" => self.open_goal_picker(),
             "/clear" => {
                 let snapshot = self.conversation.clear().await?;
@@ -2444,6 +2596,17 @@ impl App {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Ok(());
+        }
+        if self.branch_navigator.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                    self.move_branch_selection(key.code)?
+                }
+                KeyCode::Enter => self.confirm_branch_selection().await?,
+                KeyCode::Esc => self.cancel_branch_navigator(),
+                _ => {}
+            }
             return Ok(());
         }
         if self.goal_picker.is_some() {
@@ -2797,7 +2960,18 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     .areas(area);
 
     render_header(frame, app, header);
-    render_chat(frame, app, body);
+    if app.branch_navigator.is_some() {
+        let panel_width = (body.width / 4).clamp(8, 22);
+        let [chat, branches] = Layout::horizontal([
+            Constraint::Min(body.width.saturating_sub(panel_width)),
+            Constraint::Length(panel_width),
+        ])
+        .areas(body);
+        render_chat(frame, app, chat);
+        render_branch_navigator(frame, app, branches);
+    } else {
+        render_chat(frame, app, body);
+    }
     render_queued_prompt(frame, app, queued);
     render_goal(frame, app, goal);
     render_composer(frame, app, composer);
@@ -3036,6 +3210,15 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .saturating_sub(anchor.viewport_row)
             .min(u16::MAX as usize) as u16;
     }
+    if let Some(node_id) = app.pending_branch_node.take()
+        && let Some(source_line) = source
+            .node_lines
+            .iter()
+            .find_map(|(id, line)| (*id == node_id).then_some(*line))
+        && let Some(node_row) = rows.iter().position(|row| row.source_line == source_line)
+    {
+        app.scroll = node_row.saturating_sub(2).min(u16::MAX as usize) as u16;
+    }
     app.max_scroll = rows
         .len()
         .saturating_sub(inner.height as usize)
@@ -3072,6 +3255,7 @@ fn conversation_source(app: &App) -> ConversationSource {
         lines: Vec::new(),
         copy_targets: Vec::new(),
         turn_toggles: Vec::new(),
+        node_lines: Vec::new(),
     };
     let mut message_index = 0;
     while message_index < app.transcript.len() {
@@ -3089,6 +3273,9 @@ fn conversation_source(app: &App) -> ConversationSource {
         }
 
         if let Some(content) = visible_message_content(message) {
+            if let Some(node_id) = app.transcript_node_ids.get(message_index).copied() {
+                source.node_lines.push((node_id, source.lines.len()));
+            }
             push_actor_label(&mut source, "USER", AQUA);
             push_message_lines(&mut source, content, true, None);
             source.lines.push(Line::default());
@@ -3135,6 +3322,131 @@ fn conversation_source(app: &App) -> ConversationSource {
         }));
     }
     source
+}
+
+fn branch_rows(nodes: &[ConversationGraphNode]) -> Vec<BranchRow> {
+    let ids = nodes.iter().map(|node| node.id).collect::<HashSet<_>>();
+    let mut children = HashMap::<Option<Uuid>, Vec<Uuid>>::new();
+    for node in nodes {
+        let parent = node.parent_id.filter(|parent| ids.contains(parent));
+        children.entry(parent).or_default().push(node.id);
+    }
+    fn visit(
+        id: Uuid,
+        depth: usize,
+        ancestor_continues: Vec<bool>,
+        is_last: bool,
+        children: &HashMap<Option<Uuid>, Vec<Uuid>>,
+        rows: &mut Vec<BranchRow>,
+    ) {
+        rows.push(BranchRow {
+            id,
+            depth,
+            ancestor_continues: ancestor_continues.clone(),
+            is_last,
+        });
+        let descendants = children.get(&Some(id)).map(Vec::as_slice).unwrap_or(&[]);
+        for (index, child) in descendants.iter().enumerate() {
+            let mut continues = ancestor_continues.clone();
+            if depth > 0 {
+                continues.push(!is_last);
+            }
+            visit(
+                *child,
+                depth + 1,
+                continues,
+                index + 1 == descendants.len(),
+                children,
+                rows,
+            );
+        }
+    }
+    let mut rows = Vec::new();
+    let roots = children.get(&None).map(Vec::as_slice).unwrap_or(&[]);
+    for (index, root) in roots.iter().enumerate() {
+        visit(
+            *root,
+            0,
+            Vec::new(),
+            index + 1 == roots.len(),
+            &children,
+            &mut rows,
+        );
+    }
+    rows
+}
+
+fn render_branch_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(navigator) = &mut app.branch_navigator else {
+        return;
+    };
+    if area.height < 3 {
+        return;
+    }
+    let body_height = area.height.saturating_sub(2) as usize;
+    let selected_row = navigator
+        .rows
+        .iter()
+        .position(|row| row.id == navigator.nodes[navigator.selected].id)
+        .unwrap_or(0);
+    if selected_row < navigator.offset {
+        navigator.offset = selected_row;
+    } else if selected_row >= navigator.offset.saturating_add(body_height) {
+        navigator.offset = selected_row.saturating_sub(body_height.saturating_sub(1));
+    }
+
+    let mut lines = Vec::with_capacity(area.height as usize);
+    lines.push(Line::from(Span::styled(
+        " branches",
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )));
+    for row in navigator
+        .rows
+        .iter()
+        .skip(navigator.offset)
+        .take(body_height)
+    {
+        let previewed = navigator.preview_path.contains(&row.id);
+        let original = navigator.original_path.contains(&row.id);
+        let color = if previewed {
+            CRAB
+        } else if original {
+            AQUA
+        } else {
+            MUTED
+        };
+        let mut prefix = String::new();
+        for continues in &row.ancestor_continues {
+            prefix.push_str(if *continues { "│ " } else { "  " });
+        }
+        if row.depth > 0 {
+            prefix.push_str(if previewed {
+                if row.is_last { "┗━" } else { "┣━" }
+            } else if row.is_last {
+                "└─"
+            } else {
+                "├─"
+            });
+        }
+        let selected = row.id == navigator.nodes[navigator.selected].id;
+        prefix.push(if selected { '◉' } else { '●' });
+        let mut style = Style::default().fg(color);
+        if previewed {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(Line::from(Span::styled(prefix, style)));
+    }
+    while lines.len() + 1 < area.height as usize {
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(Span::styled(
+        " arrows · ↵ · esc",
+        Style::default().fg(MUTED),
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn visible_message_content(message: &Message) -> Option<&str> {
@@ -3606,7 +3918,7 @@ fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rec
         .items
         .iter()
         .any(|item| matches!(item.kind, CompletionKind::File | CompletionKind::Directory));
-    let desired_rows = menu.items.len().min(12) as u16;
+    let desired_rows = menu.items.len().min(14) as u16;
     let height = (desired_rows + 2).min(body.height);
     if height < 3 {
         return;
@@ -3738,6 +4050,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
         )),
         Line::from("  /clear     clear conversation context"),
+        Line::from("  /branches  browse conversation branches"),
         Line::from("  /goal ...  start a persistent goal"),
         Line::from("  /goals     manage persistent goals"),
         Line::from("  /model     choose model, thinking, and speed"),
@@ -4507,7 +4820,6 @@ mod tests {
 
     fn test_app(root: &std::path::Path) -> App {
         let config = Config::test("auto", "http://127.0.0.1:1/v1");
-        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let store = SessionStore::new(root).unwrap();
         let session = store
             .create(
@@ -4518,6 +4830,11 @@ mod tests {
                     .clone(),
             )
             .unwrap();
+        test_app_with_session(root, config, session)
+    }
+
+    fn test_app_with_session(root: &std::path::Path, config: Config, session: Session) -> App {
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.to_path_buf());
         App::new(
             Agent::new(provider, tools, SkillRegistry::default(), session).unwrap(),
@@ -4528,6 +4845,44 @@ mod tests {
             test_registry(root),
         )
         .unwrap()
+    }
+
+    fn branching_test_app(root: &Path) -> (App, Uuid, Uuid) {
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let store = SessionStore::new(root).unwrap();
+        let mut session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
+        let root_node = session
+            .messages
+            .push(Message::text(Role::User, "root request"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "original answer"));
+        let original_leaf = session
+            .messages
+            .push(Message::text(Role::User, "original follow-up"));
+        session
+            .messages
+            .branch_from(
+                Some(root_node),
+                Message::text(Role::Assistant, "newer answer"),
+            )
+            .unwrap();
+        let newer_leaf = session
+            .messages
+            .push(Message::text(Role::User, "newer follow-up"));
+        (
+            test_app_with_session(root, config, session),
+            original_leaf,
+            newer_leaf,
+        )
     }
 
     fn render_text(width: u16, height: u16) -> String {
@@ -4543,6 +4898,75 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn branch_navigator_previews_nodes_and_escape_restores_the_original_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, original_leaf, newer_leaf) = branching_test_app(root.path());
+        assert!(app.transcript_node_ids.contains(&newer_leaf));
+
+        app.open_branch_navigator();
+        app.move_branch_selection(KeyCode::Up).unwrap();
+
+        assert!(app.transcript_node_ids.contains(&original_leaf));
+        assert!(!app.transcript_node_ids.contains(&newer_leaf));
+        assert_eq!(app.pending_branch_node, Some(original_leaf));
+
+        app.cancel_branch_navigator();
+
+        assert!(app.branch_navigator.is_none());
+        assert!(app.transcript_node_ids.contains(&newer_leaf));
+        assert!(!app.transcript_node_ids.contains(&original_leaf));
+    }
+
+    #[tokio::test]
+    async fn branch_navigator_enter_persists_the_previewed_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, original_leaf, newer_leaf) = branching_test_app(root.path());
+        app.open_branch_navigator();
+        app.move_branch_selection(KeyCode::Up).unwrap();
+
+        app.confirm_branch_selection().await.unwrap();
+
+        assert!(app.branch_navigator.is_none());
+        assert!(app.transcript_node_ids.contains(&original_leaf));
+        assert!(!app.transcript_node_ids.contains(&newer_leaf));
+        assert!(
+            app.conversation
+                .snapshot()
+                .session
+                .messages
+                .active_node_ids()
+                .contains(&original_leaf)
+        );
+    }
+
+    #[test]
+    fn branch_navigator_renders_beside_the_transcript_at_wide_and_compact_widths() {
+        for width in [100, 36] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, _, _) = branching_test_app(root.path());
+            app.open_branch_navigator();
+            let backend = TestBackend::new(width, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("branches"), "missing branch panel at {width}");
+            assert!(text.contains('◉'), "missing selected node at {width}");
+            assert!(
+                text.contains("newer follow-up"),
+                "missing transcript beside branch panel at {width}"
+            );
+        }
     }
 
     #[test]

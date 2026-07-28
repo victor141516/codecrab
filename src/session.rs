@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     config::{SessionRegistry, normalized_root, paths_equal},
     events::AgentActivity,
-    provider::{Message, TokenUsage},
+    provider::{Message, Role, TokenUsage},
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -22,6 +22,12 @@ pub(crate) struct ConversationNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
     pub message: Message,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ConversationGraphNode {
+    pub id: Uuid,
+    pub parent_id: Option<Uuid>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -90,6 +96,34 @@ impl ConversationTree {
         self.active_node_ids.get(message_index).copied()
     }
 
+    pub(crate) fn visible_user_nodes(&self) -> Vec<ConversationGraphNode> {
+        let visible = self
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.message.role, Role::User) && !node.message.hidden)
+            .map(|node| node.id)
+            .collect::<HashSet<_>>();
+        let parents = self
+            .nodes
+            .iter()
+            .map(|node| (node.id, node.parent_id))
+            .collect::<HashMap<_, _>>();
+        self.nodes
+            .iter()
+            .filter(|node| visible.contains(&node.id))
+            .map(|node| {
+                let mut parent_id = node.parent_id;
+                while parent_id.is_some_and(|id| !visible.contains(&id)) {
+                    parent_id = parent_id.and_then(|id| parents.get(&id)).copied().flatten();
+                }
+                ConversationGraphNode {
+                    id: node.id,
+                    parent_id,
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn push(&mut self, message: Message) -> Uuid {
         self.branch_from(self.active_leaf_id, message)
             .expect("the active conversation leaf must exist")
@@ -144,6 +178,23 @@ impl ConversationTree {
             current = parents.get(&id).copied().flatten();
         }
         false
+    }
+
+    fn select_from_node(&mut self, id: Uuid) -> Result<Uuid> {
+        if !self.nodes.iter().any(|node| node.id == id) {
+            anyhow::bail!("conversation node {id} does not exist");
+        }
+        let mut leaf_id = id;
+        while let Some(child) = self
+            .nodes
+            .iter()
+            .find(|node| node.parent_id == Some(leaf_id))
+        {
+            leaf_id = child.id;
+        }
+        self.active_leaf_id = Some(leaf_id);
+        self.rebuild_active_path().map_err(anyhow::Error::msg)?;
+        Ok(leaf_id)
     }
 
     fn rebuild_active_path(&mut self) -> std::result::Result<(), String> {
@@ -504,6 +555,19 @@ impl Session {
         true
     }
 
+    pub(crate) fn preview_branch(&self, node_id: Uuid) -> Result<Self> {
+        let mut preview = self.clone();
+        preview.select_branch(node_id)?;
+        Ok(preview)
+    }
+
+    pub(crate) fn select_branch(&mut self, node_id: Uuid) -> Result<Uuid> {
+        let leaf_id = self.messages.select_from_node(node_id)?;
+        self.refresh_active_indexes();
+        self.updated_at = Utc::now();
+        Ok(leaf_id)
+    }
+
     pub(crate) fn latest_compaction(&self) -> Option<&CompactionCheckpoint> {
         let active_leaf_id = self.messages.active_leaf_id();
         self.compaction_checkpoints.iter().rev().find(|checkpoint| {
@@ -768,6 +832,71 @@ mod tests {
                 .and_then(|node| node.message.content.as_deref()),
             Some("original leaf")
         );
+    }
+
+    #[test]
+    fn selecting_an_intermediate_node_follows_its_oldest_descendant_to_a_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let root = session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "root"));
+        let original_answer = session.messages.push(Message::text(
+            crate::provider::Role::Assistant,
+            "original answer",
+        ));
+        let original_leaf = session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "original follow-up",
+        ));
+        session
+            .messages
+            .branch_from(
+                Some(root),
+                Message::text(crate::provider::Role::Assistant, "newer answer"),
+            )
+            .unwrap();
+        session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "newer follow-up",
+        ));
+
+        let selected_leaf = session.select_branch(root).unwrap();
+
+        assert_eq!(selected_leaf, original_leaf);
+        assert_eq!(
+            session.messages.active_node_ids(),
+            &[root, original_answer, original_leaf]
+        );
+        assert_eq!(
+            session.messages[2].content.as_deref(),
+            Some("original follow-up")
+        );
+    }
+
+    #[test]
+    fn visible_conversation_graph_connects_user_turns_across_agent_messages() {
+        let mut tree = ConversationTree::default();
+        let root = tree.push(Message::text(crate::provider::Role::User, "root"));
+        let answer = tree.push(Message::text(crate::provider::Role::Assistant, "answer"));
+        let follow_up = tree.push(Message::text(crate::provider::Role::User, "follow up"));
+        let alternate = tree
+            .branch_from(
+                Some(answer),
+                Message::text(crate::provider::Role::User, "alternate follow up"),
+            )
+            .unwrap();
+
+        let graph = tree.visible_user_nodes();
+
+        assert_eq!(graph.len(), 3);
+        assert_eq!(graph[0].id, root);
+        assert_eq!(graph[0].parent_id, None);
+        assert_eq!(graph[1].id, follow_up);
+        assert_eq!(graph[1].parent_id, Some(root));
+        assert_eq!(graph[2].id, alternate);
+        assert_eq!(graph[2].parent_id, Some(root));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("models", "Alias for /model"),
     ("skills", "Open the interactive skill picker"),
     ("sessions", "Browse, resume, or delete saved sessions"),
+    ("branches", "Browse conversation branches"),
     ("providers", "List configured provider profiles"),
     ("provider", "Add, select, or remove a provider profile"),
     ("goal", "Start a persistent goal"),

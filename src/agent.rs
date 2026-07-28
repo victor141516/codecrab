@@ -225,6 +225,10 @@ impl Agent {
         self.session.delete_goal(id)
     }
 
+    pub(crate) fn select_branch(&mut self, node_id: Uuid) -> Result<Uuid> {
+        self.session.select_branch(node_id)
+    }
+
     async fn turn_inner(
         &mut self,
         prompt: &str,

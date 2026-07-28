@@ -94,6 +94,10 @@ enum ConversationCommand {
     Clear {
         reply: oneshot::Sender<Result<ConversationSnapshot>>,
     },
+    SelectBranch {
+        node_id: Uuid,
+        reply: oneshot::Sender<Result<ConversationSnapshot>>,
+    },
     CreateGoal {
         objective: String,
         reply: oneshot::Sender<Result<ConversationSnapshot>>,
@@ -257,6 +261,23 @@ impl ConversationHandle {
         let (reply, response) = oneshot::channel();
         self.send(ConversationCommand::Clear { reply })?;
         receive(response, "clearing the conversation").await?
+    }
+
+    pub(crate) async fn select_branch(&self, node_id: Uuid) -> Result<ConversationSnapshot> {
+        let response = {
+            let _gate = self
+                .command_gate
+                .lock()
+                .expect("conversation command gate poisoned");
+            self.ensure_accepting_commands()?;
+            if self.is_running() {
+                anyhow::bail!("wait for the active turn before selecting a conversation branch");
+            }
+            let (reply, response) = oneshot::channel();
+            self.send_unchecked(ConversationCommand::SelectBranch { node_id, reply })?;
+            response
+        };
+        receive(response, "selecting the conversation branch").await?
     }
 
     pub(crate) async fn create_goal(&self, objective: String) -> Result<ConversationSnapshot> {
@@ -453,6 +474,16 @@ async fn run_worker(
             ConversationCommand::Clear { reply } => {
                 agent.clear();
                 reply_snapshot(&agent, &registry, &snapshots, reply);
+                false
+            }
+            ConversationCommand::SelectBranch { node_id, reply } => {
+                let result = agent
+                    .select_branch(node_id)
+                    .and_then(|_| persist(&agent, &registry).map(|_| snapshot(&agent)));
+                if let Ok(current) = &result {
+                    let _ = snapshots.send(current.clone());
+                }
+                let _ = reply.send(result);
                 false
             }
             ConversationCommand::CreateGoal { objective, reply } => {
