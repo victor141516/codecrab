@@ -369,6 +369,17 @@ cargo run -- serve --port 0
 build the frontend. Use `npm --prefix web run build` directly when changing
 only frontend code and needing faster feedback.
 
+## Releases
+
+- Keep the package version synchronized in `Cargo.toml`, `Cargo.lock`,
+  `web/package.json`, and `web/package-lock.json`.
+- A release is created by pushing an annotated Git tag named `vX.Y.Z` whose
+  version matches the package version. The lowercase `v` is required by
+  `.github/workflows/release.yml`.
+- Pushing the tag starts GitHub Actions, which creates a draft release, builds
+  and uploads the platform binaries, and publishes the release after all
+  required x64 assets are present.
+
 The live provider catalog test is ignored because it requires network access
 and an interactive ChatGPT OAuth login. Do not make normal test runs depend on
 real credentials, network access, or a user's saved sessions.

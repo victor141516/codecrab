@@ -181,6 +181,31 @@ export class VirtualTimelineModel {
     );
   }
 
+  scrollTopToRevealIndex(
+    index,
+    scrollTop,
+    viewportHeight,
+    margin = 0
+  ) {
+    if (!this.keys.length) return 0;
+    const safeIndex = clamp(index, 0, this.keys.length - 1);
+    const height = Math.max(1, viewportHeight);
+    const inset = clamp(margin, 0, height / 2);
+    const maximum = Math.max(0, this.totalHeight() - height);
+    const current = clamp(scrollTop, 0, maximum);
+    const itemStart = this.offsetForIndex(safeIndex);
+    const itemEnd = this.offsetForIndex(safeIndex + 1);
+    const available = Math.max(1, height - inset * 2);
+
+    if (itemEnd - itemStart > available || itemStart < current + inset) {
+      return clamp(itemStart - inset, 0, maximum);
+    }
+    if (itemEnd > current + height - inset) {
+      return clamp(itemEnd - height + inset, 0, maximum);
+    }
+    return current;
+  }
+
   offsetForIndex(index) {
     return this.tree.sum(clamp(index, 0, this.keys.length));
   }

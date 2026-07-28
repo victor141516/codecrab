@@ -225,8 +225,8 @@ struct BranchNavigator {
 struct BranchRow {
     id: Uuid,
     depth: usize,
-    ancestor_continues: Vec<bool>,
-    is_last: bool,
+    ancestor_continuations: Vec<Vec<Uuid>>,
+    following_siblings: Vec<Uuid>,
 }
 
 struct MessageEdit {
@@ -1521,11 +1521,20 @@ impl App {
             return Ok(());
         };
         let selected_id = navigator.nodes[navigator.selected].id;
+        let selected_row = navigator
+            .rows
+            .iter()
+            .position(|row| row.id == selected_id)
+            .unwrap_or(0);
         let target = match direction {
-            KeyCode::Up => navigator.selected.checked_sub(1),
-            KeyCode::Down => {
-                (navigator.selected + 1 < navigator.nodes.len()).then_some(navigator.selected + 1)
-            }
+            KeyCode::Up => selected_row
+                .checked_sub(1)
+                .and_then(|row| navigator.rows.get(row))
+                .and_then(|row| navigator.nodes.iter().position(|node| node.id == row.id)),
+            KeyCode::Down => navigator
+                .rows
+                .get(selected_row + 1)
+                .and_then(|row| navigator.nodes.iter().position(|node| node.id == row.id)),
             KeyCode::Left => navigator.nodes[navigator.selected]
                 .parent_id
                 .and_then(|parent_id| navigator.nodes.iter().position(|node| node.id == parent_id)),
@@ -3428,28 +3437,28 @@ fn branch_rows(nodes: &[ConversationGraphNode]) -> Vec<BranchRow> {
     fn visit(
         id: Uuid,
         depth: usize,
-        ancestor_continues: Vec<bool>,
-        is_last: bool,
+        ancestor_continuations: Vec<Vec<Uuid>>,
+        following_siblings: Vec<Uuid>,
         children: &HashMap<Option<Uuid>, Vec<Uuid>>,
         rows: &mut Vec<BranchRow>,
     ) {
         rows.push(BranchRow {
             id,
             depth,
-            ancestor_continues: ancestor_continues.clone(),
-            is_last,
+            ancestor_continuations: ancestor_continuations.clone(),
+            following_siblings: following_siblings.clone(),
         });
         let descendants = children.get(&Some(id)).map(Vec::as_slice).unwrap_or(&[]);
         for (index, child) in descendants.iter().enumerate() {
-            let mut continues = ancestor_continues.clone();
+            let mut continuations = ancestor_continuations.clone();
             if depth > 0 {
-                continues.push(!is_last);
+                continuations.push(following_siblings.clone());
             }
             visit(
                 *child,
                 depth + 1,
-                continues,
-                index + 1 == descendants.len(),
+                continuations,
+                descendants[index + 1..].to_vec(),
                 children,
                 rows,
             );
@@ -3462,12 +3471,83 @@ fn branch_rows(nodes: &[ConversationGraphNode]) -> Vec<BranchRow> {
             *root,
             0,
             Vec::new(),
-            index + 1 == roots.len(),
+            roots[index + 1..].to_vec(),
             &children,
             &mut rows,
         );
     }
     rows
+}
+
+fn branch_segment_style(previewed: bool, original: bool, selected: bool) -> Style {
+    let mut style = Style::default().fg(if previewed {
+        CRAB
+    } else if original {
+        AQUA
+    } else {
+        MUTED
+    });
+    if previewed {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+fn branch_row_line(
+    row: &BranchRow,
+    selected_id: Uuid,
+    preview_path: &HashSet<Uuid>,
+    original_path: &HashSet<Uuid>,
+) -> Line<'static> {
+    let selected = row.id == selected_id;
+    let row_previewed = preview_path.contains(&row.id);
+    let row_original = original_path.contains(&row.id);
+    let row_style = branch_segment_style(row_previewed, row_original, selected);
+    let mut spans = Vec::new();
+    for targets in &row.ancestor_continuations {
+        if !targets.is_empty() {
+            let previewed = targets.iter().any(|id| preview_path.contains(id));
+            let original = targets.iter().any(|id| original_path.contains(id));
+            spans.push(Span::styled(
+                if previewed { "┃ " } else { "│ " },
+                branch_segment_style(previewed, original, selected),
+            ));
+        } else {
+            spans.push(Span::styled("  ", row_style));
+        }
+    }
+    if row.depth > 0 {
+        let following_previewed = row
+            .following_siblings
+            .iter()
+            .any(|id| preview_path.contains(id));
+        let following_original = row
+            .following_siblings
+            .iter()
+            .any(|id| original_path.contains(id));
+        let junction_previewed = row_previewed || following_previewed;
+        let junction_original = row_original || following_original;
+        let junction = if row.following_siblings.is_empty() {
+            if row_previewed { "┗" } else { "└" }
+        } else if junction_previewed {
+            "┣"
+        } else {
+            "├"
+        };
+        spans.push(Span::styled(
+            junction,
+            branch_segment_style(junction_previewed, junction_original, selected),
+        ));
+        spans.push(Span::styled(
+            if row_previewed { "━" } else { "─" },
+            row_style,
+        ));
+    }
+    spans.push(Span::styled(if selected { "◉" } else { "●" }, row_style));
+    Line::from(spans)
 }
 
 fn render_branch_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -3500,38 +3580,12 @@ fn render_branch_navigator(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .skip(navigator.offset)
         .take(body_height)
     {
-        let previewed = navigator.preview_path.contains(&row.id);
-        let original = navigator.original_path.contains(&row.id);
-        let color = if previewed {
-            CRAB
-        } else if original {
-            AQUA
-        } else {
-            MUTED
-        };
-        let mut prefix = String::new();
-        for continues in &row.ancestor_continues {
-            prefix.push_str(if *continues { "│ " } else { "  " });
-        }
-        if row.depth > 0 {
-            prefix.push_str(if previewed {
-                if row.is_last { "┗━" } else { "┣━" }
-            } else if row.is_last {
-                "└─"
-            } else {
-                "├─"
-            });
-        }
-        let selected = row.id == navigator.nodes[navigator.selected].id;
-        prefix.push(if selected { '◉' } else { '●' });
-        let mut style = Style::default().fg(color);
-        if previewed {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if selected {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        lines.push(Line::from(Span::styled(prefix, style)));
+        lines.push(branch_row_line(
+            row,
+            navigator.nodes[navigator.selected].id,
+            &navigator.preview_path,
+            &navigator.original_path,
+        ));
     }
     while lines.len() + 1 < area.height as usize {
         lines.push(Line::default());
@@ -4981,6 +5035,61 @@ mod tests {
         )
     }
 
+    fn interleaved_branching_test_app(root: &Path) -> (App, Uuid, Uuid, Uuid) {
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let store = SessionStore::new(root).unwrap();
+        let mut session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
+        session
+            .messages
+            .push(Message::text(Role::User, "root request"));
+        let root_answer = session
+            .messages
+            .push(Message::text(Role::Assistant, "root answer"));
+        session
+            .messages
+            .push(Message::text(Role::User, "first branch"));
+        let first_answer = session
+            .messages
+            .push(Message::text(Role::Assistant, "first answer"));
+        session
+            .messages
+            .push(Message::text(Role::User, "deep branch"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "deep answer"));
+        let deep_child = session
+            .messages
+            .push(Message::text(Role::User, "deep child"));
+        let second_branch = session
+            .messages
+            .branch_from(
+                Some(root_answer),
+                Message::text(Role::User, "second branch"),
+            )
+            .unwrap();
+        let later_first_branch = session
+            .messages
+            .branch_from(
+                Some(first_answer),
+                Message::text(Role::User, "later first branch"),
+            )
+            .unwrap();
+        (
+            test_app_with_session(root, config, session),
+            deep_child,
+            later_first_branch,
+            second_branch,
+        )
+    }
+
     fn render_text(width: u16, height: u16) -> String {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
@@ -5014,6 +5123,115 @@ mod tests {
         assert!(app.branch_navigator.is_none());
         assert!(app.transcript_node_ids.contains(&newer_leaf));
         assert!(!app.transcript_node_ids.contains(&original_leaf));
+    }
+
+    #[test]
+    fn branch_navigator_vertical_movement_follows_the_rendered_row_order() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, deep_child, later_first_branch, second_branch) =
+            interleaved_branching_test_app(root.path());
+        app.open_branch_navigator();
+        let navigator = app.branch_navigator.as_ref().unwrap();
+        assert_eq!(navigator.nodes[navigator.selected].id, later_first_branch);
+
+        app.move_branch_selection(KeyCode::Up).unwrap();
+        assert_eq!(app.pending_branch_node, Some(deep_child));
+
+        app.move_branch_selection(KeyCode::Down).unwrap();
+        assert_eq!(app.pending_branch_node, Some(later_first_branch));
+
+        app.move_branch_selection(KeyCode::Down).unwrap();
+        assert_eq!(app.pending_branch_node, Some(second_branch));
+    }
+
+    #[test]
+    fn branch_navigator_colors_continuing_preview_edges_coral_across_other_subtrees() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, deep_child, later_first_branch, _) =
+            interleaved_branching_test_app(root.path());
+        app.open_branch_navigator();
+        let navigator = app.branch_navigator.as_ref().unwrap();
+        let deep_row = navigator
+            .rows
+            .iter()
+            .find(|row| row.id == deep_child)
+            .unwrap();
+        let line = branch_row_line(
+            deep_row,
+            later_first_branch,
+            &navigator.preview_path,
+            &navigator.original_path,
+        );
+
+        assert_eq!(line.spans[1].content.as_ref(), "┃ ");
+        assert_eq!(line.spans[1].style.fg, Some(CRAB));
+    }
+
+    #[test]
+    fn branch_navigator_keeps_selected_third_sibling_trunk_coral_through_earlier_subtrees() {
+        let root = Uuid::from_u128(1);
+        let branch_parent = Uuid::from_u128(2);
+        let first_sibling = Uuid::from_u128(3);
+        let first_descendant = Uuid::from_u128(4);
+        let middle_sibling = Uuid::from_u128(5);
+        let middle_descendant = Uuid::from_u128(6);
+        let selected_sibling = Uuid::from_u128(7);
+        let nodes = vec![
+            ConversationGraphNode {
+                id: root,
+                parent_id: None,
+            },
+            ConversationGraphNode {
+                id: branch_parent,
+                parent_id: Some(root),
+            },
+            ConversationGraphNode {
+                id: first_sibling,
+                parent_id: Some(branch_parent),
+            },
+            ConversationGraphNode {
+                id: first_descendant,
+                parent_id: Some(first_sibling),
+            },
+            ConversationGraphNode {
+                id: middle_sibling,
+                parent_id: Some(branch_parent),
+            },
+            ConversationGraphNode {
+                id: middle_descendant,
+                parent_id: Some(middle_sibling),
+            },
+            ConversationGraphNode {
+                id: selected_sibling,
+                parent_id: Some(branch_parent),
+            },
+        ];
+        let rows = branch_rows(&nodes);
+        let preview_path = HashSet::from([root, branch_parent, selected_sibling]);
+        let original_path = HashSet::new();
+
+        let expected_coral_segments = [
+            (first_sibling, 1, "┣"),
+            (first_descendant, 1, "┃ "),
+            (middle_sibling, 1, "┣"),
+            (middle_descendant, 1, "┃ "),
+        ];
+        for (row_id, span_index, expected_symbol) in expected_coral_segments {
+            let row = rows.iter().find(|row| row.id == row_id).unwrap();
+            let line = branch_row_line(row, selected_sibling, &preview_path, &original_path);
+            assert_eq!(line.spans[span_index].content.as_ref(), expected_symbol);
+            assert_eq!(line.spans[span_index].style.fg, Some(CRAB));
+        }
+
+        let first_sibling_row = rows.iter().find(|row| row.id == first_sibling).unwrap();
+        let first_sibling_line = branch_row_line(
+            first_sibling_row,
+            selected_sibling,
+            &preview_path,
+            &original_path,
+        );
+        assert_eq!(first_sibling_line.spans[2].content.as_ref(), "─");
+        assert_eq!(first_sibling_line.spans[2].style.fg, Some(MUTED));
     }
 
     #[test]

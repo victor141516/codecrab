@@ -94,8 +94,8 @@ matrix finishes and the required x64 binaries are present. The tag should match
 the package version, for example:
 
 ```console
-git tag -a v1.1.0 -m "CodeCrab v1.1.0"
-git push origin v1.1.0
+git tag -a v1.2.0 -m "CodeCrab v1.2.0"
+git push origin v1.2.0
 ```
 
 Sign in with the OpenAI account that owns your ChatGPT subscription:
@@ -351,17 +351,25 @@ reasoning or speed options.
 `/branches` opens the conversation tree only when requested. Each visible user
 message is a node; selecting any node previews the complete path through the
 oldest descendant leaf and keeps that message in view. In the terminal, arrows
-move between nodes, `E` loads the selected user message into the composer,
-`Enter` keeps the preview, and `Esc` restores the original branch and scroll
-position. The web panel uses the same branch-selection semantics with clickable
-nodes, a check action, and a cancel action. Each web user message also has a
-pencil action that opens an inline editor. Submitting an edit creates and
-activates a new sibling node, runs the agent from the edited prompt, and keeps
-the original message plus its complete continuation available in the tree. The
+move between nodes in their rendered tree order, `E` loads the selected user
+message into the composer, `Enter` keeps the preview, and `Esc` restores the
+original branch and scroll position. Active terminal edges stay coral across
+intervening sibling subtrees instead of inheriting the color of those rows. The
+web panel uses the same branch-selection semantics with clickable nodes, a
+check action, and a cancel action. Each web user message also has a
+pencil action that opens an inline editor, including while the branch panel is
+open on a previewed route. The panel remains visible during editing, but its
+navigation is paused until the edit is saved or cancelled. Submitting an edit
+creates and activates a new sibling node, runs the agent from the edited
+prompt, keeps the original message plus its complete continuation available in
+the tree, and rebases the still-open panel onto the resulting branch. The
 previewed route is coral, while the route that was active when the panel opened
-remains cyan where it diverges. The normal composer is disabled during preview
-or inline editing so a prompt cannot be sent to a branch other than the one
-currently shown.
+remains cyan where it diverges. Hovering a web tree node highlights its message
+on the displayed route and reveals it through the virtual timeline even when
+the row is not currently mounted; keyboard focus has the same behavior. Hover
+and focus never change branches; clicking a node does. The normal composer is
+disabled during preview or inline editing so a prompt cannot be sent to a
+branch other than the one currently shown.
 
 New conversations default to GPT-5.6 Sol with `high` reasoning and Fast speed.
 CodeCrab resolves the reasoning and Fast service-tier identifiers from the live

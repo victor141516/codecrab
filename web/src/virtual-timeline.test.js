@@ -29,6 +29,16 @@ test("dynamic height correction preserves a stable key and intra-row anchor", ()
   assert.equal(model.totalHeight(), 520);
 });
 
+test("revealing an unmounted row scrolls only when it is outside the viewport", () => {
+  const model = new VirtualTimelineModel();
+  model.setItems(createVirtualTimelineFixture(10, 100));
+
+  assert.equal(model.scrollTopToRevealIndex(3, 200, 300), 200);
+  assert.equal(model.scrollTopToRevealIndex(1, 200, 300), 100);
+  assert.equal(model.scrollTopToRevealIndex(6, 200, 300), 400);
+  assert.equal(model.scrollTopToRevealIndex(9, 200, 300), 700);
+});
+
 test("overscan clamps naturally at the beginning and end", () => {
   const model = new VirtualTimelineModel();
   model.setItems(createVirtualTimelineFixture(20, 50));

@@ -67,6 +67,14 @@ export function routeContainsEdge(route, edge) {
   return route.has(edge.parent.id) && route.has(edge.child.id);
 }
 
+export function latestActiveBranchNodeId(nodes, activeNodeIds) {
+  const active = new Set(activeNodeIds ?? []);
+  return (
+    [...(nodes ?? [])].reverse().find((node) => active.has(node.id))?.id ??
+    null
+  );
+}
+
 export function projectEditedSession(session, nodeId, content, createdAt) {
   const messageIndex = session?.active_message_ids?.indexOf(nodeId) ?? -1;
   if (!session || messageIndex < 0) return null;

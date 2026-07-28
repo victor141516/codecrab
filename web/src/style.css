@@ -74,6 +74,15 @@ button:disabled {
   gap: 0.875rem;
   padding: 1.125rem 0;
   border-bottom: 1px solid rgb(255 255 255 / 0.035);
+  border-radius: 0.5rem;
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.branch-message-highlight {
+  background: rgb(244 99 86 / 0.07);
+  box-shadow: inset 3px 0 rgb(244 99 86 / 0.75);
 }
 
 .conversation-viewport {

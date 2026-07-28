@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   branchEdgePath,
+  latestActiveBranchNodeId,
   layoutBranchGraph,
   projectEditedSession,
   routeContainsEdge
@@ -46,6 +47,28 @@ test("route styling only includes edges fully contained in the route", () => {
 
   assert.equal(routeContainsEdge(route, graph.edges[0]), false);
   assert.equal(routeContainsEdge(route, graph.edges[1]), true);
+});
+
+test("the deepest active user node is recovered after an edited branch completes", () => {
+  const nodes = [
+    { id: "root", parent_id: null },
+    { id: "old-branch", parent_id: "root" },
+    { id: "edited-branch", parent_id: "root" },
+    { id: "edited-follow-up", parent_id: "edited-branch" }
+  ];
+
+  assert.equal(
+    latestActiveBranchNodeId(nodes, [
+      "root",
+      "assistant-1",
+      "edited-branch",
+      "assistant-2",
+      "edited-follow-up",
+      "assistant-3"
+    ]),
+    "edited-follow-up"
+  );
+  assert.equal(latestActiveBranchNodeId(nodes, []), null);
 });
 
 test("editing projects only the prefix and temporary edited message", () => {

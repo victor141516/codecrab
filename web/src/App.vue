@@ -51,6 +51,7 @@ import {
 } from "./virtual-timeline.js";
 import {
   branchEdgePath,
+  latestActiveBranchNodeId,
   layoutBranchGraph,
   projectEditedSession,
   routeContainsEdge
@@ -84,6 +85,7 @@ const goalDraft = ref("");
 const editingGoalResume = ref(false);
 const branchesOpen = ref(false);
 const selectedBranchNode = ref(null);
+const hoveredBranchNode = ref(null);
 const branchSelecting = ref(false);
 const branchOriginalPath = ref(new Set());
 const editingMessageNode = ref(null);
@@ -109,6 +111,7 @@ let timelineResizeObserver = null;
 let conversationResizeObserver = null;
 let conversationWidth = 0;
 let virtualActivation = 0;
+let branchHoverRequest = 0;
 let mediaRecorder = null;
 let microphoneStream = null;
 let recordingChunks = [];
@@ -734,6 +737,8 @@ function workerLifecycle(id) {
 function resetBranchNavigator() {
   branchesOpen.value = false;
   selectedBranchNode.value = null;
+  hoveredBranchNode.value = null;
+  branchHoverRequest += 1;
   branchSelecting.value = false;
   branchOriginalPath.value = new Set();
   branchOriginalState = null;
@@ -758,17 +763,17 @@ function openBranchNavigator() {
   );
   branchOriginalScrollTop = conversation.value?.scrollTop ?? 0;
   branchOriginalAutoScroll = autoScroll.value;
-  selectedBranchNode.value =
-    [...branchNodes.value]
-      .reverse()
-      .find((node) => activeBranchPath.value.has(node.id))?.id ?? null;
+  selectedBranchNode.value = latestActiveBranchNodeId(
+    branchNodes.value,
+    session.value?.active_message_ids
+  );
   branchesOpen.value = true;
   closeAutocomplete();
   error.value = "";
 }
 
 async function cancelBranchNavigator() {
-  if (branchSelecting.value) return;
+  if (branchSelecting.value || sending.value) return;
   const original = branchOriginalState;
   const scrollTop = branchOriginalScrollTop;
   const followBottom = branchOriginalAutoScroll;
@@ -783,7 +788,14 @@ async function cancelBranchNavigator() {
 }
 
 async function previewBranch(nodeId) {
-  if (branchSelecting.value || !session.value?.id) return;
+  if (
+    branchSelecting.value ||
+    editingMessageNode.value ||
+    sending.value ||
+    !session.value?.id
+  ) {
+    return;
+  }
   branchSelecting.value = true;
   error.value = "";
   try {
@@ -796,6 +808,8 @@ async function previewBranch(nodeId) {
     });
     applyServerState(nextState);
     selectedBranchNode.value = nodeId;
+    hoveredBranchNode.value = nodeId;
+    branchHoverRequest += 1;
     await scrollToBranchMessage(nodeId);
   } catch (cause) {
     error.value = cause.message;
@@ -806,7 +820,15 @@ async function previewBranch(nodeId) {
 
 async function confirmBranchSelection() {
   const nodeId = selectedBranchNode.value;
-  if (!nodeId || branchSelecting.value || !session.value?.id) return;
+  if (
+    !nodeId ||
+    branchSelecting.value ||
+    editingMessageNode.value ||
+    sending.value ||
+    !session.value?.id
+  ) {
+    return;
+  }
   branchSelecting.value = true;
   error.value = "";
   try {
@@ -845,10 +867,41 @@ function branchNodeClasses(node) {
   };
 }
 
+async function hoverBranchNode(nodeId) {
+  hoveredBranchNode.value = nodeId;
+  const request = ++branchHoverRequest;
+  await scrollToBranchMessage(nodeId, {
+    revealOnly: true,
+    current: () =>
+      request === branchHoverRequest &&
+      hoveredBranchNode.value === nodeId
+  });
+}
+
+function leaveBranchNode(nodeId) {
+  if (hoveredBranchNode.value !== nodeId) return;
+  hoveredBranchNode.value = null;
+  branchHoverRequest += 1;
+}
+
+function rebaseBranchNavigator() {
+  if (!branchesOpen.value) return;
+  branchOriginalState = state.value;
+  branchOriginalPath.value = new Set(
+    session.value?.active_message_ids ?? []
+  );
+  branchOriginalScrollTop = conversation.value?.scrollTop ?? 0;
+  branchOriginalAutoScroll = autoScroll.value;
+  selectedBranchNode.value = latestActiveBranchNodeId(
+    branchNodes.value,
+    session.value?.active_message_ids
+  );
+}
+
 async function beginMessageEdit(item) {
   if (
     sending.value ||
-    branchesOpen.value ||
+    branchSelecting.value ||
     !item.nodeId ||
     editingMessageNode.value
   ) {
@@ -893,8 +946,13 @@ async function saveMessageEdit() {
     error.value = "The message is no longer on the visible branch.";
     return;
   }
+  const keepBranchesOpen = branchesOpen.value;
   cancelMessageEdit();
   await runPrompt(prompt, { editNodeId: nodeId });
+  if (keepBranchesOpen && branchesOpen.value) {
+    await nextTick();
+    rebaseBranchNavigator();
+  }
 }
 
 function handleMessageEditorKey(event) {
@@ -1638,9 +1696,11 @@ function handleGlobalKeydown(event) {
     return;
   }
   if (branchesOpen.value) {
-    event.preventDefault();
-    void cancelBranchNavigator();
-    return;
+    if (!sending.value) {
+      event.preventDefault();
+      void cancelBranchNavigator();
+      return;
+    }
   }
   if (editingGoal.value) {
     event.preventDefault();
@@ -2037,9 +2097,13 @@ async function scrollToBottom() {
   }
 }
 
-async function scrollToBranchMessage(nodeId) {
+async function scrollToBranchMessage(
+  nodeId,
+  { revealOnly = false, current = () => true } = {}
+) {
   await nextTick();
   await nextTick();
+  if (!current()) return false;
   const item = timeline.value.find(
     (candidate) =>
       candidate.type === "message" && candidate.nodeId === nodeId
@@ -2047,12 +2111,24 @@ async function scrollToBranchMessage(nodeId) {
   const model = virtualTimelineStore.active();
   const element = conversation.value;
   const index = item ? model?.indexByKey.get(item.key) : null;
-  if (!item || !model || !element || index == null) return;
+  if (!item || !model || !element || index == null || !current()) {
+    return false;
+  }
+  const contentScrollTop = conversationContentScrollTop(element);
+  const nextContentScrollTop = revealOnly
+    ? model.scrollTopToRevealIndex(
+        index,
+        contentScrollTop,
+        element.clientHeight,
+        16
+      )
+    : Math.max(0, model.offsetForIndex(index) - 16);
+  if (Math.abs(nextContentScrollTop - contentScrollTop) < 1) return true;
   autoScroll.value = false;
   element.scrollTop =
-    TIMELINE_VERTICAL_PADDING +
-    Math.max(0, model.offsetForIndex(index) - 16);
+    TIMELINE_VERTICAL_PADDING + nextContentScrollTop;
   updateVirtualWindow();
+  return true;
 }
 
 function ensureTimelineResizeObserver() {
@@ -2710,7 +2786,14 @@ onBeforeUnmount(() => {
             :ref="(element) => bindTimelineRow(item.key, element)"
             data-timeline-row
           >
-            <article v-if="item.type === 'message'" class="message-row group">
+            <article
+              v-if="item.type === 'message'"
+              class="message-row group"
+              :class="{
+                'branch-message-highlight':
+                  hoveredBranchNode === item.nodeId
+              }"
+            >
               <div
                 class="grid size-6 shrink-0 place-items-center rounded-md bg-white/7 text-[10px] font-bold text-zinc-300"
               >
@@ -2759,7 +2842,7 @@ onBeforeUnmount(() => {
                     <button
                       type="button"
                       class="grid size-5 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
-                      :disabled="sending || branchesOpen"
+                      :disabled="sending || branchSelecting"
                       title="Edit message"
                       aria-label="Edit message"
                       @click="beginMessageEdit(item)"
@@ -3009,7 +3092,12 @@ onBeforeUnmount(() => {
             />
             <button
               class="grid size-6 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-coral disabled:opacity-30"
-              :disabled="branchSelecting || !selectedBranchNode"
+              :disabled="
+                branchSelecting ||
+                sending ||
+                Boolean(editingMessageNode) ||
+                !selectedBranchNode
+              "
               title="Use previewed branch"
               aria-label="Use previewed branch"
               @click="confirmBranchSelection"
@@ -3018,7 +3106,9 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="grid size-6 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300 disabled:opacity-30"
-              :disabled="branchSelecting"
+              :disabled="
+                branchSelecting || sending || Boolean(editingMessageNode)
+              "
               title="Cancel branch preview"
               aria-label="Cancel branch preview"
               @click="cancelBranchNavigator"
@@ -3058,16 +3148,23 @@ onBeforeUnmount(() => {
                   left: `${node.x}px`,
                   top: `${node.y}px`
                 }"
-                :disabled="branchSelecting"
+                :disabled="
+                  branchSelecting || sending || Boolean(editingMessageNode)
+                "
                 :aria-label="`Preview conversation from message ${index + 1}`"
                 :aria-current="selectedBranchNode === node.id ? 'true' : undefined"
                 :title="`Preview from message ${index + 1}`"
                 @click="previewBranch(node.id)"
+                @mouseenter="hoverBranchNode(node.id)"
+                @mouseleave="leaveBranchNode(node.id)"
+                @focus="hoverBranchNode(node.id)"
+                @blur="leaveBranchNode(node.id)"
               />
             </div>
           </div>
           <p class="shrink-0 px-2 py-2 text-[8px] leading-3 text-zinc-700">
-            Select a node to preview. ✓ keeps it; Esc restores the original.
+            Hover reveals its message; click previews its branch. You can edit
+            visible messages directly. ✓ keeps it; Esc restores the original.
           </p>
         </aside>
       </div>
