@@ -366,6 +366,13 @@ the next saved session in that project and replaces the URL accordingly. If
 none remain, no replacement is created: the URL returns to `/` and the sidebar
 invites the user to choose `New session`.
 
+Unsent web composer text is browser-local and scoped to the normalized project
+path plus session ID. Switching sessions restores each session's exact draft,
+including whitespace and line breaks; creating a session focuses its composer,
+successful sends and session deletion remove the saved draft, and storage
+failures do not prevent navigation. Browser storage is never used to resolve a
+session URL or choose the active project.
+
 Typing `@` opens files and folders from the selected project directory. Use
 `@../` for its parent, `@/` for the filesystem root, and continue selecting
 folders with `Enter` to browse deeper. Selecting a file inserts its `@path`

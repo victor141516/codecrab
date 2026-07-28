@@ -182,6 +182,12 @@ current draft and all later turns until changed.
   restore that session on a clean reload without `localStorage` or prior
   browser state. Selecting or replacing an active session must push or replace
   the corresponding URL as appropriate.
+- Web composer drafts are browser-local and isolated by normalized project
+  identity plus session ID. Save before navigation, clear while a destination
+  is loading, restore after Vue's DOM update, recover the source draft after a
+  navigation or send failure, and delete stored drafts after a successful send
+  or session deletion. Storage failures must not block navigation, and draft
+  storage must never participate in URL/session resolution.
 - The web sidebar is a two-level navigator rather than a fully expanded tree:
   show one project's sessions under its directory name, use a back control to
   show all projects, and open a project's session list when selected. Keep the

@@ -1,5 +1,13 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch
+} from "vue";
 import {
   ArrowUp,
   Check,
@@ -22,6 +30,10 @@ import {
   X
 } from "@lucide/vue";
 import { renderMarkdown } from "./markdown.js";
+import {
+  createComposerDraftController,
+  createComposerDraftStore
+} from "./composer-drafts.js";
 import { isScrolledToBottom } from "./scroll.js";
 import {
   activityEventTimestamp,
@@ -72,6 +84,18 @@ let waveformData = null;
 let lastEscapeAt = 0;
 const sessionStates = new Map();
 const sessionRuntimes = new Map();
+const composerDraftStore = createComposerDraftStore();
+const composerDrafts = createComposerDraftController({
+  store: composerDraftStore,
+  getDraft: () => draft.value,
+  setDraft: (value) => {
+    draft.value = value;
+  },
+  afterUpdate: nextTick,
+  resize: resizeComposer,
+  focus: () => composer.value?.focus()
+});
+watch(draft, (value) => composerDrafts.persist(value), { flush: "sync" });
 
 const session = computed(() => state.value?.session ?? null);
 function runtimeFor(id) {
@@ -412,6 +436,7 @@ async function loadState({ resumeGoal = false } = {}) {
     if (!requestedSession) {
       updateSessionUrl(nextState.session?.id, "replace");
     }
+    await composerDrafts.activate(nextState.project, nextState.session?.id);
     if (
       resumeGoal &&
       !runtimeFor(nextState.session?.id).sending &&
@@ -452,7 +477,8 @@ async function runAction(
 }
 
 async function newSession() {
-  await runAction(
+  const source = await composerDrafts.beginNavigation();
+  const nextState = await runAction(
     () => api("/api/sessions", { method: "POST", body: "{}" }),
     {
       selectActiveProject: true,
@@ -460,9 +486,17 @@ async function newSession() {
       historyMode: "push"
     }
   );
+  if (nextState) {
+    await composerDrafts.activate(nextState.project, nextState.session?.id, {
+      focusComposer: true
+    });
+  } else {
+    await composerDrafts.rollbackNavigation(source);
+  }
 }
 
 async function resumeSession(project, id) {
+  const source = await composerDrafts.beginNavigation();
   const nextState = await runAction(
     () =>
       api("/api/sessions/resume", {
@@ -475,9 +509,14 @@ async function resumeSession(project, id) {
       historyMode: "push"
     }
   );
+  if (!nextState) {
+    await composerDrafts.rollbackNavigation(source);
+    return;
+  }
+  await composerDrafts.activate(nextState.project, nextState.session?.id);
   if (
-    !runtimeFor(nextState?.session?.id).sending &&
-    nextState?.session?.goals?.some((goal) => goal.status === "active")
+    !runtimeFor(nextState.session?.id).sending &&
+    nextState.session?.goals?.some((goal) => goal.status === "active")
   ) {
     void runPrompt("", { continuation: true });
   }
@@ -488,6 +527,9 @@ async function deleteSession(project, id) {
   if (runtimeFor(id).sending) return;
   const deletingActive =
     project === state.value?.project && id === session.value?.id;
+  const source = deletingActive
+    ? await composerDrafts.beginNavigation()
+    : null;
   error.value = "";
   try {
     const nextState = await api("/api/sessions/delete", {
@@ -496,11 +538,13 @@ async function deleteSession(project, id) {
     });
     sessionStates.delete(id);
     sessionRuntimes.delete(id);
+    composerDrafts.forget(project, id);
     applyServerState(nextState, {
       selectActiveProject: deletingActive
     });
     if (deletingActive) {
       updateSessionUrl(nextState.session?.id, "replace");
+      await composerDrafts.activate(nextState.project, nextState.session?.id);
     } else if (
       !nextState.projects.some(
         (candidate) => candidate.root === selectedProjectRoot.value
@@ -509,6 +553,7 @@ async function deleteSession(project, id) {
       sidebarView.value = "projects";
     }
   } catch (cause) {
+    if (source) await composerDrafts.rollbackNavigation(source);
     error.value = cause.message;
   }
 }
@@ -574,6 +619,7 @@ function updateSessionUrl(id, mode = "push") {
 async function handleHistoryNavigation() {
   const id = sessionIdFromLocation();
   if (!id || id === session.value?.id) return;
+  const source = await composerDrafts.beginNavigation();
   error.value = "";
   try {
     const nextState = await api("/api/sessions/resume", {
@@ -581,11 +627,14 @@ async function handleHistoryNavigation() {
       body: JSON.stringify({ id })
     });
     applyServerState(nextState, { selectActiveProject: true });
+    await composerDrafts.activate(nextState.project, nextState.session?.id);
     await scrollToBottom();
     if (!sending.value && activeGoal.value) {
       void runPrompt("", { continuation: true });
     }
   } catch (cause) {
+    await composerDrafts.rollbackNavigation(source);
+    updateSessionUrl(source.identity?.sessionId, "replace");
     error.value = cause.message;
   }
 }
@@ -1182,8 +1231,10 @@ async function sendPrompt() {
     }
     return;
   }
-  await clearComposer();
-  await runPrompt(prompt);
+  const sent = composerDrafts.snapshot();
+  await clearComposer({ keepStored: true });
+  const completed = await runPrompt(prompt);
+  await composerDrafts.finishSend(sent, completed);
 }
 
 function activeGoalFor(sessionId) {
@@ -1239,6 +1290,7 @@ async function runPrompt(
       composer.value?.focus();
     }
   }
+  return completed;
 }
 
 async function cancelTurn({ pauseGoal = true } = {}) {
@@ -1444,10 +1496,8 @@ function resizeComposer() {
   composer.value.style.height = `${Math.min(composer.value.scrollHeight, 192)}px`;
 }
 
-async function clearComposer() {
-  draft.value = "";
-  await nextTick();
-  resizeComposer();
+async function clearComposer(options) {
+  await composerDrafts.clear(options);
 }
 
 function handleConversationScroll() {
@@ -1541,6 +1591,7 @@ onMounted(() => {
   loadState({ resumeGoal: true });
 });
 onBeforeUnmount(() => {
+  composerDrafts.persist();
   window.removeEventListener("popstate", handleHistoryNavigation);
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.clearTimeout(copiedMessageTimer);
