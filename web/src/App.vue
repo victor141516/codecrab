@@ -44,6 +44,10 @@ import {
   formatEventTimestamp
 } from "./timestamps.js";
 import { sortChronologically } from "./timeline.js";
+import {
+  VIRTUAL_TIMELINE_OVERSCAN,
+  VirtualTimelineStore
+} from "./virtual-timeline.js";
 
 const state = ref(null);
 const draft = ref("");
@@ -76,6 +80,21 @@ let autocompleteController = null;
 let copiedMessageTimer = null;
 const activityDetailElements = new Map();
 const activityDetailObservers = new Map();
+const timelineRowElements = new Map();
+const timelineElementKeys = new Map();
+const virtualTimelineStore = new VirtualTimelineStore();
+const virtualWindow = ref({
+  start: 0,
+  end: 0,
+  top: 0,
+  bottom: 0,
+  total: 0
+});
+const TIMELINE_VERTICAL_PADDING = 32;
+let timelineResizeObserver = null;
+let conversationResizeObserver = null;
+let conversationWidth = 0;
+let virtualActivation = 0;
 let mediaRecorder = null;
 let microphoneStream = null;
 let recordingChunks = [];
@@ -173,7 +192,12 @@ const activeGoal = computed(
   () => goals.value.find((goal) => goal.status === "active") ?? null
 );
 
-function assistantTurnEvents(messages, activities, turnMessageIndex) {
+function assistantTurnEvents(
+  messages,
+  activities,
+  turnMessageIndex,
+  sessionKey
+) {
   const events = [];
   const matchedActivities = new Set();
 
@@ -182,7 +206,7 @@ function assistantTurnEvents(messages, activities, turnMessageIndex) {
     if (!message.hidden && message.content?.trim()) {
       events.push({
         type: "message",
-        key: `message-${turnMessageIndex}-${messageIndex}`,
+        key: `message-${sessionKey}-${turnMessageIndex}-${messageIndex}`,
         message
       });
     }
@@ -195,7 +219,7 @@ function assistantTurnEvents(messages, activities, turnMessageIndex) {
       if (activity) {
         events.push({
           type: "activity",
-          key: `activity-${activity.id}`,
+          key: `activity-${sessionKey}-${activity.id}`,
           activity
         });
         matchedActivities.add(activity.id);
@@ -210,7 +234,7 @@ function assistantTurnEvents(messages, activities, turnMessageIndex) {
     ) {
       events.push({
         type: "activity",
-        key: `activity-${activity.id}`,
+        key: `activity-${sessionKey}-${activity.id}`,
         activity
       });
     }
@@ -266,7 +290,7 @@ const timeline = computed(() => {
           assistantTurnItem(`assistant-${sessionKey}-${messageIndex}`, [
             {
               type: "message",
-              key: `message-orphan-${messageIndex}`,
+              key: `message-orphan-${sessionKey}-${messageIndex}`,
               message
             }
           ])
@@ -279,7 +303,7 @@ const timeline = computed(() => {
     if (!message.hidden && message.content?.trim()) {
       items.push({
         type: "message",
-        key: `message-${messageIndex}`,
+        key: `message-${sessionKey}-${messageIndex}`,
         message
       });
     }
@@ -294,7 +318,8 @@ const timeline = computed(() => {
     const turnEvents = assistantTurnEvents(
       messages.slice(messageIndex + 1, nextUser),
       activities,
-      messageIndex
+      messageIndex,
+      sessionKey
     );
     if (turnEvents.length) {
       items.push(
@@ -314,6 +339,17 @@ const activeAssistantTurnKey = computed(() => {
   const last = timeline.value.at(-1);
   return last?.type === "assistant_turn" ? last.key : null;
 });
+const virtualTimelineItems = computed(() =>
+  timeline.value.slice(virtualWindow.value.start, virtualWindow.value.end)
+);
+
+watch(
+  [() => session.value?.id, timeline],
+  ([sessionId, items], [previousSessionId]) => {
+    void activateVirtualTimeline(sessionId, items, previousSessionId);
+  },
+  { flush: "pre" }
+);
 
 function turnHasCollapsibleProgress(item) {
   return (
@@ -547,6 +583,7 @@ async function deleteSession(project, id) {
     sessionStates.delete(id);
     sessionRuntimes.delete(id);
     composerDrafts.forget(project, id);
+    virtualTimelineStore.delete(id);
     applyServerState(nextState, {
       selectActiveProject: deletingActive
     });
@@ -567,9 +604,6 @@ async function deleteSession(project, id) {
 }
 
 function applyServerState(nextState, { selectActiveProject = false } = {}) {
-  if (nextState.session?.id !== session.value?.id) {
-    autoScroll.value = true;
-  }
   const id = nextState.session?.id;
   const cached = id ? sessionStates.get(id) : null;
   const effective =
@@ -1563,9 +1597,161 @@ async function clearComposer(options) {
   await composerDrafts.clear(options);
 }
 
+function timelineDescriptor(item) {
+  return {
+    key: item.key,
+    estimate: estimateTimelineItemHeight(item),
+    signature: timelineItemSignature(item),
+    mounted: timelineRowElements.has(item.key)
+  };
+}
+
+function timelineItemSignature(item) {
+  if (item.type === "message") {
+    return `message:${textShape(item.message.content)}`;
+  }
+  return visibleTurnEvents(item)
+    .map((event) =>
+      event.type === "message"
+        ? `${event.key}:message:${textShape(event.message.content)}`
+        : `${event.key}:activity:${event.activity.status}:${textShape(
+            event.activity.detail
+          )}:${expandedActivityKeys.value.has(event.key)}`
+    )
+    .join("|");
+}
+
+function textShape(content) {
+  const text = content ?? "";
+  const lineBreaks = (text.match(/\n/g) ?? []).length;
+  return `${text.length}:${lineBreaks}:${text.slice(0, 24)}:${text.slice(-24)}`;
+}
+
+function estimateTimelineItemHeight(item) {
+  if (item.type === "message") {
+    return 58 + estimatedWrappedLines(item.message.content, 82) * 21;
+  }
+  let height = 54;
+  if (turnHasCollapsibleProgress(item)) height += 32;
+  for (const event of visibleTurnEvents(item)) {
+    if (event.type === "activity") {
+      height += expandedActivityKeys.value.has(event.key)
+        ? 30 + estimatedWrappedLines(event.activity.detail, 72) * 16
+        : 32;
+    } else {
+      height += 28 + estimatedWrappedLines(event.message.content, 78) * 19;
+    }
+  }
+  if (activeAssistantTurnKey.value === item.key) height += 18;
+  return Math.min(2_400, Math.max(72, height));
+}
+
+function estimatedWrappedLines(content, width) {
+  return (content ?? "").split("\n").reduce(
+    (total, line) => total + Math.max(1, Math.ceil(line.length / width)),
+    0
+  );
+}
+
+async function activateVirtualTimeline(
+  sessionId,
+  items,
+  previousSessionId
+) {
+  const activation = ++virtualActivation;
+  const switching = sessionId !== previousSessionId;
+  if (switching) {
+    saveVirtualSessionView(previousSessionId);
+    disconnectTimelineRows();
+  }
+
+  let model = virtualTimelineStore.active();
+  const sameTopology =
+    !switching &&
+    model &&
+    model.keys.length === items.length &&
+    (!items.length ||
+      (model.keys[0] === items[0].key &&
+        model.keys.at(-1) === items.at(-1).key));
+  if (sameTopology) {
+    const last = items.at(-1);
+    if (last) model.updateItem(timelineDescriptor(last));
+  } else {
+    model = virtualTimelineStore.activate(
+      sessionId,
+      items.map(timelineDescriptor)
+    );
+  }
+  if (!model) {
+    virtualWindow.value = {
+      start: 0,
+      end: 0,
+      top: 0,
+      bottom: 0,
+      total: 0
+    };
+    return;
+  }
+
+  updateVirtualWindow();
+  await nextTick();
+  if (activation !== virtualActivation) return;
+  if (switching) {
+    await restoreVirtualSessionView(sessionId, activation);
+  } else if (autoScroll.value) {
+    await scrollToBottom();
+  } else {
+    updateVirtualWindow();
+  }
+}
+
+function saveVirtualSessionView(sessionId = session.value?.id) {
+  const element = conversation.value;
+  const model = virtualTimelineStore.active();
+  if (!sessionId || !element || !model) return;
+  virtualTimelineStore.saveView(sessionId, {
+    anchor: model.anchorAt(conversationContentScrollTop(element)),
+    followBottom: autoScroll.value
+  });
+}
+
+async function restoreVirtualSessionView(sessionId, activation) {
+  const element = conversation.value;
+  const model = virtualTimelineStore.active();
+  if (!element || !model || activation !== virtualActivation) return;
+  const view = virtualTimelineStore.view(sessionId);
+  autoScroll.value = view?.followBottom ?? true;
+  updateVirtualWindow();
+  await nextTick();
+  if (activation !== virtualActivation) return;
+  if (autoScroll.value) {
+    element.scrollTop = element.scrollHeight;
+  } else {
+    element.scrollTop =
+      TIMELINE_VERTICAL_PADDING + model.scrollTopForAnchor(view.anchor);
+  }
+  updateVirtualWindow();
+}
+
+function conversationContentScrollTop(element) {
+  return Math.max(0, element.scrollTop - TIMELINE_VERTICAL_PADDING);
+}
+
+function updateVirtualWindow() {
+  const element = conversation.value;
+  const model = virtualTimelineStore.active();
+  if (!model) return;
+  virtualWindow.value = model.range(
+    element ? conversationContentScrollTop(element) : 0,
+    element?.clientHeight ?? 800,
+    VIRTUAL_TIMELINE_OVERSCAN
+  );
+}
+
 function handleConversationScroll() {
   if (conversation.value) {
     autoScroll.value = isScrolledToBottom(conversation.value);
+    updateVirtualWindow();
   }
 }
 
@@ -1574,7 +1760,107 @@ async function scrollToBottom() {
   await nextTick();
   if (autoScroll.value && conversation.value) {
     conversation.value.scrollTop = conversation.value.scrollHeight;
+    updateVirtualWindow();
   }
+}
+
+function ensureTimelineResizeObserver() {
+  if (timelineResizeObserver || typeof ResizeObserver === "undefined") return;
+  timelineResizeObserver = new ResizeObserver((entries) => {
+    measureTimelineRows(entries);
+  });
+}
+
+function bindTimelineRow(key, element) {
+  const previous = timelineRowElements.get(key);
+  if (previous === element) return;
+  if (previous) {
+    timelineResizeObserver?.unobserve(previous);
+    timelineElementKeys.delete(previous);
+    timelineRowElements.delete(key);
+  }
+  if (!element) return;
+  ensureTimelineResizeObserver();
+  timelineRowElements.set(key, element);
+  timelineElementKeys.set(element, key);
+  timelineResizeObserver?.observe(element);
+}
+
+function disconnectTimelineRows() {
+  for (const element of timelineRowElements.values()) {
+    timelineResizeObserver?.unobserve(element);
+  }
+  timelineRowElements.clear();
+  timelineElementKeys.clear();
+}
+
+function measureTimelineRows(entries) {
+  const model = virtualTimelineStore.active();
+  const element = conversation.value;
+  if (!model || !element) return;
+  const anchor = autoScroll.value
+    ? null
+    : model.anchorAt(conversationContentScrollTop(element));
+  let changed = false;
+  for (const entry of entries) {
+    const key = timelineElementKeys.get(entry.target);
+    if (!key) continue;
+    changed =
+      model.measure(key, entry.target.getBoundingClientRect().height).changed ||
+      changed;
+  }
+  if (!changed) return;
+  updateVirtualWindow();
+  const activation = virtualActivation;
+  void nextTick().then(() => {
+    if (activation !== virtualActivation || !conversation.value) return;
+    if (autoScroll.value) {
+      conversation.value.scrollTop = conversation.value.scrollHeight;
+    } else if (anchor) {
+      conversation.value.scrollTop =
+        TIMELINE_VERTICAL_PADDING + model.scrollTopForAnchor(anchor);
+    }
+    updateVirtualWindow();
+  });
+}
+
+function invalidateVirtualMeasurements() {
+  const model = virtualTimelineStore.active();
+  const element = conversation.value;
+  if (!model || !element) return;
+  const anchor = autoScroll.value
+    ? null
+    : model.anchorAt(conversationContentScrollTop(element));
+  if (!model.invalidateMeasurements()) return;
+  updateVirtualWindow();
+  const activation = virtualActivation;
+  void nextTick().then(() => {
+    if (activation !== virtualActivation || !conversation.value) return;
+    if (autoScroll.value) {
+      conversation.value.scrollTop = conversation.value.scrollHeight;
+    } else if (anchor) {
+      conversation.value.scrollTop =
+        TIMELINE_VERTICAL_PADDING + model.scrollTopForAnchor(anchor);
+    }
+    updateVirtualWindow();
+  });
+}
+
+function observeConversationSize() {
+  if (!conversation.value || typeof ResizeObserver === "undefined") return;
+  conversationResizeObserver?.disconnect();
+  conversationWidth = conversation.value.getBoundingClientRect().width;
+  conversationResizeObserver = new ResizeObserver(([entry]) => {
+    const width = entry.contentRect.width;
+    if (Math.abs(width - conversationWidth) < 1) return;
+    conversationWidth = width;
+    invalidateVirtualMeasurements();
+  });
+  conversationResizeObserver.observe(conversation.value);
+}
+
+function handleFontMetricsChange() {
+  invalidateVirtualMeasurements();
 }
 
 async function copyMessage(content, key) {
@@ -1651,9 +1937,20 @@ function formatTime(value) {
 onMounted(() => {
   window.addEventListener("popstate", handleHistoryNavigation);
   window.addEventListener("keydown", handleGlobalKeydown);
+  observeConversationSize();
+  document.fonts?.addEventListener?.("loadingdone", handleFontMetricsChange);
+  void document.fonts?.ready?.then(handleFontMetricsChange);
   loadState({ resumeGoal: true });
 });
 onBeforeUnmount(() => {
+  saveVirtualSessionView();
+  disconnectTimelineRows();
+  timelineResizeObserver?.disconnect();
+  conversationResizeObserver?.disconnect();
+  document.fonts?.removeEventListener?.(
+    "loadingdone",
+    handleFontMetricsChange
+  );
   composerDrafts.persist();
   autocompleteController?.abort();
   window.removeEventListener("popstate", handleHistoryNavigation);
@@ -2076,7 +2373,8 @@ onBeforeUnmount(() => {
 
       <div
         ref="conversation"
-        class="min-h-0 flex-1 overflow-y-auto"
+        class="conversation-viewport min-h-0 flex-1 overflow-y-auto"
+        data-testid="conversation-viewport"
         @scroll.passive="handleConversationScroll"
       >
         <div v-if="loading" class="grid h-full place-items-center">
@@ -2088,8 +2386,22 @@ onBeforeUnmount(() => {
 
         <div v-else-if="!timeline.length" class="h-full" />
 
-        <div v-else class="mx-auto max-w-3xl px-4 py-8 sm:px-8">
-          <template v-for="item in timeline" :key="item.key">
+        <div
+          v-else
+          class="mx-auto max-w-3xl px-4 py-8 sm:px-8"
+          :data-timeline-mounted="virtualTimelineItems.length"
+          :data-timeline-total="timeline.length"
+        >
+          <div
+            :style="{ height: `${virtualWindow.top}px` }"
+            aria-hidden="true"
+          />
+          <div
+            v-for="item in virtualTimelineItems"
+            :key="item.key"
+            :ref="(element) => bindTimelineRow(item.key, element)"
+            data-timeline-row
+          >
             <article v-if="item.type === 'message'" class="message-row group">
               <div
                 class="grid size-6 shrink-0 place-items-center rounded-md bg-white/7 text-[10px] font-bold text-zinc-300"
@@ -2303,7 +2615,12 @@ onBeforeUnmount(() => {
                 </div>
               </div>
             </article>
-          </template>
+          </div>
+
+          <div
+            :style="{ height: `${virtualWindow.bottom}px` }"
+            aria-hidden="true"
+          />
 
           <div v-if="sending && !activeAssistantTurnKey" class="message-row">
             <div class="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md bg-coral/12 text-[10px] font-bold text-coral">

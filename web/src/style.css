@@ -76,6 +76,10 @@ button:disabled {
   border-bottom: 1px solid rgb(255 255 255 / 0.035);
 }
 
+.conversation-viewport {
+  overflow-anchor: none;
+}
+
 .message-content {
   color: #d4d4d8;
   font-size: 0.8125rem;
