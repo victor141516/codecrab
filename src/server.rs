@@ -129,6 +129,16 @@ impl Serialize for WebSession {
             "messages".into(),
             serde_json::to_value(&*self.0.messages).map_err(serde::ser::Error::custom)?,
         );
+        object.insert(
+            "active_message_ids".into(),
+            serde_json::to_value(self.0.messages.active_node_ids())
+                .map_err(serde::ser::Error::custom)?,
+        );
+        object.insert(
+            "branch_nodes".into(),
+            serde_json::to_value(self.0.messages.visible_user_nodes())
+                .map_err(serde::ser::Error::custom)?,
+        );
         value.serialize(serializer)
     }
 }
@@ -152,6 +162,12 @@ struct ChatRequest {
 #[derive(Deserialize)]
 struct ConversationRequest {
     session_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct BranchRequest {
+    session_id: Option<Uuid>,
+    node_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -319,6 +335,8 @@ pub(crate) async fn serve(
                 .route("/providers/use", post(use_provider))
                 .route("/providers/delete", post(delete_provider))
                 .route("/session/clear", post(clear_session))
+                .route("/branches/preview", post(preview_branch))
+                .route("/branches/select", post(select_branch))
                 .route("/sessions", post(new_session))
                 .route("/sessions/delete", post(delete_session))
                 .route("/sessions/resume", post(resume_session))
@@ -964,6 +982,51 @@ async fn clear_session(
     ))
 }
 
+async fn preview_branch(
+    State(state): State<ServerState>,
+    Json(request): Json<BranchRequest>,
+) -> ApiResult<StateResponse> {
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::message(
+                StatusCode::CONFLICT,
+                "create or resume a session before browsing its branches",
+            )
+        })?;
+    if conversation.is_running() {
+        return Err(ApiError::message(
+            StatusCode::CONFLICT,
+            "wait for the active turn before browsing conversation branches",
+        ));
+    }
+    let conversation_snapshot = conversation.snapshot();
+    let preview = conversation_snapshot
+        .session
+        .preview_branch(request.node_id)?;
+    let mut response = snapshot_for(&state, Some(conversation_snapshot.session.id)).await?;
+    response.session = Some(WebSession(preview));
+    Ok(Json(response))
+}
+
+async fn select_branch(
+    State(state): State<ServerState>,
+    Json(request): Json<BranchRequest>,
+) -> ApiResult<StateResponse> {
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::message(
+                StatusCode::CONFLICT,
+                "create or resume a session before selecting a conversation branch",
+            )
+        })?;
+    conversation.select_branch(request.node_id).await?;
+    Ok(Json(
+        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
+    ))
+}
+
 async fn new_session(State(state): State<ServerState>) -> ApiResult<StateResponse> {
     let _transition = state.inner.workspace_transition.lock().await;
     let (root, current) = {
@@ -1388,6 +1451,8 @@ mod tests {
 
         let value = serde_json::to_value(WebSession(session)).unwrap();
         assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(value["active_message_ids"].as_array().unwrap().len(), 1);
+        assert_eq!(value["branch_nodes"].as_array().unwrap().len(), 1);
         assert_eq!(value["conversation"]["nodes"].as_array().unwrap().len(), 1);
         assert_eq!(
             value["messages"][0]["content"].as_str(),
@@ -1436,6 +1501,102 @@ mod tests {
         assert!(INDEX_HTML.starts_with(b"<!doctype html>"));
         assert!(APP_JS.len() > 1_000);
         assert!(APP_CSS.len() > 1_000);
+    }
+
+    #[tokio::test]
+    async fn branch_preview_is_reversible_and_selection_persists_the_resolved_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("model", "http://127.0.0.1:1/v1");
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store
+            .create_for_provider(config.active_provider.clone(), "model".into())
+            .unwrap();
+        let root_node = session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "root"));
+        session.messages.push(Message::text(
+            crate::provider::Role::Assistant,
+            "original answer",
+        ));
+        let original_leaf = session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "original follow-up",
+        ));
+        session
+            .messages
+            .branch_from(
+                Some(root_node),
+                Message::text(crate::provider::Role::Assistant, "newer answer"),
+            )
+            .unwrap();
+        let newer_leaf = session.messages.push(Message::text(
+            crate::provider::Role::User,
+            "newer follow-up",
+        ));
+        let session_id = session.id;
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let conversation = test_conversation(agent);
+        let state = test_state(config, root.clone(), conversation.clone(), false);
+
+        let Json(preview) = match preview_branch(
+            State(state.clone()),
+            Json(BranchRequest {
+                session_id: Some(session_id),
+                node_id: root_node,
+            }),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => panic!("{:#}", error.error),
+        };
+
+        assert!(
+            preview
+                .session
+                .as_ref()
+                .unwrap()
+                .messages
+                .active_node_ids()
+                .contains(&original_leaf)
+        );
+        assert!(
+            conversation
+                .snapshot()
+                .session
+                .messages
+                .active_node_ids()
+                .contains(&newer_leaf)
+        );
+
+        if let Err(error) = select_branch(
+            State(state),
+            Json(BranchRequest {
+                session_id: Some(session_id),
+                node_id: root_node,
+            }),
+        )
+        .await
+        {
+            panic!("{:#}", error.error);
+        }
+
+        assert!(
+            conversation
+                .snapshot()
+                .session
+                .messages
+                .active_node_ids()
+                .contains(&original_leaf)
+        );
+        let persisted = store.load(Some(&session_id.to_string())).unwrap();
+        assert!(
+            persisted
+                .messages
+                .active_node_ids()
+                .contains(&original_leaf)
+        );
     }
 
     #[tokio::test]

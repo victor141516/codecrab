@@ -24,7 +24,7 @@ pub(crate) struct ConversationNode {
     pub message: Message,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize)]
 pub(crate) struct ConversationGraphNode {
     pub id: Uuid,
     pub parent_id: Option<Uuid>,

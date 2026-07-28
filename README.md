@@ -27,6 +27,8 @@ terminal interface and an optional embedded web application.
   and final responses in their exact chronological order in both clients.
 - Automatic conversation scrolling pauses when the user scrolls upward and
   resumes only after they return to the bottom, even while new output streams.
+- Conversation history is stored as a tree. `/branches` opens a compact,
+  reversible branch preview beside the transcript in both clients.
 - Sanitized Markdown responses in the web client with formatted headings,
   lists, tables, links, inline code, and syntax-highlighted code blocks.
 - Per-segment web copy controls for user messages and assistant text, excluding
@@ -184,6 +186,8 @@ The initial API surface is:
 | `POST` | `/api/transcribe` | Transcribe audio for the `X-CodeCrab-Session` session |
 | `PUT` | `/api/model` | Change model, thinking, and service tier for `session_id` |
 | `POST` | `/api/session/clear` | Clear `session_id` |
+| `POST` | `/api/branches/preview` | Preview the oldest leaf descending from `{ session_id, node_id }` without persistence |
+| `POST` | `/api/branches/select` | Select and persist the oldest leaf descending from `{ session_id, node_id }` |
 | `POST` | `/api/sessions` | Create and select a session |
 | `POST` | `/api/sessions/delete` | Delete `{ project?, id }`; select the next saved session when active |
 | `POST` | `/api/sessions/resume` | Resume `{ project?, id }`, resolving the project globally when omitted |
@@ -288,6 +292,7 @@ Commands inside the composer:
 /help       open keyboard and command help
 /model      choose model, reasoning effort, and service speed
 /sessions   browse, resume, or delete saved sessions
+/branches   browse and preview conversation branches
 /goal ...   create and start a persistent goal
 /goals      browse, describe, activate, pause, or delete goals
 /skills     show available Agent Skills
@@ -342,6 +347,16 @@ being written and every later turn until changed, and are restored when the
 session is resumed. Compatible providers that return the standard
 `{"data":[{"id":"..."}]}` shape remain selectable but do not get invented
 reasoning or speed options.
+
+`/branches` opens the conversation tree only when requested. Each visible user
+message is a node; selecting any node previews the complete path through the
+oldest descendant leaf and keeps that message in view. In the terminal, arrows
+move between nodes, `Enter` keeps the preview, and `Esc` restores the original
+branch and scroll position. The web panel uses the same semantics with clickable
+nodes, a check action, and a cancel action. The previewed route is coral, while
+the route that was active when the panel opened remains cyan where it diverges.
+The composer is disabled during preview so a prompt cannot be sent to a branch
+other than the one currently shown.
 
 New conversations default to GPT-5.6 Sol with `high` reasoning and Fast speed.
 CodeCrab resolves the reasoning and Fast service-tier identifiers from the live
@@ -711,6 +726,11 @@ platform-global `config.toml`, which lets terminal commands, `/sessions`, and
 the web sidebar discover every project that has saved sessions. Empty projects
 are removed from that registry. The field is managed automatically and can
 also be edited manually.
+
+Each session persists one conversation tree with stable node and parent IDs,
+plus the selected leaf. The ordinary `messages` field returned by the web API
+is only the active root-to-leaf projection; inactive branches remain in
+`conversation.nodes` and are never discarded by branch selection.
 
 ### Automatic context compaction
 

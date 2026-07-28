@@ -80,6 +80,72 @@ button:disabled {
   overflow-anchor: none;
 }
 
+.branch-navigator {
+  border-left: 1px solid rgb(255 255 255 / 0.035);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgb(255 255 255 / 0.012)
+  );
+}
+
+.branch-edge {
+  fill: none;
+  stroke: #3f3f46;
+  stroke-width: 1.25;
+  vector-effect: non-scaling-stroke;
+}
+
+.branch-edge-original {
+  stroke: #22d3ee;
+  stroke-width: 1.75;
+  opacity: 0.75;
+}
+
+.branch-edge-current {
+  stroke: #f46356;
+  stroke-width: 3;
+}
+
+.branch-node {
+  position: absolute;
+  width: 0.625rem;
+  height: 0.625rem;
+  transform: translate(-50%, -50%);
+  border: 2px solid #52525b;
+  border-radius: 9999px;
+  background: #0c0d0e;
+  padding: 0;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease;
+}
+
+.branch-node:hover,
+.branch-node:focus-visible {
+  border-color: #d4d4d8;
+  outline: none;
+  transform: translate(-50%, -50%) scale(1.2);
+}
+
+.branch-node-original {
+  border-color: #22d3ee;
+}
+
+.branch-node-current {
+  width: 0.75rem;
+  height: 0.75rem;
+  border-color: #f46356;
+  background: #f46356;
+}
+
+.branch-node-selected {
+  box-shadow:
+    0 0 0 3px #0c0d0e,
+    0 0 0 4px rgb(244 99 86 / 0.8);
+}
+
 .message-content {
   color: #d4d4d8;
   font-size: 0.8125rem;

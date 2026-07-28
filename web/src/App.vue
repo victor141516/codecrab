@@ -16,6 +16,7 @@ import {
   ChevronUp,
   Copy,
   Folder,
+  GitBranch,
   ListTodo,
   LoaderCircle,
   Menu,
@@ -48,6 +49,11 @@ import {
   VIRTUAL_TIMELINE_OVERSCAN,
   VirtualTimelineStore
 } from "./virtual-timeline.js";
+import {
+  branchEdgePath,
+  layoutBranchGraph,
+  routeContainsEdge
+} from "./branches.js";
 
 const state = ref(null);
 const draft = ref("");
@@ -75,6 +81,10 @@ const describedGoal = ref(null);
 const editingGoal = ref(null);
 const goalDraft = ref("");
 const editingGoalResume = ref(false);
+const branchesOpen = ref(false);
+const selectedBranchNode = ref(null);
+const branchSelecting = ref(false);
+const branchOriginalPath = ref(new Set());
 let autocompleteRequest = 0;
 let autocompleteController = null;
 let copiedMessageTimer = null;
@@ -106,6 +116,9 @@ let audioAnalyser = null;
 let waveformFrame = null;
 let waveformData = null;
 let lastEscapeAt = 0;
+let branchOriginalState = null;
+let branchOriginalScrollTop = 0;
+let branchOriginalAutoScroll = true;
 const sessionStates = new Map();
 const sessionRuntimes = new Map();
 const composerDraftStore = createComposerDraftStore();
@@ -190,6 +203,17 @@ const visibleGoal = computed(
 );
 const activeGoal = computed(
   () => goals.value.find((goal) => goal.status === "active") ?? null
+);
+const branchNodes = computed(() => session.value?.branch_nodes ?? []);
+const branchLayout = computed(() => layoutBranchGraph(branchNodes.value));
+const activeBranchPath = computed(
+  () => new Set(session.value?.active_message_ids ?? [])
+);
+watch(
+  () => session.value?.id,
+  (current, previous) => {
+    if (previous && current !== previous) resetBranchNavigator();
+  }
 );
 
 function assistantTurnEvents(
@@ -279,6 +303,7 @@ const timeline = computed(() => {
   const messages = session.value?.messages ?? [];
   const activities = session.value?.activities ?? [];
   const turns = session.value?.turns ?? [];
+  const activeMessageIds = session.value?.active_message_ids ?? [];
   const sessionKey = session.value?.id ?? "session";
   const items = [];
   let messageIndex = 0;
@@ -301,10 +326,12 @@ const timeline = computed(() => {
     }
 
     if (!message.hidden && message.content?.trim()) {
+      const nodeId = activeMessageIds[messageIndex] ?? null;
       items.push({
         type: "message",
-        key: `message-${sessionKey}-${messageIndex}`,
-        message
+        key: `message-${sessionKey}-${nodeId ?? messageIndex}`,
+        message,
+        nodeId
       });
     }
 
@@ -697,7 +724,118 @@ function workerLifecycle(id) {
   return state.value?.workers?.find((worker) => worker.id === id)?.lifecycle ?? "";
 }
 
+function resetBranchNavigator() {
+  branchesOpen.value = false;
+  selectedBranchNode.value = null;
+  branchSelecting.value = false;
+  branchOriginalPath.value = new Set();
+  branchOriginalState = null;
+}
+
+function openBranchNavigator() {
+  if (sending.value) {
+    error.value = "Wait for the active operation before browsing branches.";
+    return;
+  }
+  if (!branchNodes.value.length) {
+    error.value = "This conversation has no visible user messages.";
+    return;
+  }
+  branchOriginalState = state.value;
+  branchOriginalPath.value = new Set(
+    session.value?.active_message_ids ?? []
+  );
+  branchOriginalScrollTop = conversation.value?.scrollTop ?? 0;
+  branchOriginalAutoScroll = autoScroll.value;
+  selectedBranchNode.value =
+    [...branchNodes.value]
+      .reverse()
+      .find((node) => activeBranchPath.value.has(node.id))?.id ?? null;
+  branchesOpen.value = true;
+  closeAutocomplete();
+  error.value = "";
+}
+
+async function cancelBranchNavigator() {
+  if (branchSelecting.value) return;
+  const original = branchOriginalState;
+  const scrollTop = branchOriginalScrollTop;
+  const followBottom = branchOriginalAutoScroll;
+  resetBranchNavigator();
+  if (!original) return;
+  applyServerState(original);
+  await nextTick();
+  await nextTick();
+  autoScroll.value = followBottom;
+  if (conversation.value) conversation.value.scrollTop = scrollTop;
+  updateVirtualWindow();
+}
+
+async function previewBranch(nodeId) {
+  if (branchSelecting.value || !session.value?.id) return;
+  branchSelecting.value = true;
+  error.value = "";
+  try {
+    const nextState = await api("/api/branches/preview", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: session.value.id,
+        node_id: nodeId
+      })
+    });
+    applyServerState(nextState);
+    selectedBranchNode.value = nodeId;
+    await scrollToBranchMessage(nodeId);
+  } catch (cause) {
+    error.value = cause.message;
+  } finally {
+    branchSelecting.value = false;
+  }
+}
+
+async function confirmBranchSelection() {
+  const nodeId = selectedBranchNode.value;
+  if (!nodeId || branchSelecting.value || !session.value?.id) return;
+  branchSelecting.value = true;
+  error.value = "";
+  try {
+    const nextState = await api("/api/branches/select", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: session.value.id,
+        node_id: nodeId
+      })
+    });
+    applyServerState(nextState);
+    resetBranchNavigator();
+    await scrollToBranchMessage(nodeId);
+  } catch (cause) {
+    error.value = cause.message;
+    branchSelecting.value = false;
+  }
+}
+
+function branchEdgeClasses(edge) {
+  return {
+    "branch-edge-current": routeContainsEdge(activeBranchPath.value, edge),
+    "branch-edge-original":
+      !routeContainsEdge(activeBranchPath.value, edge) &&
+      routeContainsEdge(branchOriginalPath.value, edge)
+  };
+}
+
+function branchNodeClasses(node) {
+  return {
+    "branch-node-current": activeBranchPath.value.has(node.id),
+    "branch-node-original":
+      !activeBranchPath.value.has(node.id) &&
+      branchOriginalPath.value.has(node.id),
+    "branch-node-selected": selectedBranchNode.value === node.id
+  };
+}
+
 async function clearSession() {
+  if (branchesOpen.value) return;
   const sessionId = session.value?.id;
   if (!sessionId) return;
   error.value = "";
@@ -1031,7 +1169,7 @@ async function toggleDictation() {
 }
 
 async function updateModel(patch) {
-  if (!session.value) return;
+  if (!session.value || branchesOpen.value) return;
   const sessionId = session.value.id;
   const currentSession = session.value;
   error.value = "";
@@ -1241,6 +1379,10 @@ async function streamChat(
 }
 
 async function sendPrompt() {
+  if (branchesOpen.value) {
+    error.value = "Keep or cancel the branch preview before writing.";
+    return;
+  }
   if (recording.value) {
     sendAfterTranscription = true;
     mediaRecorder?.stop();
@@ -1253,6 +1395,11 @@ async function sendPrompt() {
     await clearComposer();
     closeAutocomplete();
     goalsOpen.value = true;
+    return;
+  }
+  if (prompt === "/branches") {
+    await clearComposer();
+    openBranchNavigator();
     return;
   }
   if (prompt === "/goal") {
@@ -1367,6 +1514,11 @@ function handleGlobalKeydown(event) {
   if (event.repeat) return;
   if (event.key !== "Escape") {
     lastEscapeAt = 0;
+    return;
+  }
+  if (branchesOpen.value) {
+    event.preventDefault();
+    void cancelBranchNavigator();
     return;
   }
   if (editingGoal.value) {
@@ -1762,6 +1914,24 @@ async function scrollToBottom() {
     conversation.value.scrollTop = conversation.value.scrollHeight;
     updateVirtualWindow();
   }
+}
+
+async function scrollToBranchMessage(nodeId) {
+  await nextTick();
+  await nextTick();
+  const item = timeline.value.find(
+    (candidate) =>
+      candidate.type === "message" && candidate.nodeId === nodeId
+  );
+  const model = virtualTimelineStore.active();
+  const element = conversation.value;
+  const index = item ? model?.indexByKey.get(item.key) : null;
+  if (!item || !model || !element || index == null) return;
+  autoScroll.value = false;
+  element.scrollTop =
+    TIMELINE_VERTICAL_PADDING +
+    Math.max(0, model.offsetForIndex(index) - 16);
+  updateVirtualWindow();
 }
 
 function ensureTimelineResizeObserver() {
@@ -2320,11 +2490,24 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="ml-auto flex items-center gap-2">
+          <button
+            v-if="session"
+            class="grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-30"
+            :class="branchesOpen ? 'text-coral' : 'text-zinc-600'"
+            :disabled="sending || !branchNodes.length"
+            title="Browse conversation branches"
+            aria-label="Browse conversation branches"
+            :aria-pressed="branchesOpen"
+            @click="branchesOpen ? cancelBranchNavigator() : openBranchNavigator()"
+          >
+            <GitBranch class="size-4" aria-hidden="true" />
+          </button>
           <button class="grid size-8 place-items-center rounded-md text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300" title="Providers" aria-label="Manage providers" @click="providersOpen = true"><Settings class="size-4" /></button>
           <select
             v-if="session"
             class="control max-w-44"
             :value="session.model"
+            :disabled="branchesOpen"
             aria-label="Model"
             @change="chooseModel"
           >
@@ -2336,6 +2519,7 @@ onBeforeUnmount(() => {
             v-if="reasoningOptions.length"
             class="control hidden sm:block"
             :value="session?.reasoning_effort ?? ''"
+            :disabled="branchesOpen"
             aria-label="Thinking level"
             @change="updateModel({ reasoning_effort: $event.target.value || null })"
           >
@@ -2351,6 +2535,7 @@ onBeforeUnmount(() => {
             v-if="speedOptions.length"
             class="control hidden sm:block"
             :value="session?.service_tier ?? ''"
+            :disabled="branchesOpen"
             aria-label="Service speed"
             @change="updateModel({ service_tier: $event.target.value || null })"
           >
@@ -2362,6 +2547,7 @@ onBeforeUnmount(() => {
           <button
             v-if="session"
             class="grid size-8 place-items-center rounded-md text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
+            :disabled="branchesOpen"
             title="Clear conversation"
             aria-label="Clear conversation"
             @click="clearSession"
@@ -2371,6 +2557,7 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
+      <div class="flex min-h-0 flex-1">
       <div
         ref="conversation"
         class="conversation-viewport min-h-0 flex-1 overflow-y-auto"
@@ -2637,6 +2824,86 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+        <aside
+          v-if="branchesOpen"
+          class="branch-navigator flex w-28 shrink-0 flex-col sm:w-36 lg:w-44"
+          aria-label="Conversation branches"
+        >
+          <header class="flex h-10 shrink-0 items-center gap-1 px-2">
+            <GitBranch class="size-3.5 text-zinc-600" aria-hidden="true" />
+            <span class="min-w-0 flex-1 truncate text-[9px] font-semibold uppercase tracking-[0.14em] text-zinc-600">
+              Branches
+            </span>
+            <LoaderCircle
+              v-if="branchSelecting"
+              class="size-3 animate-spin text-coral"
+              aria-hidden="true"
+            />
+            <button
+              class="grid size-6 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-coral disabled:opacity-30"
+              :disabled="branchSelecting || !selectedBranchNode"
+              title="Use previewed branch"
+              aria-label="Use previewed branch"
+              @click="confirmBranchSelection"
+            >
+              <Check class="size-3.5" aria-hidden="true" />
+            </button>
+            <button
+              class="grid size-6 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300 disabled:opacity-30"
+              :disabled="branchSelecting"
+              title="Cancel branch preview"
+              aria-label="Cancel branch preview"
+              @click="cancelBranchNavigator"
+            >
+              <X class="size-3.5" aria-hidden="true" />
+            </button>
+          </header>
+          <div class="min-h-0 flex-1 overflow-auto">
+            <div
+              class="relative min-h-full min-w-full"
+              :style="{
+                width: `${Math.max(branchLayout.width, 112)}px`,
+                height: `${branchLayout.height}px`
+              }"
+            >
+              <svg
+                class="pointer-events-none absolute inset-0 overflow-visible"
+                :width="Math.max(branchLayout.width, 112)"
+                :height="branchLayout.height"
+                aria-hidden="true"
+              >
+                <path
+                  v-for="edge in branchLayout.edges"
+                  :key="`${edge.parent.id}-${edge.child.id}`"
+                  :d="branchEdgePath(edge)"
+                  class="branch-edge"
+                  :class="branchEdgeClasses(edge)"
+                />
+              </svg>
+              <button
+                v-for="(node, index) in branchLayout.nodes"
+                :key="node.id"
+                type="button"
+                class="branch-node"
+                :class="branchNodeClasses(node)"
+                :style="{
+                  left: `${node.x}px`,
+                  top: `${node.y}px`
+                }"
+                :disabled="branchSelecting"
+                :aria-label="`Preview conversation from message ${index + 1}`"
+                :aria-current="selectedBranchNode === node.id ? 'true' : undefined"
+                :title="`Preview from message ${index + 1}`"
+                @click="previewBranch(node.id)"
+              />
+            </div>
+          </div>
+          <p class="shrink-0 px-2 py-2 text-[8px] leading-3 text-zinc-700">
+            Select a node to preview. ✓ keeps it; Esc restores the original.
+          </p>
+        </aside>
+      </div>
+
       <div class="shrink-0 bg-gradient-to-t from-ink via-ink to-transparent px-3 pb-3 pt-6 sm:px-6">
         <div class="mx-auto max-w-3xl">
           <div
@@ -2784,7 +3051,8 @@ onBeforeUnmount(() => {
                 ref="composer"
                 v-model="draft"
                 rows="1"
-                class="max-h-48 min-h-11 w-full resize-none bg-transparent px-3 py-3 text-sm leading-5 text-zinc-200 outline-none placeholder:text-zinc-700"
+                class="max-h-48 min-h-11 w-full resize-none bg-transparent px-3 py-3 text-sm leading-5 text-zinc-200 outline-none placeholder:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+                :disabled="branchesOpen"
                 placeholder="Message CodeCrab…"
                 aria-label="Message CodeCrab"
                 :aria-activedescendant="
@@ -2814,7 +3082,7 @@ onBeforeUnmount(() => {
                         ? 'animate-pulse bg-red-500/15 text-red-400 hover:bg-red-500/25'
                         : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-200'
                     "
-                    :disabled="transcribing || !dictationAvailable"
+                    :disabled="branchesOpen || transcribing || !dictationAvailable"
                     :title="
                       dictationAvailable
                         ? recording
@@ -2835,7 +3103,9 @@ onBeforeUnmount(() => {
                   <button
                     class="grid size-7 place-items-center rounded-md bg-zinc-100 text-sm text-zinc-950 transition hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-600"
                     :disabled="
-                      recording
+                      branchesOpen
+                        ? true
+                        : recording
                         ? false
                         : sending
                         ? cancelling
