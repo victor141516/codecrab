@@ -1,16 +1,21 @@
 #![warn(unreachable_pub)]
 
 mod agent;
+mod audio;
 mod auth;
+mod completion;
 mod config;
 mod events;
+mod http_debug;
 mod provider;
+mod server;
 mod session;
 mod skills;
 mod tools;
+mod transcription;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,11 +23,11 @@ use clap::{Parser, Subcommand};
 use crate::{
     agent::Agent,
     auth::OAuthStore,
-    config::Config,
+    config::{Config, SessionRegistry},
     provider::OpenAiCompatible,
-    session::SessionStore,
+    session::{SessionStore, list_session_projects, resolve_global_session},
     skills::SkillRegistry,
-    tools::{ApprovalMode, ToolBox},
+    tools::ToolBox,
 };
 
 #[derive(Parser)]
@@ -44,9 +49,9 @@ struct Cli {
     #[arg(long, global = true)]
     base_url: Option<String>,
 
-    /// Approve all file mutations and shell commands.
-    #[arg(short = 'y', long, global = true)]
-    yes: bool,
+    /// Print complete OpenAI HTTP requests and responses to stderr, including credentials.
+    #[arg(long, global = true)]
+    debug_openai: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -69,12 +74,21 @@ enum Command {
         /// Session id or an unambiguous prefix. Omit for the latest session.
         id: Option<String>,
     },
-    /// List saved sessions for this project.
+    /// List saved sessions across every registered project.
     Sessions,
     /// List available project and user skills.
     Skills,
     /// Print the effective configuration (secrets are omitted).
     Config,
+    /// Serve the embedded web application and agent API.
+    Serve {
+        /// Interface to listen on.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port. Use 0 to select an available port.
+        #[arg(long, default_value_t = 4096)]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -99,7 +113,8 @@ async fn main() -> Result<()> {
     config.apply_cli(cli.model, cli.base_url);
 
     if let Some(Command::Auth { command }) = &cli.command {
-        let auth = OAuthStore::new()?;
+        let mut auth = OAuthStore::new()?;
+        auth.set_debug_openai(cli.debug_openai);
         match command {
             AuthCommand::Login => {
                 let identity = auth.login().await?;
@@ -145,10 +160,11 @@ async fn main() -> Result<()> {
 
     let store = SessionStore::new(&root)?;
     let skills = SkillRegistry::discover(&root);
+    let registry = SessionRegistry::global();
 
     match cli.command {
         Some(Command::Sessions) => {
-            ui::print_sessions(&store.list()?);
+            ui::print_sessions(&list_session_projects(&root, &registry)?);
             return Ok(());
         }
         Some(Command::Skills) => {
@@ -156,7 +172,15 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Config) => {
-            println!("{}", toml::to_string_pretty(&config.public_view())?);
+            let contents = toml::to_string_pretty(&config.public_view())?;
+            println!(
+                "{}",
+                format_config_output(Config::file_path().as_deref(), &contents)
+            );
+            return Ok(());
+        }
+        Some(Command::Serve { host, port }) => {
+            server::serve(root, config, host, port, cli.debug_openai).await?;
             return Ok(());
         }
         Some(Command::Auth { .. }) => unreachable!("auth commands return before session setup"),
@@ -165,15 +189,8 @@ async fn main() -> Result<()> {
             if prompt.trim().is_empty() {
                 anyhow::bail!("prompt is empty");
             }
-            let provider = OpenAiCompatible::new(&config)?;
-            let tools = ToolBox::new(
-                root.clone(),
-                if cli.yes {
-                    ApprovalMode::Always
-                } else {
-                    ApprovalMode::Never
-                },
-            );
+            let provider = new_provider(&config, cli.debug_openai)?;
+            let tools = ToolBox::new(root.clone());
             let mut agent =
                 Agent::new(provider, tools, skills, store.create(config.model.clone())?)?;
             match agent.fetch_models().await {
@@ -188,39 +205,40 @@ async fn main() -> Result<()> {
             let answer = agent.turn(prompt.trim()).await?;
             println!("{answer}");
             store.save(agent.session())?;
+            registry.register(&root)?;
             return Ok(());
         }
         Some(Command::Resume { id }) => {
-            let session = store.load(id.as_deref())?;
-            let provider = OpenAiCompatible::new(&config)?;
-            let tools = ToolBox::new(
-                root,
-                if cli.yes {
-                    ApprovalMode::Always
-                } else {
-                    ApprovalMode::Ask
-                },
-            );
-            let agent = Agent::new(provider, tools, skills, session)?;
-            ui::interactive(agent, &store).await?;
+            let projects = list_session_projects(&root, &registry)?;
+            let (session_root, session_id) = resolve_global_session(&projects, id.as_deref())?;
+            let session_store = SessionStore::new(&session_root)?;
+            let session = session_store.load(Some(&session_id.to_string()))?;
+            let provider = new_provider(&config, cli.debug_openai)?;
+            let tools = ToolBox::new(session_root.clone());
+            let agent = Agent::new(
+                provider,
+                tools,
+                SkillRegistry::discover(&session_root),
+                session,
+            )?;
+            ui::interactive(agent, &registry, cli.debug_openai).await?;
         }
         None => {
-            let provider = OpenAiCompatible::new(&config)?;
-            let tools = ToolBox::new(
-                root,
-                if cli.yes {
-                    ApprovalMode::Always
-                } else {
-                    ApprovalMode::Ask
-                },
-            );
+            let provider = new_provider(&config, cli.debug_openai)?;
+            let tools = ToolBox::new(root);
             let session = store.create(config.model.clone())?;
             let agent = Agent::new(provider, tools, skills, session)?;
-            ui::interactive(agent, &store).await?;
+            ui::interactive(agent, &registry, cli.debug_openai).await?;
         }
     }
 
     Ok(())
+}
+
+fn new_provider(config: &Config, debug_openai: bool) -> Result<OpenAiCompatible> {
+    let mut provider = OpenAiCompatible::new(config)?;
+    provider.set_debug_openai(debug_openai);
+    Ok(provider)
 }
 
 fn one_shot_prompt(prompt: Option<String>) -> Result<String> {
@@ -243,4 +261,30 @@ fn one_shot_prompt(prompt: Option<String>) -> Result<String> {
         }
         (None, input) => input.to_owned(),
     })
+}
+
+fn format_config_output(path: Option<&Path>, contents: &str) -> String {
+    let path = path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "(platform configuration path unavailable)".into());
+    format!(
+        "Configuration file path:\n{path}\n\nEffective configuration content:\n{}",
+        contents.trim_end()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_output_separates_the_file_path_from_effective_content() {
+        let output = format_config_output(
+            Some(Path::new("/config/codecrab/config.toml")),
+            "model = \"auto\"\n",
+        );
+
+        assert!(output.starts_with("Configuration file path:\n/config/codecrab/config.toml\n\n"));
+        assert!(output.contains("Effective configuration content:\nmodel = \"auto\""));
+    }
 }

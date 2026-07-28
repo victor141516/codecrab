@@ -1,4 +1,6 @@
 /target
 /.codecrab/
+/web/dist/
+/web/node_modules/
 *.swp
 *.tmp

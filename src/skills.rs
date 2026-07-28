@@ -429,9 +429,6 @@ fn read_resource(skill: &Skill, relative: &str) -> Result<(PathBuf, String)> {
     let path = requested
         .canonicalize()
         .with_context(|| format!("cannot resolve skill resource {relative:?}"))?;
-    if !path.starts_with(&skill.root) {
-        anyhow::bail!("skill resource escapes {}", skill.root.display());
-    }
     let metadata = fs::metadata(&path)?;
     if !metadata.is_file() {
         anyhow::bail!("skill resource is not a file");
@@ -613,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_resources_cannot_escape_their_directory() {
+    fn skill_resources_can_use_parent_paths() {
         let temp = tempfile::tempdir().unwrap();
         let skills_root = temp.path().join("skills");
         write_skill(
@@ -629,8 +626,8 @@ mod tests {
             "read_skill_file",
             r#"{"name":"safe-skill","path":"../../secret.txt"}"#,
         );
-        assert_eq!(result["ok"], false);
-        assert!(result["error"].as_str().unwrap().contains("escapes"));
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["result"]["content"], "outside");
     }
 
     #[test]

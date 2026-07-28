@@ -1,15 +1,16 @@
 use std::{
-    fs,
     io::{self, Stdout},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -22,62 +23,49 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet},
+    parsing::SyntaxSet,
+};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, watch},
     task::JoinHandle,
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    agent::Agent,
-    events::AgentEvent,
+    agent::{Agent, turn_was_cancelled},
+    audio::AudioRecording,
+    completion::{
+        CompletionKind, CompletionMenu, builtin_command_from_input, complete as complete_input,
+        goal_objective_from_input,
+    },
+    config::{SessionRegistry, normalized_root, paths_equal},
+    events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{Message, ModelCatalogEntry, ModelSelection, Role},
-    session::{SessionStore, SessionSummary},
+    session::{Goal, GoalStatus, SessionProject, SessionStore, list_session_projects},
+    transcription::Transcriber,
 };
+use uuid::Uuid;
 
 const CRAB: Color = Color::Rgb(244, 99, 86);
 const AQUA: Color = Color::Rgb(74, 210, 200);
+const GOAL: Color = Color::Rgb(190, 150, 255);
 const MUTED: Color = Color::Rgb(125, 135, 150);
+const MARKDOWN_H1: Color = Color::Rgb(255, 179, 71);
+const MARKDOWN_HEADING: Color = Color::Rgb(92, 207, 230);
+const MARKDOWN_BOLD: Color = Color::Rgb(255, 214, 102);
+const MARKDOWN_ITALIC: Color = Color::Rgb(190, 150, 255);
+const MARKDOWN_CODE: Color = Color::Rgb(126, 216, 160);
+const MARKDOWN_LIST: Color = Color::Rgb(244, 99, 86);
+const MARKDOWN_LINK: Color = Color::Rgb(100, 180, 255);
+const MARKDOWN_FENCE: Color = Color::Rgb(105, 115, 130);
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const COMMANDS: &[(&str, &str)] = &[
-    ("help", "Open keyboard and command help"),
-    ("model", "Choose model, reasoning, and speed"),
-    ("models", "Alias for /model"),
-    ("skills", "Open the interactive skill picker"),
-    ("clear", "Clear the conversation context"),
-    ("quit", "Save the session and exit"),
-];
-
-struct ApprovalPrompt {
-    action: String,
-    response: oneshot::Sender<bool>,
-}
-
 struct SkillView {
     name: String,
     description: String,
     scope: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompletionKind {
-    Command,
-    Skill,
-    File,
-    Directory,
-}
-
-struct CompletionItem {
-    name: String,
-    description: String,
-    icon: Option<&'static str>,
-    kind: CompletionKind,
-}
-
-struct CompletionMenu {
-    items: Vec<CompletionItem>,
-    selected: usize,
-    token_start: usize,
-    token_end: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,16 +83,560 @@ struct ModelPicker {
     service_tier: Option<String>,
 }
 
+struct SessionPicker {
+    projects: Vec<SessionProjectView>,
+    selected: usize,
+}
+
+struct GoalPicker {
+    selected: usize,
+    describing: bool,
+    description_scroll: u16,
+}
+
+enum PendingGoalAction {
+    Create(String),
+    Toggle(Uuid),
+    Pause(Uuid),
+    Delete(Uuid),
+    BeginEdit(Uuid),
+}
+
+#[derive(Default)]
+struct GoalButtons {
+    toggle: Option<Rect>,
+    edit: Option<Rect>,
+    delete: Option<Rect>,
+    list: Option<Rect>,
+}
+
+struct SessionProjectView {
+    project: SessionProject,
+    expanded: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SessionPickerRow {
+    Project(usize),
+    Session(usize, usize),
+}
+
+#[derive(Clone)]
+struct SourceRange {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
+struct CopyTarget {
+    ranges: Vec<SourceRange>,
+    text: String,
+}
+
+struct ConversationSource {
+    lines: Vec<Line<'static>>,
+    copy_targets: Vec<CopyTarget>,
+}
+
+#[derive(Clone)]
+struct VisualUnit {
+    text: String,
+    width: u16,
+    style: Style,
+    source_line: usize,
+    source_start: usize,
+    source_end: usize,
+}
+
+#[derive(Clone, Default)]
+struct VisualRow {
+    source_line: usize,
+    units: Vec<VisualUnit>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TextPoint {
+    row: usize,
+    unit: usize,
+}
+
+struct ConversationView {
+    area: Rect,
+    rows: Vec<VisualRow>,
+    scroll: usize,
+    copy_targets: Vec<CopyTarget>,
+}
+
+impl ConversationView {
+    fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.area.x
+            && column < self.area.right()
+            && row >= self.area.y
+            && row < self.area.bottom()
+    }
+
+    fn point_at(&self, column: u16, row: u16, clamp_vertical: bool) -> Option<TextPoint> {
+        if self.rows.is_empty() || column < self.area.x || column >= self.area.right() {
+            return None;
+        }
+        let viewport_row = if clamp_vertical {
+            row.saturating_sub(self.area.y)
+                .min(self.area.height.saturating_sub(1))
+        } else {
+            if !self.contains(column, row) {
+                return None;
+            }
+            row - self.area.y
+        };
+        let row_index = (self.scroll + viewport_row as usize).min(self.rows.len() - 1);
+        let units = &self.rows[row_index].units;
+        if units.is_empty() {
+            return Some(TextPoint {
+                row: row_index,
+                unit: 0,
+            });
+        }
+        let target_column = column.saturating_sub(self.area.x);
+        let mut current = 0;
+        for (unit, value) in units.iter().enumerate() {
+            if target_column < current + value.width.max(1) {
+                return Some(TextPoint {
+                    row: row_index,
+                    unit,
+                });
+            }
+            current += value.width;
+        }
+        Some(TextPoint {
+            row: row_index,
+            unit: units.len() - 1,
+        })
+    }
+
+    fn copy_target_at(&self, point: TextPoint) -> Option<&CopyTarget> {
+        let unit = self.rows.get(point.row)?.units.get(point.unit)?;
+        self.copy_targets.iter().find(|target| {
+            target.ranges.iter().any(|range| {
+                range.line == unit.source_line
+                    && unit.source_start < range.end
+                    && unit.source_end > range.start
+            })
+        })
+    }
+
+    fn selected_text(&self, selection: &TextSelection) -> String {
+        let (start, end) = selection.normalized();
+        let mut output = String::new();
+        for row_index in start.row..=end.row {
+            if row_index > start.row
+                && self.rows.get(row_index - 1).map(|row| row.source_line)
+                    != self.rows.get(row_index).map(|row| row.source_line)
+            {
+                output.push('\n');
+            }
+            let Some(row) = self.rows.get(row_index) else {
+                continue;
+            };
+            if row.units.is_empty() {
+                continue;
+            }
+            let first = if row_index == start.row {
+                start.unit.min(row.units.len() - 1)
+            } else {
+                0
+            };
+            let last = if row_index == end.row {
+                end.unit.min(row.units.len() - 1)
+            } else {
+                row.units.len() - 1
+            };
+            for unit in &row.units[first..=last] {
+                output.push_str(&unit.text);
+            }
+        }
+        output
+    }
+}
+
+struct TextSelection {
+    anchor: TextPoint,
+    cursor: TextPoint,
+    dragging: bool,
+    moved: bool,
+    last_column: u16,
+    last_row: u16,
+}
+
+impl TextSelection {
+    fn normalized(&self) -> (TextPoint, TextPoint) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    fn contains(&self, point: TextPoint) -> bool {
+        let (start, end) = self.normalized();
+        point >= start && point <= end
+    }
+}
+
+struct CopyFlash {
+    ranges: Vec<SourceRange>,
+    until: Instant,
+}
+
+struct MarkdownHighlighter {
+    syntaxes: SyntaxSet,
+    theme: Theme,
+}
+
+impl MarkdownHighlighter {
+    fn new() -> Self {
+        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let themes = ThemeSet::load_defaults();
+        let theme = themes
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| themes.themes.values().next())
+            .expect("syntect ships at least one default theme")
+            .clone();
+        Self { syntaxes, theme }
+    }
+
+    fn render(&self, markdown: &str) -> Vec<Line<'static>> {
+        let lines = markdown.lines().collect::<Vec<_>>();
+        let mut rendered = Vec::with_capacity(lines.len());
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            let Some(language) = markdown_fence_language(line) else {
+                rendered.push(markdown_inline_line(line));
+                index += 1;
+                continue;
+            };
+
+            rendered.push(markdown_fence_line(line));
+            index += 1;
+            let syntax = self
+                .syntaxes
+                .find_syntax_by_token(language)
+                .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+            let mut highlighter = HighlightLines::new(syntax, &self.theme);
+            while index < lines.len() && !markdown_fence_closes(lines[index]) {
+                rendered.push(self.highlight_code_line(&mut highlighter, lines[index]));
+                index += 1;
+            }
+            if index < lines.len() {
+                rendered.push(markdown_fence_line(lines[index]));
+                index += 1;
+            }
+        }
+        rendered
+    }
+
+    fn highlight_code_line(
+        &self,
+        highlighter: &mut HighlightLines<'_>,
+        line: &str,
+    ) -> Line<'static> {
+        let with_newline = format!("{line}\n");
+        let Ok(regions) = highlighter.highlight_line(&with_newline, &self.syntaxes) else {
+            return Line::from(Span::styled(line.to_owned(), markdown_code_style()));
+        };
+        let mut remaining = line.len();
+        let mut spans = Vec::new();
+        for (style, text) in regions {
+            if remaining == 0 {
+                break;
+            }
+            let take = text.len().min(remaining);
+            if take > 0 {
+                spans.push(Span::styled(
+                    text[..take].to_owned(),
+                    ratatui_style_from_syntect(style),
+                ));
+                remaining -= take;
+            }
+        }
+        Line::from(spans)
+    }
+}
+
+fn shared_markdown_highlighter() -> Arc<MarkdownHighlighter> {
+    static HIGHLIGHTER: OnceLock<Arc<MarkdownHighlighter>> = OnceLock::new();
+    HIGHLIGHTER
+        .get_or_init(|| Arc::new(MarkdownHighlighter::new()))
+        .clone()
+}
+
+fn markdown_fence_language(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    trimmed.strip_prefix("```").map(|language| language.trim())
+}
+
+fn markdown_fence_closes(line: &str) -> bool {
+    line.trim_start().starts_with("```")
+}
+
+fn markdown_fence_line(line: &str) -> Line<'static> {
+    let Some(marker_start) = line.find("```") else {
+        return Line::from(line.to_owned());
+    };
+    let marker_end = marker_start + 3;
+    let mut spans = Vec::new();
+    if marker_start > 0 {
+        spans.push(Span::raw(line[..marker_start].to_owned()));
+    }
+    spans.push(Span::styled(
+        line[marker_start..marker_end].to_owned(),
+        Style::default().fg(MARKDOWN_FENCE),
+    ));
+    if marker_end < line.len() {
+        spans.push(Span::styled(
+            line[marker_end..].to_owned(),
+            Style::default()
+                .fg(MARKDOWN_CODE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn markdown_inline_line(line: &str) -> Line<'static> {
+    if let Some(level) = markdown_heading_level(line) {
+        let color = if level == 1 {
+            MARKDOWN_H1
+        } else {
+            MARKDOWN_HEADING
+        };
+        return Line::from(Span::styled(
+            line.to_owned(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let marker = markdown_list_marker(line).or_else(|| markdown_quote_marker(line));
+    let Some((start, end)) = marker else {
+        return Line::from(markdown_inline_spans(line));
+    };
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::raw(line[..start].to_owned()));
+    }
+    spans.push(Span::styled(
+        line[start..end].to_owned(),
+        Style::default()
+            .fg(MARKDOWN_LIST)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.extend(markdown_inline_spans(&line[end..]));
+    Line::from(spans)
+}
+
+fn markdown_heading_level(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    (level > 0
+        && level <= 6
+        && trimmed
+            .as_bytes()
+            .get(level)
+            .is_some_and(u8::is_ascii_whitespace))
+    .then_some(level)
+}
+
+fn markdown_list_marker(line: &str) -> Option<(usize, usize)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    let rest = &line[indent..];
+    if rest.starts_with("- ") || rest.starts_with("+ ") || rest.starts_with("* ") {
+        return Some((indent, indent + 1));
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0
+        && rest
+            .as_bytes()
+            .get(digits)
+            .is_some_and(|byte| matches!(byte, b'.' | b')'))
+        && rest
+            .as_bytes()
+            .get(digits + 1)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return Some((indent, indent + digits + 1));
+    }
+    None
+}
+
+fn markdown_quote_marker(line: &str) -> Option<(usize, usize)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    line.as_bytes()
+        .get(indent)
+        .is_some_and(|byte| *byte == b'>')
+        .then_some((indent, indent + 1))
+}
+
+fn markdown_inline_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain_start = 0;
+    let mut index = 0;
+    while index < text.len() {
+        let match_result = markdown_inline_match(text, index);
+        let Some((end, style)) = match_result else {
+            index += text[index..].chars().next().unwrap().len_utf8();
+            continue;
+        };
+        if plain_start < index {
+            spans.push(Span::raw(text[plain_start..index].to_owned()));
+        }
+        spans.push(Span::styled(text[index..end].to_owned(), style));
+        index = end;
+        plain_start = end;
+    }
+    if plain_start < text.len() {
+        spans.push(Span::raw(text[plain_start..].to_owned()));
+    }
+    spans
+}
+
+fn markdown_inline_match(text: &str, index: usize) -> Option<(usize, Style)> {
+    if index > 0 && text.as_bytes().get(index - 1) == Some(&b'\\') {
+        return None;
+    }
+    let rest = &text[index..];
+    if rest.starts_with('`') && !rest.starts_with("```") {
+        return markdown_delimited_end(rest, "`")
+            .map(|end| (index + end, Style::default().fg(MARKDOWN_CODE)));
+    }
+    for marker in ["**", "__"] {
+        if rest.starts_with(marker) {
+            return markdown_delimited_end(rest, marker).map(|end| {
+                (
+                    index + end,
+                    Style::default()
+                        .fg(MARKDOWN_BOLD)
+                        .add_modifier(Modifier::BOLD),
+                )
+            });
+        }
+    }
+    for marker in ["*", "_"] {
+        if rest.starts_with(marker) && !rest.starts_with(&marker.repeat(2)) {
+            return markdown_delimited_end(rest, marker).map(|end| {
+                (
+                    index + end,
+                    Style::default()
+                        .fg(MARKDOWN_ITALIC)
+                        .add_modifier(Modifier::ITALIC),
+                )
+            });
+        }
+    }
+    if rest.starts_with('[')
+        && let Some(label_end) = rest.find("](")
+        && let Some(url_end) = rest[label_end + 2..].find(')')
+    {
+        return Some((
+            index + label_end + 2 + url_end + 1,
+            Style::default()
+                .fg(MARKDOWN_LINK)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+    }
+    None
+}
+
+fn markdown_delimited_end(text: &str, marker: &str) -> Option<usize> {
+    let content_start = marker.len();
+    let closing = text[content_start..].find(marker)? + content_start;
+    (closing > content_start).then_some(closing + marker.len())
+}
+
+fn markdown_code_style() -> Style {
+    Style::default().fg(MARKDOWN_CODE)
+}
+
+fn ratatui_style_from_syntect(style: SyntectStyle) -> Style {
+    let mut output = Style::default().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+    if style.font_style.contains(FontStyle::BOLD) {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        output = output.add_modifier(Modifier::UNDERLINED);
+    }
+    output
+}
+
+impl SessionPicker {
+    fn rows(&self) -> Vec<SessionPickerRow> {
+        let mut rows = Vec::new();
+        for (project_index, project) in self.projects.iter().enumerate() {
+            rows.push(SessionPickerRow::Project(project_index));
+            if project.expanded {
+                rows.extend(
+                    (0..project.project.sessions.len()).map(|session_index| {
+                        SessionPickerRow::Session(project_index, session_index)
+                    }),
+                );
+            }
+        }
+        rows
+    }
+
+    fn selected_row(&self) -> Option<SessionPickerRow> {
+        self.rows().get(self.selected).copied()
+    }
+
+    fn select_project(&mut self, project_index: usize) {
+        if let Some(index) = self.rows().iter().position(
+            |row| matches!(row, SessionPickerRow::Project(index) if *index == project_index),
+        ) {
+            self.selected = index;
+        }
+    }
+}
+
 struct App {
     agent: Option<Agent>,
     transcript: Vec<Message>,
+    live_messages: Vec<Message>,
+    activities: Vec<AgentActivity>,
     running: Option<JoinHandle<(Agent, Result<String>)>>,
     event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
-    approval: Option<ApprovalPrompt>,
+    recording: Option<AudioRecording>,
+    transcription: Option<JoinHandle<Result<String>>>,
+    debug_openai: bool,
+    clipboard: Option<arboard::Clipboard>,
+    markdown: Arc<MarkdownHighlighter>,
     input: String,
     cursor: usize,
     preferred_column: Option<usize>,
     pending_user: Option<String>,
+    queued_prompt: Option<String>,
+    goals: Vec<Goal>,
+    visible_goal_id: Option<Uuid>,
+    goal_picker: Option<GoalPicker>,
+    pending_goal_action: Option<PendingGoalAction>,
+    editing_goal_id: Option<Uuid>,
+    editing_goal_resume: bool,
+    goal_buttons: GoalButtons,
+    cancel_tx: Option<watch::Sender<bool>>,
+    last_escape: Option<Instant>,
+    steer_button: Option<Rect>,
+    conversation_view: Option<ConversationView>,
+    text_selection: Option<TextSelection>,
+    copy_flash: Option<CopyFlash>,
     error: Option<String>,
     scroll: u16,
     max_scroll: u16,
@@ -116,6 +648,7 @@ struct App {
     completion: Option<CompletionMenu>,
     model_catalog: Vec<ModelCatalogEntry>,
     model_picker: Option<ModelPicker>,
+    session_picker: Option<SessionPicker>,
     should_quit: bool,
     project: String,
     project_root: PathBuf,
@@ -130,6 +663,7 @@ impl App {
         agent: Agent,
         model_catalog: Vec<ModelCatalogEntry>,
         catalog_error: Option<String>,
+        debug_openai: bool,
     ) -> Self {
         let project_root = agent.project_root().to_path_buf();
         let project = project_root.display().to_string();
@@ -146,19 +680,42 @@ impl App {
             })
             .collect::<Vec<_>>();
         let transcript = agent.session().messages.clone();
+        let activities = agent.session().activities.clone();
+        let goals = agent.session().goals.clone();
+        let visible_goal_id = agent.session().visible_goal_id;
         let initial_error = catalog_error
             .as_ref()
             .map(|error| format!("Could not load the model catalog: {error}"));
         Self {
             agent: Some(agent),
             transcript,
+            live_messages: Vec::new(),
+            activities,
             running: None,
             event_rx: None,
-            approval: None,
+            recording: None,
+            transcription: None,
+            debug_openai,
+            clipboard: arboard::Clipboard::new().ok(),
+            markdown: shared_markdown_highlighter(),
             input: String::new(),
             cursor: 0,
             preferred_column: None,
             pending_user: None,
+            queued_prompt: None,
+            goals,
+            visible_goal_id,
+            goal_picker: None,
+            pending_goal_action: None,
+            editing_goal_id: None,
+            editing_goal_resume: false,
+            goal_buttons: GoalButtons::default(),
+            cancel_tx: None,
+            last_escape: None,
+            steer_button: None,
+            conversation_view: None,
+            text_selection: None,
+            copy_flash: None,
             error: initial_error,
             scroll: 0,
             max_scroll: 0,
@@ -170,6 +727,7 @@ impl App {
             completion: None,
             model_catalog,
             model_picker: None,
+            session_picker: None,
             should_quit: false,
             project,
             project_root,
@@ -184,8 +742,16 @@ impl App {
         self.running.is_some()
     }
 
+    fn is_busy(&self) -> bool {
+        self.is_running() || self.recording.is_some() || self.transcription.is_some()
+    }
+
     fn status(&self) -> String {
-        if self.is_running() {
+        if self.recording.is_some() {
+            "● recording".into()
+        } else if self.transcription.is_some() {
+            format!("{} transcribing", SPINNER[self.spinner % SPINNER.len()])
+        } else if self.is_running() {
             format!("{} working", SPINNER[self.spinner % SPINNER.len()])
         } else {
             "● ready".into()
@@ -215,6 +781,68 @@ impl App {
         self.cursor += value.len_utf8();
         self.preferred_column = None;
         self.refresh_completion();
+    }
+
+    fn insert_transcript(&mut self, transcript: &str) {
+        let leading_space = self.cursor > 0
+            && !self.input[..self.cursor]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        let trailing_space = self.cursor < self.input.len()
+            && !self.input[self.cursor..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
+        let mut insertion = String::new();
+        if leading_space {
+            insertion.push(' ');
+        }
+        insertion.push_str(transcript.trim());
+        if trailing_space {
+            insertion.push(' ');
+        }
+        self.insert(&insertion);
+        self.completion = None;
+    }
+
+    fn toggle_dictation(&mut self) -> Result<()> {
+        if self.transcription.is_some() {
+            return Ok(());
+        }
+        if let Some(recording) = self.recording.take() {
+            let audio = recording.finish()?;
+            let debug_openai = self.debug_openai;
+            self.transcription = Some(tokio::spawn(async move {
+                Transcriber::new(debug_openai)?
+                    .transcribe(audio, "audio/wav")
+                    .await
+            }));
+        } else {
+            self.error = None;
+            self.completion = None;
+            self.recording = Some(AudioRecording::start()?);
+        }
+        Ok(())
+    }
+
+    async fn finish_transcription_if_ready(&mut self) -> Result<()> {
+        if !self
+            .transcription
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return Ok(());
+        }
+        let task = self.transcription.take().expect("checked above");
+        match task.await.context("dictation task failed")? {
+            Ok(transcript) => {
+                self.insert_transcript(&transcript);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("Dictation failed: {error:#}")),
+        }
+        Ok(())
     }
 
     fn backspace(&mut self) {
@@ -297,76 +925,25 @@ impl App {
                 .get(menu.selected)
                 .map(|item| (item.kind, item.name.clone()))
         });
-        if let Some(context) = file_completion_context(&self.input, self.cursor, &self.project_root)
-        {
-            let items = file_completion_items(&context);
-            if items.is_empty() {
-                self.completion = None;
-                return;
-            }
-            let selected = previous
-                .and_then(|key| {
-                    items
-                        .iter()
-                        .position(|item| (item.kind, item.name.clone()) == key)
-                })
-                .unwrap_or(0);
-            self.completion = Some(CompletionMenu {
-                items,
-                selected,
-                token_start: context.start,
-                token_end: context.end,
-            });
-            return;
-        }
-
-        let Some(context) = slash_completion_context(&self.input, self.cursor) else {
+        let Some(mut menu) = complete_input(
+            &self.input,
+            self.cursor,
+            &self.project_root,
+            self.skills
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill.description.as_str())),
+        ) else {
             self.completion = None;
             return;
         };
-
-        let mut items = Vec::new();
-        if context.commands_allowed {
-            items.extend(
-                COMMANDS
-                    .iter()
-                    .filter(|(name, _)| name.starts_with(context.prefix))
-                    .map(|(name, description)| CompletionItem {
-                        name: (*name).to_owned(),
-                        description: (*description).to_owned(),
-                        icon: None,
-                        kind: CompletionKind::Command,
-                    }),
-            );
-        }
-        items.extend(
-            self.skills
-                .iter()
-                .filter(|skill| skill.name.starts_with(context.prefix))
-                .map(|skill| CompletionItem {
-                    name: skill.name.clone(),
-                    description: skill.description.clone(),
-                    icon: None,
-                    kind: CompletionKind::Skill,
-                }),
-        );
-        if items.is_empty() {
-            self.completion = None;
-            return;
-        }
-        let selected = previous
+        menu.selected = previous
             .and_then(|key| {
-                items
+                menu.items
                     .iter()
                     .position(|item| (item.kind, item.name.clone()) == key)
             })
             .unwrap_or(0);
-        self.completion = Some(CompletionMenu {
-            items,
-            selected,
-            token_start: context.start,
-            token_end: context.end,
-        });
+        self.completion = Some(menu);
     }
 
     fn move_completion(&mut self, delta: isize) {
@@ -384,25 +961,12 @@ impl App {
         let Some(item) = menu.items.get(menu.selected) else {
             return false;
         };
-        let replacement = match item.kind {
-            CompletionKind::Command | CompletionKind::Skill => format!("/{}", item.name),
-            CompletionKind::File | CompletionKind::Directory => format!("@{}", item.name),
-        };
         self.input
-            .replace_range(menu.token_start..menu.token_end, &replacement);
-        self.cursor = menu.token_start + replacement.len();
-        match item.kind {
-            CompletionKind::Skill | CompletionKind::File => {
-                self.input.insert(self.cursor, ' ');
-                self.cursor += 1;
-            }
-            CompletionKind::Directory => {
-                self.input.insert(self.cursor, '/');
-                self.cursor += 1;
-                self.refresh_completion();
-                return true;
-            }
-            CompletionKind::Command => {}
+            .replace_range(menu.token_start..menu.token_end, &item.replacement);
+        self.cursor = menu.token_start + item.replacement.len();
+        if item.kind == CompletionKind::Directory {
+            self.refresh_completion();
+            return true;
         }
         self.preferred_column = None;
         true
@@ -530,7 +1094,9 @@ impl App {
         }
     }
 
-    fn accept_model_selection(&mut self, store: &SessionStore) -> Result<()> {
+    fn accept_model_selection(&mut self, registry: &SessionRegistry) -> Result<()> {
+        let store = self.current_store()?;
+        let root = self.project_root.clone();
         let Some(picker) = &mut self.model_picker else {
             return Ok(());
         };
@@ -601,6 +1167,7 @@ impl App {
                 if let Some(agent) = &mut self.agent {
                     agent.set_model_selection(selection.clone());
                     store.save(agent.session())?;
+                    registry.register(&root)?;
                 }
                 self.model.clone_from(&selection.model);
                 self.reasoning_effort
@@ -610,6 +1177,425 @@ impl App {
                 self.model_picker = None;
             }
         }
+        Ok(())
+    }
+
+    fn current_store(&self) -> Result<SessionStore> {
+        SessionStore::new(&self.project_root)
+    }
+
+    fn save_active_session(&self, registry: &SessionRegistry) -> Result<()> {
+        let agent = self.agent.as_ref().context("agent is unavailable")?;
+        self.current_store()?.save(agent.session())?;
+        registry.register(&self.project_root)
+    }
+
+    fn sync_goals_from_agent(&mut self) {
+        if let Some(agent) = &self.agent {
+            self.goals.clone_from(&agent.session().goals);
+            self.visible_goal_id = agent.session().visible_goal_id;
+        }
+    }
+
+    fn visible_goal(&self) -> Option<&Goal> {
+        self.visible_goal_id
+            .and_then(|id| self.goals.iter().find(|goal| goal.id == id))
+    }
+
+    fn active_goal_id(&self) -> Option<Uuid> {
+        self.goals
+            .iter()
+            .find(|goal| goal.status == GoalStatus::Active)
+            .map(|goal| goal.id)
+    }
+
+    fn request_goal_action(&mut self, action: PendingGoalAction) {
+        self.pending_goal_action = Some(action);
+        if self.is_running() {
+            self.cancel_current_turn();
+        }
+    }
+
+    fn request_stop(&mut self) {
+        if let Some(id) = self.active_goal_id() {
+            self.pending_goal_action = Some(PendingGoalAction::Pause(id));
+        }
+        self.cancel_current_turn();
+    }
+
+    fn open_goal_picker(&mut self) {
+        let selected = self
+            .visible_goal_id
+            .and_then(|id| self.goals.iter().position(|goal| goal.id == id))
+            .unwrap_or(0);
+        self.goal_picker = Some(GoalPicker {
+            selected,
+            describing: false,
+            description_scroll: 0,
+        });
+        self.show_help = false;
+        self.show_skills = false;
+        self.model_picker = None;
+        self.session_picker = None;
+        self.completion = None;
+    }
+
+    fn move_goal_selection(&mut self, delta: isize) {
+        let Some(picker) = &mut self.goal_picker else {
+            return;
+        };
+        if picker.describing {
+            picker.description_scroll = if delta < 0 {
+                picker
+                    .description_scroll
+                    .saturating_sub(delta.unsigned_abs() as u16)
+            } else {
+                picker.description_scroll.saturating_add(delta as u16)
+            };
+            return;
+        }
+        if self.goals.is_empty() {
+            return;
+        }
+        picker.selected =
+            (picker.selected as isize + delta).rem_euclid(self.goals.len() as isize) as usize;
+    }
+
+    fn describe_selected_goal(&mut self) {
+        let Some(picker) = &mut self.goal_picker else {
+            return;
+        };
+        if self.goals.get(picker.selected).is_some() {
+            picker.describing = !picker.describing;
+            picker.description_scroll = 0;
+        }
+    }
+
+    fn toggle_selected_goal(&mut self) {
+        let Some(id) = self
+            .goal_picker
+            .as_ref()
+            .and_then(|picker| self.goals.get(picker.selected))
+            .map(|goal| goal.id)
+        else {
+            return;
+        };
+        self.goal_picker = None;
+        self.request_goal_action(PendingGoalAction::Toggle(id));
+    }
+
+    fn delete_selected_goal(&mut self) {
+        let Some((index, id)) = self.goal_picker.as_ref().and_then(|picker| {
+            self.goals
+                .get(picker.selected)
+                .map(|goal| (picker.selected, goal.id))
+        }) else {
+            return;
+        };
+        self.request_goal_action(PendingGoalAction::Delete(id));
+        if let Some(picker) = &mut self.goal_picker {
+            picker.selected = index.min(self.goals.len().saturating_sub(2));
+            picker.describing = false;
+        }
+    }
+
+    fn begin_goal_edit(&mut self, id: Uuid) {
+        let Some(goal) = self.goals.iter().find(|goal| goal.id == id) else {
+            return;
+        };
+        self.input.clone_from(&goal.objective);
+        self.cursor = self.input.len();
+        self.preferred_column = None;
+        self.completion = None;
+        self.editing_goal_id = Some(id);
+    }
+
+    fn apply_pending_goal_action(&mut self, registry: &SessionRegistry) -> Result<bool> {
+        let Some(action) = self.pending_goal_action.take() else {
+            return Ok(false);
+        };
+        let agent = self.agent.as_mut().context("agent is unavailable")?;
+        let mut start_prompt = None;
+        let mut continue_goal = false;
+        match action {
+            PendingGoalAction::Create(objective) => {
+                agent.create_goal(objective.clone());
+                start_prompt = Some(objective);
+            }
+            PendingGoalAction::Toggle(id) => {
+                let active = agent
+                    .session()
+                    .goals
+                    .iter()
+                    .find(|goal| goal.id == id)
+                    .is_some_and(|goal| goal.status == GoalStatus::Active);
+                if active {
+                    agent.pause_goal(id);
+                } else if agent.activate_goal(id) {
+                    continue_goal = true;
+                }
+            }
+            PendingGoalAction::Pause(id) => {
+                agent.pause_goal(id);
+            }
+            PendingGoalAction::Delete(id) => {
+                agent.delete_goal(id);
+            }
+            PendingGoalAction::BeginEdit(id) => {
+                self.editing_goal_resume = agent
+                    .session()
+                    .goals
+                    .iter()
+                    .find(|goal| goal.id == id)
+                    .is_some_and(|goal| goal.status == GoalStatus::Active);
+                if self.editing_goal_resume {
+                    agent.pause_goal(id);
+                }
+                self.sync_goals_from_agent();
+                self.save_active_session(registry)?;
+                self.begin_goal_edit(id);
+                return Ok(false);
+            }
+        }
+        self.sync_goals_from_agent();
+        self.save_active_session(registry)?;
+        if let Some(prompt) = start_prompt {
+            self.start_turn(prompt, false)?;
+            return Ok(true);
+        }
+        if continue_goal {
+            self.start_goal_continuation()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn open_session_picker(&mut self, registry: &SessionRegistry) -> Result<()> {
+        self.save_active_session(registry)?;
+        let current_id = self
+            .agent
+            .as_ref()
+            .context("agent is unavailable")?
+            .session()
+            .id;
+        let projects = list_session_projects(&self.project_root, registry)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, project)| SessionProjectView {
+                project,
+                expanded: index == 0,
+            })
+            .collect::<Vec<_>>();
+        let mut picker = SessionPicker {
+            projects,
+            selected: 0,
+        };
+        if let Some(selected) = picker.rows().iter().position(|row| {
+            matches!(
+                row,
+                SessionPickerRow::Session(project, session)
+                    if picker.projects[*project].project.sessions[*session].id == current_id
+            )
+        }) {
+            picker.selected = selected;
+        }
+        self.session_picker = Some(picker);
+        self.show_help = false;
+        self.show_skills = false;
+        self.model_picker = None;
+        self.completion = None;
+        Ok(())
+    }
+
+    fn move_session_selection(&mut self, delta: isize) {
+        let Some(picker) = &mut self.session_picker else {
+            return;
+        };
+        let len = picker.rows().len();
+        if len == 0 {
+            return;
+        }
+        picker.selected = (picker.selected as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    fn move_session_left(&mut self) {
+        let Some(picker) = &mut self.session_picker else {
+            return;
+        };
+        match picker.selected_row() {
+            Some(SessionPickerRow::Session(project, _)) => picker.select_project(project),
+            Some(SessionPickerRow::Project(project)) if picker.projects[project].expanded => {
+                picker.projects[project].expanded = false;
+                picker.select_project(project);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_session_right(&mut self) {
+        let Some(picker) = &mut self.session_picker else {
+            return;
+        };
+        if let Some(SessionPickerRow::Project(project)) = picker.selected_row()
+            && !picker.projects[project].expanded
+        {
+            picker.projects[project].expanded = true;
+            picker.select_project(project);
+        }
+    }
+
+    fn accept_session_selection(&mut self) -> Result<()> {
+        let Some(row) = self
+            .session_picker
+            .as_ref()
+            .and_then(SessionPicker::selected_row)
+        else {
+            return Ok(());
+        };
+        let SessionPickerRow::Session(project_index, session_index) = row else {
+            self.move_session_right();
+            return Ok(());
+        };
+        let (root, id) = {
+            let picker = self.session_picker.as_ref().unwrap();
+            let project = &picker.projects[project_index].project;
+            (project.root.clone(), project.sessions[session_index].id)
+        };
+        let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
+        self.agent
+            .as_mut()
+            .context("agent is unavailable")?
+            .switch_project(root, session)?;
+        self.sync_active_session()?;
+        self.session_picker = None;
+        if self.active_goal_id().is_some() {
+            self.start_goal_continuation()?;
+        }
+        Ok(())
+    }
+
+    fn delete_session_selection(&mut self, registry: &SessionRegistry) -> Result<()> {
+        let Some(SessionPickerRow::Session(project_index, session_index)) = self
+            .session_picker
+            .as_ref()
+            .and_then(SessionPicker::selected_row)
+        else {
+            return Ok(());
+        };
+        let selected = self.session_picker.as_ref().unwrap().selected;
+        let (root, id) = {
+            let picker = self.session_picker.as_ref().unwrap();
+            let project = &picker.projects[project_index].project;
+            (project.root.clone(), project.sessions[session_index].id)
+        };
+        let store = SessionStore::new(&root)?;
+        let current_id = self
+            .agent
+            .as_ref()
+            .context("agent is unavailable")?
+            .session()
+            .id;
+        store.delete(&id.to_string())?;
+
+        if id == current_id && paths_equal(&root, &self.project_root) {
+            let mut session = store.create(self.model.clone())?;
+            session.reasoning_effort.clone_from(&self.reasoning_effort);
+            session.service_tier.clone_from(&self.service_tier);
+            self.agent
+                .as_mut()
+                .context("agent is unavailable")?
+                .replace_session(session);
+            self.sync_active_session()?;
+            store.save(
+                self.agent
+                    .as_ref()
+                    .context("agent is unavailable")?
+                    .session(),
+            )?;
+            registry.register(&root)?;
+        }
+
+        if store.list()?.is_empty() {
+            registry.unregister(&root)?;
+        }
+        let projects = list_session_projects(&self.project_root, registry)?;
+        let expanded = self
+            .session_picker
+            .as_ref()
+            .map(|picker| {
+                picker
+                    .projects
+                    .iter()
+                    .filter(|project| project.expanded)
+                    .map(|project| project.project.root.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut picker = SessionPicker {
+            projects: projects
+                .into_iter()
+                .map(|project| SessionProjectView {
+                    expanded: expanded.iter().any(|root| paths_equal(root, &project.root)),
+                    project,
+                })
+                .collect(),
+            selected: 0,
+        };
+        picker.selected = selected.min(picker.rows().len().saturating_sub(1));
+        self.session_picker = Some(picker);
+        self.error = None;
+        Ok(())
+    }
+
+    fn sync_active_session(&mut self) -> Result<()> {
+        let session = self
+            .agent
+            .as_ref()
+            .context("agent is unavailable")?
+            .session();
+        self.transcript.clone_from(&session.messages);
+        self.activities.clone_from(&session.activities);
+        self.goals.clone_from(&session.goals);
+        self.visible_goal_id = session.visible_goal_id;
+        self.project_root = self
+            .agent
+            .as_ref()
+            .context("agent is unavailable")?
+            .project_root()
+            .to_path_buf();
+        self.project = self.project_root.display().to_string();
+        self.model.clone_from(&session.model);
+        self.reasoning_effort.clone_from(&session.reasoning_effort);
+        self.service_tier.clone_from(&session.service_tier);
+        self.skills = self
+            .agent
+            .as_ref()
+            .context("agent is unavailable")?
+            .skills()
+            .iter()
+            .map(|skill| SkillView {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                scope: skill.scope.label(),
+            })
+            .collect();
+        self.live_messages.clear();
+        self.pending_user = None;
+        self.queued_prompt = None;
+        self.goal_picker = None;
+        self.pending_goal_action = None;
+        self.editing_goal_id = None;
+        self.editing_goal_resume = false;
+        self.goal_buttons = GoalButtons::default();
+        self.cancel_tx = None;
+        self.last_escape = None;
+        self.steer_button = None;
+        self.conversation_view = None;
+        self.text_selection = None;
+        self.copy_flash = None;
+        self.error = None;
+        self.scroll = 0;
+        self.auto_scroll = true;
         Ok(())
     }
 
@@ -623,52 +1609,413 @@ impl App {
         self.auto_scroll = self.scroll >= self.max_scroll;
     }
 
-    async fn drain_agent_events(&mut self) {
+    fn drain_agent_events(&mut self) {
         let mut pending = Vec::new();
         if let Some(receiver) = &mut self.event_rx {
             while let Ok(event) = receiver.try_recv() {
                 pending.push(event);
             }
         }
+        let received_events = !pending.is_empty();
         for event in pending {
             match event {
-                AgentEvent::ApprovalRequested { action, response } => {
-                    self.approval = Some(ApprovalPrompt { action, response });
+                AgentEvent::AssistantMessage(message) => self.live_messages.push(message),
+                AgentEvent::AssistantTextDelta { delta, start } => {
+                    if start {
+                        self.live_messages
+                            .push(Message::text(Role::Assistant, delta));
+                    } else if let Some(message) = self.live_messages.last_mut() {
+                        message.content.get_or_insert_default().push_str(&delta);
+                    }
+                }
+                AgentEvent::AssistantMessageCompleted(message) => {
+                    if let Some(existing) = self
+                        .live_messages
+                        .iter_mut()
+                        .rfind(|existing| matches!(existing.role, Role::Assistant))
+                    {
+                        *existing = message;
+                    } else {
+                        self.live_messages.push(message);
+                    }
+                }
+                AgentEvent::Activity(activity) => {
+                    if let Some(existing) = self
+                        .activities
+                        .iter_mut()
+                        .find(|existing| existing.id == activity.id)
+                    {
+                        existing.clone_from(&activity);
+                    } else {
+                        self.activities.push(activity);
+                    }
                 }
             }
         }
+        if received_events
+            && !self
+                .text_selection
+                .as_ref()
+                .is_some_and(|selection| selection.dragging)
+        {
+            self.auto_scroll = true;
+        }
     }
 
-    async fn finish_turn_if_ready(&mut self, store: &SessionStore) -> Result<()> {
+    fn copy_to_clipboard(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        let result = self
+            .clipboard
+            .as_mut()
+            .context("the operating-system clipboard is unavailable")
+            .and_then(|clipboard| clipboard.set_text(text).map_err(Into::into));
+        if let Err(error) = result {
+            self.error = Some(format!("Could not copy to the clipboard: {error}"));
+        }
+    }
+
+    fn update_selection_cursor(&mut self, column: u16, row: u16) {
+        let point = self
+            .conversation_view
+            .as_ref()
+            .and_then(|view| view.point_at(column, row, true));
+        if let (Some(selection), Some(point)) = (&mut self.text_selection, point) {
+            selection.moved |= point != selection.anchor;
+            selection.cursor = point;
+            selection.last_column = column;
+            selection.last_row = row;
+        }
+    }
+
+    fn finish_text_selection(&mut self, column: u16, row: u16) {
+        self.update_selection_cursor(column, row);
+        let text = self.text_selection.as_mut().and_then(|selection| {
+            selection.dragging = false;
+            selection
+                .moved
+                .then(|| {
+                    self.conversation_view
+                        .as_ref()
+                        .map(|view| view.selected_text(selection))
+                })
+                .flatten()
+        });
+        if let Some(text) = text {
+            self.copy_to_clipboard(text);
+        } else {
+            self.text_selection = None;
+        }
+    }
+
+    fn update_drag_autoscroll(&mut self) {
+        if self
+            .copy_flash
+            .as_ref()
+            .is_some_and(|flash| Instant::now() >= flash.until)
+        {
+            self.copy_flash = None;
+        }
+        let Some(selection) = self
+            .text_selection
+            .as_ref()
+            .filter(|selection| selection.dragging)
+        else {
+            return;
+        };
+        let Some(view) = &self.conversation_view else {
+            return;
+        };
+        let column = selection.last_column;
+        let row = selection.last_row;
+        let (direction, amount) = if row < view.area.y {
+            (-1, view.area.y.saturating_sub(row).clamp(1, 5))
+        } else if row >= view.area.bottom() {
+            (
+                1,
+                row.saturating_sub(view.area.bottom())
+                    .saturating_add(1)
+                    .clamp(1, 5),
+            )
+        } else {
+            return;
+        };
+        if direction < 0 {
+            self.scroll_up(amount);
+        } else {
+            self.scroll_down(amount);
+        }
+        if let Some(view) = &mut self.conversation_view {
+            view.scroll = self.scroll as usize;
+        }
+        self.update_selection_cursor(column, row);
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.goal_picker.is_none()
+            && self.session_picker.is_none()
+            && self.model_picker.is_none()
+            && !self.show_help
+            && !self.show_skills
+        {
+            let point = (mouse.column, mouse.row).into();
+            if self
+                .goal_buttons
+                .list
+                .is_some_and(|area| area.contains(point))
+            {
+                self.open_goal_picker();
+                return;
+            }
+            if let Some(id) = self.visible_goal_id {
+                if self
+                    .goal_buttons
+                    .toggle
+                    .is_some_and(|area| area.contains(point))
+                {
+                    self.request_goal_action(PendingGoalAction::Toggle(id));
+                    return;
+                }
+                if self
+                    .goal_buttons
+                    .edit
+                    .is_some_and(|area| area.contains(point))
+                {
+                    self.request_goal_action(PendingGoalAction::BeginEdit(id));
+                    return;
+                }
+                if self
+                    .goal_buttons
+                    .delete
+                    .is_some_and(|area| area.contains(point))
+                {
+                    self.request_goal_action(PendingGoalAction::Delete(id));
+                    return;
+                }
+            }
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.queued_prompt.is_some()
+            && self
+                .steer_button
+                .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+        {
+            self.cancel_current_turn();
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                let target = self.conversation_view.as_ref().and_then(|view| {
+                    view.point_at(mouse.column, mouse.row, false)
+                        .and_then(|point| view.copy_target_at(point))
+                        .map(|target| (target.text.clone(), target.ranges.clone()))
+                });
+                if let Some((text, ranges)) = target {
+                    self.text_selection = None;
+                    self.copy_flash = Some(CopyFlash {
+                        ranges,
+                        until: Instant::now() + Duration::from_millis(500),
+                    });
+                    self.copy_to_clipboard(text);
+                }
+                return;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(point) = self
+                    .conversation_view
+                    .as_ref()
+                    .and_then(|view| view.point_at(mouse.column, mouse.row, false))
+                {
+                    self.copy_flash = None;
+                    self.auto_scroll = false;
+                    self.text_selection = Some(TextSelection {
+                        anchor: point,
+                        cursor: point,
+                        dragging: true,
+                        moved: false,
+                        last_column: mouse.column,
+                        last_row: mouse.row,
+                    });
+                    return;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left)
+                if self
+                    .text_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.dragging) =>
+            {
+                self.update_selection_cursor(mouse.column, mouse.row);
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if self
+                    .text_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.dragging) =>
+            {
+                self.finish_text_selection(mouse.column, mouse.row);
+                return;
+            }
+            _ => {}
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp if self.show_skills => {
+                self.move_skill_selection(-1);
+            }
+            MouseEventKind::ScrollDown if self.show_skills => {
+                self.move_skill_selection(1);
+            }
+            MouseEventKind::ScrollUp if self.model_picker.is_some() => {
+                self.move_model_selection(-1);
+            }
+            MouseEventKind::ScrollDown if self.model_picker.is_some() => {
+                self.move_model_selection(1);
+            }
+            MouseEventKind::ScrollUp if self.session_picker.is_some() => {
+                self.move_session_selection(-1);
+            }
+            MouseEventKind::ScrollDown if self.session_picker.is_some() => {
+                self.move_session_selection(1);
+            }
+            MouseEventKind::ScrollUp if self.goal_picker.is_some() => {
+                self.move_goal_selection(-1);
+            }
+            MouseEventKind::ScrollDown if self.goal_picker.is_some() => {
+                self.move_goal_selection(1);
+            }
+            MouseEventKind::ScrollUp if self.completion.is_some() => {
+                self.move_completion(-1);
+            }
+            MouseEventKind::ScrollDown if self.completion.is_some() => {
+                self.move_completion(1);
+            }
+            MouseEventKind::ScrollUp => self.scroll_up(3),
+            MouseEventKind::ScrollDown => self.scroll_down(3),
+            _ => {}
+        }
+    }
+
+    async fn finish_turn_if_ready(&mut self, registry: &SessionRegistry) -> Result<()> {
         if !self.running.as_ref().is_some_and(JoinHandle::is_finished) {
             return Ok(());
         }
         let handle = self.running.take().expect("checked above");
         let (agent, result) = handle.await.context("agent task failed")?;
         self.transcript = agent.session().messages.clone();
+        self.activities = agent.session().activities.clone();
+        self.goals = agent.session().goals.clone();
+        self.visible_goal_id = agent.session().visible_goal_id;
+        let root = agent.project_root().to_path_buf();
+        let store = SessionStore::new(&root)?;
         store.save(agent.session())?;
+        registry.register(&root)?;
         self.agent = Some(agent);
         self.event_rx = None;
+        self.cancel_tx = None;
+        self.last_escape = None;
+        self.live_messages.clear();
         self.pending_user = None;
-        self.approval = None;
         self.auto_scroll = true;
-        match result {
+        let turn_succeeded = match result {
             Ok(_) => {
                 self.error = None;
+                true
+            }
+            Err(error) if turn_was_cancelled(&error) => {
+                self.error = None;
+                false
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}"));
+                false
             }
+        };
+        if self.apply_pending_goal_action(registry)? {
+            return Ok(());
+        }
+        if let Some(prompt) = self.queued_prompt.take() {
+            self.start_turn(prompt, false)?;
+        } else if turn_succeeded && self.active_goal_id().is_some() {
+            self.start_goal_continuation()?;
         }
         Ok(())
     }
 
-    fn submit(&mut self, store: &SessionStore) -> Result<()> {
-        if self.is_running() {
+    fn submit(&mut self, registry: &SessionRegistry) -> Result<()> {
+        if self.recording.is_some() || self.transcription.is_some() {
             return Ok(());
         }
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
+            return Ok(());
+        }
+        if let Some(id) = self.editing_goal_id.take() {
+            if prompt.chars().count() > 4_000 {
+                self.editing_goal_id = Some(id);
+                self.error = Some("Goal objective cannot exceed 4,000 characters.".into());
+                return Ok(());
+            }
+            let resume = std::mem::take(&mut self.editing_goal_resume);
+            let edited = {
+                let agent = self.agent.as_mut().context("agent is unavailable")?;
+                let edited = agent.edit_goal(id, prompt);
+                if edited && resume {
+                    agent.activate_goal(id);
+                }
+                edited
+            };
+            if !edited {
+                self.error = Some("The goal no longer exists.".into());
+            } else {
+                self.input.clear();
+                self.cursor = 0;
+                self.preferred_column = None;
+                self.completion = None;
+                self.sync_goals_from_agent();
+                self.save_active_session(registry)?;
+                self.error = None;
+                if resume {
+                    self.start_goal_continuation()?;
+                }
+            }
+            return Ok(());
+        }
+        if prompt == "/goal" {
+            self.error = Some("Write the objective after /goal.".into());
+            return Ok(());
+        }
+        if let Some(objective) = goal_objective_from_input(&self.input).map(str::to_owned) {
+            self.input.clear();
+            self.cursor = 0;
+            self.preferred_column = None;
+            self.completion = None;
+            self.request_goal_action(PendingGoalAction::Create(objective));
+            if !self.is_running() {
+                self.apply_pending_goal_action(registry)?;
+            }
+            return Ok(());
+        }
+        if prompt == "/goals" {
+            self.input.clear();
+            self.cursor = 0;
+            self.preferred_column = None;
+            self.completion = None;
+            return self.command(&prompt, registry);
+        }
+        if self.is_running() {
+            if self.queued_prompt.is_none() {
+                self.input.clear();
+                self.cursor = 0;
+                self.preferred_column = None;
+                self.completion = None;
+                self.queued_prompt = Some(prompt);
+            }
             return Ok(());
         }
         if builtin_command_from_input(&self.input).is_some() {
@@ -676,69 +2023,130 @@ impl App {
             self.cursor = 0;
             self.preferred_column = None;
             self.completion = None;
-            return self.command(&prompt, store);
+            return self.command(&prompt, registry);
         }
 
-        self.input.clear();
-        self.cursor = 0;
-        self.preferred_column = None;
-        self.completion = None;
+        self.start_turn(prompt, true)
+    }
+
+    fn start_turn(&mut self, prompt: String, clear_composer: bool) -> Result<()> {
+        if clear_composer {
+            self.input.clear();
+            self.cursor = 0;
+            self.preferred_column = None;
+            self.completion = None;
+        }
         self.error = None;
         self.pending_user = Some(prompt.clone());
+        self.live_messages.clear();
         self.auto_scroll = true;
 
         let mut agent = self.agent.take().context("agent is unavailable")?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancellation) = watch::channel(false);
         self.event_rx = Some(event_rx);
+        self.cancel_tx = Some(cancel_tx);
         self.running = Some(tokio::spawn(async move {
-            let result = agent.turn_with_events(&prompt, event_tx).await;
+            let result = agent
+                .turn_with_events(&prompt, event_tx, cancellation)
+                .await;
             (agent, result)
         }));
         Ok(())
     }
 
-    fn command(&mut self, command: &str, store: &SessionStore) -> Result<()> {
+    fn start_goal_continuation(&mut self) -> Result<()> {
+        self.error = None;
+        self.pending_user = None;
+        self.live_messages.clear();
+        self.auto_scroll = true;
+
+        let mut agent = self.agent.take().context("agent is unavailable")?;
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancellation) = watch::channel(false);
+        self.event_rx = Some(event_rx);
+        self.cancel_tx = Some(cancel_tx);
+        self.running = Some(tokio::spawn(async move {
+            let result = agent
+                .continue_goal_with_events(event_tx, cancellation)
+                .await;
+            (agent, result)
+        }));
+        Ok(())
+    }
+
+    fn cancel_current_turn(&mut self) {
+        if let Some(cancel_tx) = &self.cancel_tx {
+            let _ = cancel_tx.send(true);
+        }
+    }
+
+    fn command(&mut self, command: &str, registry: &SessionRegistry) -> Result<()> {
         match command {
             "/quit" => self.should_quit = true,
             "/help" => self.show_help = true,
             "/model" | "/models" => self.open_model_picker(),
             "/skills" => self.open_skill_picker(),
+            "/sessions" => self.open_session_picker(registry)?,
+            "/goals" => self.open_goal_picker(),
             "/clear" => {
                 if let Some(agent) = &mut self.agent {
                     agent.clear();
-                    store.save(agent.session())?;
                     self.transcript.clear();
+                    self.live_messages.clear();
+                    self.activities.clear();
                     self.error = None;
                 }
+                self.sync_goals_from_agent();
+                self.save_active_session(registry)?;
             }
             _ => self.error = Some(format!("Unknown command: {command}")),
         }
         Ok(())
     }
 
-    fn handle_approval_key(&mut self, key: KeyEvent) -> bool {
-        if self.approval.is_none() {
-            return false;
-        }
-        let answer = match key.code {
-            KeyCode::Char('y' | 'Y') | KeyCode::Enter => Some(true),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
-            _ => None,
-        };
-        if let Some(answer) = answer
-            && let Some(prompt) = self.approval.take()
-        {
-            let _ = prompt.response.send(answer);
-        }
-        true
-    }
-
-    fn handle_key(&mut self, key: KeyEvent, store: &SessionStore) -> Result<()> {
+    fn handle_key(&mut self, key: KeyEvent, registry: &SessionRegistry) -> Result<()> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Ok(());
         }
-        if self.handle_approval_key(key) {
+        if self.goal_picker.is_some() {
+            let describing = self
+                .goal_picker
+                .as_ref()
+                .is_some_and(|picker| picker.describing);
+            match key.code {
+                KeyCode::Up => self.move_goal_selection(-1),
+                KeyCode::Down => self.move_goal_selection(1),
+                KeyCode::PageUp => self.move_goal_selection(if describing { -8 } else { -5 }),
+                KeyCode::PageDown => self.move_goal_selection(if describing { 8 } else { 5 }),
+                KeyCode::Char('d' | 'D') => self.describe_selected_goal(),
+                KeyCode::Enter | KeyCode::Char(' ') if !describing => self.toggle_selected_goal(),
+                KeyCode::Delete | KeyCode::Backspace if !describing => self.delete_selected_goal(),
+                KeyCode::Esc if describing => self.describe_selected_goal(),
+                KeyCode::Esc => self.goal_picker = None,
+                _ => {}
+            }
             return Ok(());
+        }
+        if self.is_running() {
+            if key.code == KeyCode::Esc {
+                if key.kind == KeyEventKind::Repeat {
+                    return Ok(());
+                }
+                let now = Instant::now();
+                if self
+                    .last_escape
+                    .is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(1))
+                {
+                    self.last_escape = None;
+                    self.request_stop();
+                } else {
+                    self.last_escape = Some(now);
+                    self.completion = None;
+                }
+                return Ok(());
+            }
+            self.last_escape = None;
         }
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?')) {
@@ -764,9 +2172,54 @@ impl App {
                 KeyCode::Down => self.move_model_selection(1),
                 KeyCode::PageUp => self.move_model_selection(-5),
                 KeyCode::PageDown => self.move_model_selection(5),
-                KeyCode::Enter | KeyCode::Tab => self.accept_model_selection(store)?,
+                KeyCode::Enter | KeyCode::Tab => self.accept_model_selection(registry)?,
                 KeyCode::Left | KeyCode::Backspace | KeyCode::Esc => self.back_model_picker(),
                 _ => {}
+            }
+            return Ok(());
+        }
+        if self.session_picker.is_some() {
+            match key.code {
+                KeyCode::Up => self.move_session_selection(-1),
+                KeyCode::Down => self.move_session_selection(1),
+                KeyCode::PageUp => self.move_session_selection(-5),
+                KeyCode::PageDown => self.move_session_selection(5),
+                KeyCode::Left => self.move_session_left(),
+                KeyCode::Right => self.move_session_right(),
+                KeyCode::Enter => self.accept_session_selection()?,
+                KeyCode::Delete | KeyCode::Backspace => self.delete_session_selection(registry)?,
+                KeyCode::Esc => self.session_picker = None,
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.editing_goal_id.is_some() && key.code == KeyCode::Esc {
+            let id = self.editing_goal_id.take().expect("checked above");
+            let resume = std::mem::take(&mut self.editing_goal_resume);
+            self.input.clear();
+            self.cursor = 0;
+            self.preferred_column = None;
+            self.completion = None;
+            self.error = None;
+            if resume {
+                if let Some(agent) = &mut self.agent {
+                    agent.activate_goal(id);
+                }
+                self.sync_goals_from_agent();
+                self.save_active_session(registry)?;
+                self.start_goal_continuation()?;
+            }
+            return Ok(());
+        }
+
+        if key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('s' | 'S'))
+        {
+            if let Err(error) = self.toggle_dictation() {
+                self.error = Some(format!("Dictation failed: {error:#}"));
             }
             return Ok(());
         }
@@ -811,7 +2264,7 @@ impl App {
 
         if key.modifiers == KeyModifiers::CONTROL {
             match key.code {
-                KeyCode::Char('c' | 'd') if !self.is_running() => self.should_quit = true,
+                KeyCode::Char('c' | 'd') if !self.is_busy() => self.should_quit = true,
                 KeyCode::Char('c') => {}
                 KeyCode::Char('j') => self.insert("\n"),
                 KeyCode::Char('u') => {
@@ -852,7 +2305,7 @@ impl App {
             {
                 self.insert("\n");
             }
-            KeyCode::Enter => self.submit(store)?,
+            KeyCode::Enter => self.submit(registry)?,
             KeyCode::Char('?') if self.input.is_empty() => self.show_help = true,
             KeyCode::Char(value) => self.insert_char(value),
             KeyCode::Backspace => self.backspace(),
@@ -896,7 +2349,11 @@ impl App {
     }
 }
 
-pub(crate) async fn interactive(mut agent: Agent, store: &SessionStore) -> Result<()> {
+pub(crate) async fn interactive(
+    mut agent: Agent,
+    registry: &SessionRegistry,
+    debug_openai: bool,
+) -> Result<()> {
     let (model_catalog, catalog_error) = match agent.fetch_models().await {
         Ok(catalog) => {
             agent.resolve_auto_model(&catalog);
@@ -918,8 +2375,8 @@ pub(crate) async fn interactive(mut agent: Agent, store: &SessionStore) -> Resul
 
     let result = run_tui(
         &mut terminal,
-        App::new(agent, model_catalog, catalog_error),
-        store,
+        App::new(agent, model_catalog, catalog_error, debug_openai),
+        registry,
     )
     .await;
 
@@ -940,66 +2397,60 @@ pub(crate) async fn interactive(mut agent: Agent, store: &SessionStore) -> Resul
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: App,
-    store: &SessionStore,
+    registry: &SessionRegistry,
 ) -> Result<String> {
+    if app.active_goal_id().is_some() {
+        app.start_goal_continuation()?;
+    }
     loop {
-        app.drain_agent_events().await;
-        app.finish_turn_if_ready(store).await?;
+        app.drain_agent_events();
+        app.finish_turn_if_ready(registry).await?;
+        if !app.is_running() {
+            app.apply_pending_goal_action(registry)?;
+        }
+        app.finish_transcription_if_ready().await?;
+        app.update_drag_autoscroll();
         app.spinner = app.spinner.wrapping_add(1);
         terminal.draw(|frame| render(frame, &mut app))?;
 
-        if app.should_quit && !app.is_running() {
+        if app.should_quit && !app.is_busy() {
             break;
         }
         if event::poll(Duration::from_millis(70))? {
             match event::read()? {
-                Event::Key(key) => app.handle_key(key, store)?,
+                Event::Key(key) => app.handle_key(key, registry)?,
                 Event::Paste(text) => app.insert(&text.replace("\r\n", "\n")),
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp if app.show_skills => {
-                        app.move_skill_selection(-1);
-                    }
-                    MouseEventKind::ScrollDown if app.show_skills => {
-                        app.move_skill_selection(1);
-                    }
-                    MouseEventKind::ScrollUp if app.model_picker.is_some() => {
-                        app.move_model_selection(-1);
-                    }
-                    MouseEventKind::ScrollDown if app.model_picker.is_some() => {
-                        app.move_model_selection(1);
-                    }
-                    MouseEventKind::ScrollUp if app.completion.is_some() => {
-                        app.move_completion(-1);
-                    }
-                    MouseEventKind::ScrollDown if app.completion.is_some() => {
-                        app.move_completion(1);
-                    }
-                    MouseEventKind::ScrollUp => app.scroll_up(3),
-                    MouseEventKind::ScrollDown => app.scroll_down(3),
-                    _ => {}
-                },
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
         }
     }
 
     let agent = app.agent.context("agent did not return before exit")?;
+    let store = SessionStore::new(agent.project_root())?;
     store.save(agent.session())?;
+    registry.register(agent.project_root())?;
     Ok(agent.session().id.to_string())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let input_lines = app.input.lines().count().clamp(1, 6) as u16;
-    let [header, body, composer] = Layout::vertical([
+    let queued_height = if app.queued_prompt.is_some() { 3 } else { 0 };
+    let goal_height = if app.visible_goal().is_some() { 3 } else { 0 };
+    let [header, body, queued, goal, composer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(8),
+        Constraint::Length(queued_height),
+        Constraint::Length(goal_height),
         Constraint::Length(input_lines + 2),
     ])
     .areas(area);
 
     render_header(frame, app, header);
     render_chat(frame, app, body);
+    render_queued_prompt(frame, app, queued);
+    render_goal(frame, app, goal);
     render_composer(frame, app, composer);
     if app.completion.is_some() {
         render_completion(frame, app, body, composer);
@@ -1014,9 +2465,157 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     if app.model_picker.is_some() {
         render_model_picker(frame, app, area);
     }
-    if let Some(approval) = &app.approval {
-        render_approval(frame, area, &approval.action);
+    if app.session_picker.is_some() {
+        render_session_picker(frame, app, area);
     }
+    if app.goal_picker.is_some() {
+        render_goal_picker(frame, app, area);
+    }
+}
+
+fn render_queued_prompt(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(prompt) = &app.queued_prompt else {
+        app.steer_button = None;
+        return;
+    };
+    if area.width < 16 || area.height < 3 {
+        app.steer_button = None;
+        return;
+    }
+
+    let button_width = 9.min(area.width);
+    let message_width = area.width.saturating_sub(button_width);
+    let [message, button] = Layout::horizontal([
+        Constraint::Length(message_width),
+        Constraint::Length(button_width),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" QUEUED  ", Style::default().fg(MUTED)),
+            Span::raw(prompt.clone()),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED)),
+        )
+        .wrap(Wrap { trim: true }),
+        message,
+    );
+    frame.render_widget(
+        Paragraph::new("Steer").centered().block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(CRAB)),
+        ),
+        button,
+    );
+    app.steer_button = Some(button);
+}
+
+fn render_goal(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(goal) = app.visible_goal().cloned() else {
+        app.goal_buttons = GoalButtons::default();
+        return;
+    };
+    if area.height < 3 {
+        app.goal_buttons = GoalButtons::default();
+        return;
+    }
+    if area.width < 34 {
+        frame.render_widget(
+            Paragraph::new(compact_text(
+                &format!(
+                    "{}  {}",
+                    match goal.status {
+                        GoalStatus::Active => "ACTIVE",
+                        GoalStatus::Paused => "PAUSED",
+                        GoalStatus::Completed => "DONE",
+                        GoalStatus::Blocked => "BLOCKED",
+                    },
+                    goal.objective.replace('\n', " ")
+                ),
+                area.width.saturating_sub(2) as usize,
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(GOAL)),
+            ),
+            area,
+        );
+        app.goal_buttons = GoalButtons::default();
+        return;
+    }
+
+    let widths = [7, 6, 8, 7];
+    let controls_width = widths.iter().sum::<u16>();
+    let message_width = area.width.saturating_sub(controls_width);
+    let [message, toggle, edit, delete, list] = Layout::horizontal([
+        Constraint::Length(message_width),
+        Constraint::Length(widths[0]),
+        Constraint::Length(widths[1]),
+        Constraint::Length(widths[2]),
+        Constraint::Length(widths[3]),
+    ])
+    .areas(area);
+    let status = match goal.status {
+        GoalStatus::Active => "ACTIVE",
+        GoalStatus::Paused => "PAUSED",
+        GoalStatus::Completed => "DONE",
+        GoalStatus::Blocked => "BLOCKED",
+    };
+    let status_color = match goal.status {
+        GoalStatus::Active => GOAL,
+        GoalStatus::Paused => Color::Yellow,
+        GoalStatus::Completed => AQUA,
+        GoalStatus::Blocked => Color::Red,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {status}  "),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(goal.objective.replace('\n', " ")),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(status_color)),
+        ),
+        message,
+    );
+    let button = |label: &str, color: Color| {
+        Paragraph::new(label.to_owned()).centered().block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color)),
+        )
+    };
+    frame.render_widget(
+        button(
+            if goal.status == GoalStatus::Active {
+                "Pause"
+            } else {
+                "Play"
+            },
+            status_color,
+        ),
+        toggle,
+    );
+    frame.render_widget(button("Edit", MUTED), edit);
+    frame.render_widget(button("Delete", Color::Red), delete);
+    frame.render_widget(button("Goals", GOAL), list);
+    app.goal_buttons = GoalButtons {
+        toggle: Some(toggle),
+        edit: Some(edit),
+        delete: Some(delete),
+        list: Some(list),
+    };
 }
 
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1029,7 +2628,9 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let status_color = if app.is_running() {
+    let status_color = if app.recording.is_some() {
+        Color::Red
+    } else if app.is_running() || app.transcription.is_some() {
         Color::Yellow
     } else {
         AQUA
@@ -1041,22 +2642,19 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let fixed_width = status.chars().count()
         + app.model.chars().count()
         + thinking.chars().count()
-        + separator.chars().count() * if fast { 4 } else { 3 }
-        + usize::from(fast);
+        + separator.chars().count() * 3
+        + if fast { 2 } else { 0 };
     let mut spans = vec![
         Span::styled(status, Style::default().fg(status_color)),
         Span::styled("  │  ", Style::default().fg(MUTED)),
         Span::styled(&app.model, Style::default().fg(Color::White)),
-        Span::styled("  │  ", Style::default().fg(MUTED)),
-        Span::styled(thinking, Style::default().fg(AQUA)),
     ];
     if fast {
-        spans.extend([
-            Span::styled(separator, Style::default().fg(MUTED)),
-            Span::styled("⚡", Style::default().fg(Color::Yellow)),
-        ]);
+        spans.push(Span::styled(" ⚡", Style::default().fg(Color::Yellow)));
     }
     spans.extend([
+        Span::styled(separator, Style::default().fg(MUTED)),
+        Span::styled(thinking, Style::default().fg(AQUA)),
         Span::styled(separator, Style::default().fg(MUTED)),
         Span::styled(
             compact_path(
@@ -1070,25 +2668,15 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " Conversation ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = area.inner(Margin {
+        horizontal: 0,
+        vertical: 1,
+    });
 
-    let lines = conversation_lines(app);
-    let width = inner.width.max(1) as usize;
-    let content_height: usize = lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum();
-    app.max_scroll = content_height
+    let source = conversation_source(app);
+    let rows = wrap_conversation_lines(&source.lines, inner.width.max(1));
+    app.max_scroll = rows
+        .len()
         .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
     if app.auto_scroll {
@@ -1096,76 +2684,368 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         app.scroll = app.scroll.min(app.max_scroll);
     }
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
-    frame.render_widget(paragraph, inner);
+    let visible = rows
+        .iter()
+        .enumerate()
+        .skip(app.scroll as usize)
+        .take(inner.height as usize)
+        .map(|(row_index, row)| visual_row_line(app, row_index, row))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), inner);
+    app.conversation_view = Some(ConversationView {
+        area: inner,
+        rows,
+        scroll: app.scroll as usize,
+        copy_targets: source.copy_targets,
+    });
 }
 
+#[cfg(test)]
 fn conversation_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for message in &app.transcript {
-        let (label, color) = match message.role {
-            Role::User => ("YOU", AQUA),
-            Role::Assistant => ("CRAB", CRAB),
-            _ => continue,
-        };
-        let Some(content) = message
-            .content
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-        else {
+    conversation_source(app).lines
+}
+
+fn conversation_source(app: &App) -> ConversationSource {
+    let mut source = ConversationSource {
+        lines: Vec::new(),
+        copy_targets: Vec::new(),
+    };
+    let mut message_index = 0;
+    while message_index < app.transcript.len() {
+        let message = &app.transcript[message_index];
+        if !matches!(message.role, Role::User) {
+            if matches!(message.role, Role::Assistant)
+                && let Some(content) = visible_message_content(message)
+            {
+                push_actor_label(&mut source, "CRAB", CRAB);
+                push_message_lines(&mut source, content, true, Some(&app.markdown));
+                source.lines.push(Line::default());
+            }
+            message_index += 1;
             continue;
-        };
-        lines.push(Line::from(Span::styled(
-            format!(" {label} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(color)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for line in content.lines() {
-            lines.push(Line::from(Span::raw(line.to_owned())));
         }
-        lines.push(Line::default());
+
+        if let Some(content) = visible_message_content(message) {
+            push_actor_label(&mut source, "YOU", AQUA);
+            push_message_lines(&mut source, content, true, None);
+            source.lines.push(Line::default());
+        }
+
+        let next_user = app.transcript[message_index + 1..]
+            .iter()
+            .position(|candidate| matches!(candidate.role, Role::User))
+            .map(|offset| message_index + 1 + offset)
+            .unwrap_or(app.transcript.len());
+        let turn_messages = &app.transcript[message_index + 1..next_user];
+        if turn_has_visible_content(app, message_index, turn_messages) {
+            push_actor_label(&mut source, "CRAB", CRAB);
+            push_turn_lines(&mut source, app, message_index, turn_messages);
+            source.lines.push(Line::default());
+        }
+        message_index = next_user;
     }
+
     if let Some(content) = &app.pending_user {
-        lines.push(Line::from(Span::styled(
-            " YOU ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(AQUA)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.extend(content.lines().map(|line| Line::from(line.to_owned())));
-        lines.push(Line::default());
+        push_actor_label(&mut source, "YOU", AQUA);
+        push_message_lines(&mut source, content, true, None);
+        source.lines.push(Line::default());
+        let turn_message_index = app.transcript.len();
+        if turn_has_visible_content(app, turn_message_index, &app.live_messages) {
+            push_actor_label(&mut source, "CRAB", CRAB);
+            push_turn_lines(&mut source, app, turn_message_index, &app.live_messages);
+            source.lines.push(Line::default());
+        }
     }
     if let Some(error) = &app.error {
-        lines.push(Line::from(Span::styled(
+        source.lines.push(Line::from(Span::styled(
             " ERROR ",
             Style::default()
                 .fg(Color::White)
                 .bg(Color::Red)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.extend(error.lines().map(|line| {
+        source.lines.extend(error.lines().map(|line| {
             Line::from(Span::styled(
                 line.to_owned(),
                 Style::default().fg(Color::Red),
             ))
         }));
     }
-    lines
+    source
+}
+
+fn visible_message_content(message: &Message) -> Option<&str> {
+    (!message.hidden)
+        .then_some(message.content.as_deref())
+        .flatten()
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn push_actor_label(source: &mut ConversationSource, label: &str, color: Color) {
+    source.lines.push(Line::from(Span::styled(
+        format!(" {label} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(color)
+            .add_modifier(Modifier::BOLD),
+    )));
+}
+
+fn push_message_lines(
+    source: &mut ConversationSource,
+    content: &str,
+    copyable: bool,
+    markdown: Option<&MarkdownHighlighter>,
+) {
+    let mut ranges = Vec::new();
+    let rendered = markdown
+        .map(|highlighter| highlighter.render(content))
+        .unwrap_or_else(|| {
+            content
+                .lines()
+                .map(|line| Line::from(line.to_owned()))
+                .collect()
+        });
+    for (line, rendered) in content.lines().zip(rendered) {
+        let line_index = source.lines.len();
+        source.lines.push(rendered);
+        if !line.is_empty() {
+            ranges.push(SourceRange {
+                line: line_index,
+                start: 0,
+                end: line.len(),
+            });
+        }
+    }
+    if copyable && !ranges.is_empty() {
+        source.copy_targets.push(CopyTarget {
+            ranges,
+            text: content.to_owned(),
+        });
+    }
+}
+
+fn turn_has_visible_content(app: &App, turn_message_index: usize, messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        matches!(message.role, Role::Assistant) && visible_message_content(message).is_some()
+    }) || app
+        .activities
+        .iter()
+        .any(|activity| activity.turn_message_index == turn_message_index)
+}
+
+fn push_turn_lines(
+    source: &mut ConversationSource,
+    app: &App,
+    turn_message_index: usize,
+    messages: &[Message],
+) {
+    let mut matched_activities = Vec::new();
+    let mut emitted_any = false;
+    let mut last_was_message = false;
+    for message in messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::Assistant))
+    {
+        if let Some(content) = visible_message_content(message) {
+            if emitted_any {
+                source.lines.push(Line::default());
+            }
+            push_message_lines(source, content, true, Some(&app.markdown));
+            emitted_any = true;
+            last_was_message = true;
+        }
+        for call in message.tool_calls.iter().flatten() {
+            if let Some(activity) = app.activities.iter().find(|activity| {
+                activity.turn_message_index == turn_message_index && activity.id == call.id
+            }) {
+                if last_was_message {
+                    source.lines.push(Line::default());
+                }
+                push_activity_line(source, app, activity);
+                matched_activities.push(activity.id.as_str());
+                emitted_any = true;
+                last_was_message = false;
+            }
+        }
+    }
+    for activity in app.activities.iter().filter(|activity| {
+        activity.turn_message_index == turn_message_index
+            && !matched_activities.contains(&activity.id.as_str())
+    }) {
+        if last_was_message {
+            source.lines.push(Line::default());
+        }
+        push_activity_line(source, app, activity);
+        last_was_message = false;
+    }
+}
+
+fn push_activity_line(source: &mut ConversationSource, app: &App, activity: &AgentActivity) {
+    let color = match activity.kind {
+        ActivityKind::Read => AQUA,
+        ActivityKind::Search => Color::LightBlue,
+        ActivityKind::Write => Color::Yellow,
+        ActivityKind::Shell => Color::Magenta,
+        ActivityKind::Skill => CRAB,
+        ActivityKind::Other => MUTED,
+    };
+    let (icon, icon_color) = match activity.status {
+        ActivityStatus::Running => (
+            SPINNER[app.spinner % SPINNER.len()].to_string(),
+            Color::Yellow,
+        ),
+        ActivityStatus::Completed => ("✓".to_owned(), Color::Green),
+        ActivityStatus::Failed => ("×".to_owned(), Color::Red),
+    };
+    let icon = format!("{icon} ");
+    let title = format!("{} ", activity.title);
+    let detail = activity_detail_for_display(&app.project_root, activity);
+    let detail_start = "  ".len() + icon.len() + title.len();
+    let line_index = source.lines.len();
+    source.lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(icon, Style::default().fg(icon_color)),
+        Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(detail.clone(), Style::default().fg(MUTED)),
+    ]));
+    if matches!(
+        activity.tool.as_str(),
+        "shell" | "read_file" | "write_file" | "replace_in_file"
+    ) && !detail.is_empty()
+    {
+        source.copy_targets.push(CopyTarget {
+            ranges: vec![SourceRange {
+                line: line_index,
+                start: detail_start,
+                end: detail_start + detail.len(),
+            }],
+            text: detail,
+        });
+    }
+}
+
+fn wrap_conversation_lines(lines: &[Line<'static>], width: u16) -> Vec<VisualRow> {
+    let mut rows = Vec::new();
+    for (source_line, line) in lines.iter().enumerate() {
+        let mut row = VisualRow {
+            source_line,
+            units: Vec::new(),
+        };
+        let mut row_width = 0;
+        let mut source_offset = 0;
+        for span in &line.spans {
+            for character in span.content.chars() {
+                let source_start = source_offset;
+                source_offset += character.len_utf8();
+                let (text, character_width) = if character == '\t' {
+                    ("    ".to_owned(), 4)
+                } else {
+                    (
+                        character.to_string(),
+                        UnicodeWidthChar::width(character).unwrap_or(0) as u16,
+                    )
+                };
+                if character_width == 0
+                    && let Some(previous) = row.units.last_mut()
+                {
+                    previous.text.push_str(&text);
+                    previous.source_end = source_offset;
+                    continue;
+                }
+                if !row.units.is_empty() && row_width + character_width > width {
+                    rows.push(std::mem::take(&mut row));
+                    row.source_line = source_line;
+                    row_width = 0;
+                }
+                row.units.push(VisualUnit {
+                    text,
+                    width: character_width,
+                    style: span.style,
+                    source_line,
+                    source_start,
+                    source_end: source_offset,
+                });
+                row_width = row_width.saturating_add(character_width);
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+fn visual_row_line(app: &App, row_index: usize, row: &VisualRow) -> Line<'static> {
+    Line::from(
+        row.units
+            .iter()
+            .enumerate()
+            .map(|(unit_index, unit)| {
+                let point = TextPoint {
+                    row: row_index,
+                    unit: unit_index,
+                };
+                let selected = app
+                    .text_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.contains(point));
+                let flashed = app.copy_flash.as_ref().is_some_and(|flash| {
+                    Instant::now() < flash.until
+                        && flash.ranges.iter().any(|range| {
+                            range.line == unit.source_line
+                                && unit.source_start < range.end
+                                && unit.source_end > range.start
+                        })
+                });
+                let style = if selected || flashed {
+                    unit.style.add_modifier(Modifier::REVERSED)
+                } else {
+                    unit.style
+                };
+                Span::styled(unit.text.clone(), style)
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn activity_detail_for_display(project_root: &Path, activity: &AgentActivity) -> String {
+    if !matches!(
+        activity.tool.as_str(),
+        "list_files" | "read_file" | "write_file" | "replace_in_file"
+    ) {
+        return activity.detail.clone();
+    }
+    let path = Path::new(&activity.detail);
+    if !path.is_absolute() {
+        return activity.detail.clone();
+    }
+    let path = normalized_root(path);
+    let root = normalized_root(project_root);
+    path.strip_prefix(&root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| activity.detail.clone())
 }
 
 fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let color = if app.is_running() {
+    let color = if app.recording.is_some() {
+        Color::Red
+    } else if app.is_running() || app.transcription.is_some() {
         Color::Yellow
     } else {
         AQUA
     };
-    let title = if app.is_running() {
-        " Draft · agent working "
+    let title = if app.recording.is_some() {
+        " Recording · Ctrl+Shift+S to stop "
+    } else if app.transcription.is_some() {
+        " Transcribing voice… "
+    } else if app.is_running() {
+        " Queue next message "
+    } else if app.editing_goal_id.is_some() {
+        " Edit goal · Enter save · Esc cancel "
     } else {
         " Message "
     };
@@ -1197,7 +3077,12 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         frame.render_widget(Paragraph::new(shown), inner);
     }
-    if app.approval.is_none() && !app.show_help && !app.show_skills && app.model_picker.is_none() {
+    if !app.show_help
+        && !app.show_skills
+        && app.model_picker.is_none()
+        && app.session_picker.is_none()
+        && app.goal_picker.is_none()
+    {
         frame.set_cursor_position((
             inner.x + column.min(inner.width.saturating_sub(1) as usize) as u16,
             inner.y + line_index.saturating_sub(start) as u16,
@@ -1213,7 +3098,7 @@ fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rec
         .items
         .iter()
         .any(|item| matches!(item.kind, CompletionKind::File | CompletionKind::Directory));
-    let desired_rows = menu.items.len().min(8) as u16;
+    let desired_rows = menu.items.len().min(12) as u16;
     let height = (desired_rows + 2).min(body.height);
     if height < 3 {
         return;
@@ -1315,47 +3200,6 @@ fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rec
     );
 }
 
-fn render_approval(frame: &mut Frame<'_>, area: Rect, action: &str) {
-    let popup = centered_rect(area, 70, 9);
-    frame.render_widget(Clear, popup);
-    let content = vec![
-        Line::from(Span::styled(
-            "The agent wants permission to:",
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            action.to_owned(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::default(),
-        Line::from(vec![
-            Span::styled(" Enter / Y ", Style::default().fg(Color::Black).bg(AQUA)),
-            Span::raw(" allow    "),
-            Span::styled(
-                " N / Esc ",
-                Style::default().fg(Color::White).bg(Color::Red),
-            ),
-            Span::raw(" deny"),
-        ]),
-    ];
-    frame.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(Span::styled(
-                    " Approval required ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        ),
-        popup,
-    );
-}
-
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(area, 74, 24);
     frame.render_widget(Clear, popup);
@@ -1367,6 +3211,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  Enter                 complete selection or send"),
         Line::from("  Tab                   complete slash selection"),
         Line::from("  Shift+Enter / Ctrl+J  insert newline"),
+        Line::from("  Ctrl+Shift+S          start or stop voice dictation"),
         Line::from("  ↑ / ↓                 navigate menu or move between lines"),
         Line::from("  PgUp / PgDn           scroll conversation"),
         Line::from("  Ctrl+U                clear composer"),
@@ -1387,7 +3232,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
         )),
         Line::from("  /clear     clear conversation context"),
+        Line::from("  /goal ...  start a persistent goal"),
+        Line::from("  /goals     manage persistent goals"),
         Line::from("  /model     choose model, thinking, and speed"),
+        Line::from("  /sessions  resume or delete saved sessions"),
         Line::from("  /skills    show available skills"),
         Line::from("  /quit      save and quit"),
         Line::default(),
@@ -1583,6 +3431,215 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(picker) = &app.session_picker else {
+        return;
+    };
+    let rows = picker.rows();
+    let session_count = picker
+        .projects
+        .iter()
+        .map(|project| project.project.sessions.len())
+        .sum::<usize>();
+    let height = (rows.len().min(16) as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
+    let popup = centered_rect(area, 86, height);
+    frame.render_widget(Clear, popup);
+    let available = popup.height.saturating_sub(4) as usize;
+    let start = picker
+        .selected
+        .saturating_sub(available.saturating_sub(1))
+        .min(rows.len().saturating_sub(available));
+    let current_id = app.agent.as_ref().map(|agent| agent.session().id);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "↑↓ select  •  ← parent/collapse  •  → expand  •  Enter resume  •  Del delete",
+            Style::default().fg(MUTED),
+        )),
+        Line::default(),
+    ];
+    for (index, row) in rows.iter().enumerate().skip(start).take(available) {
+        let selected = index == picker.selected;
+        let line = match *row {
+            SessionPickerRow::Project(project_index) => {
+                let project = &picker.projects[project_index];
+                let active = paths_equal(&project.project.root, &app.project_root);
+                Line::from(vec![
+                    Span::styled(
+                        if selected { " › " } else { "   " },
+                        Style::default().fg(CRAB),
+                    ),
+                    Span::styled(
+                        if project.expanded { "▾ " } else { "▸ " },
+                        Style::default().fg(CRAB),
+                    ),
+                    Span::styled(
+                        compact_path(&project.project.root.display().to_string(), 54),
+                        Style::default()
+                            .fg(if selected { Color::White } else { CRAB })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "  {}{}",
+                            project.project.sessions.len(),
+                            if active { "  current project" } else { "" }
+                        ),
+                        Style::default().fg(MUTED),
+                    ),
+                ])
+            }
+            SessionPickerRow::Session(project_index, session_index) => {
+                let session = &picker.projects[project_index].project.sessions[session_index];
+                let active = Some(session.id) == current_id
+                    && paths_equal(
+                        &picker.projects[project_index].project.root,
+                        &app.project_root,
+                    );
+                Line::from(vec![
+                    Span::styled(
+                        if selected { " ›     " } else { "       " },
+                        Style::default().fg(AQUA),
+                    ),
+                    Span::styled(if active { "● " } else { "  " }, Style::default().fg(AQUA)),
+                    Span::styled(
+                        format!("{:<28}", compact_text(&session.title, 27)),
+                        Style::default()
+                            .fg(if selected { Color::White } else { AQUA })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            " {:<18}  {}  {}",
+                            compact_text(&session.model, 17),
+                            &session.id.to_string()[..8],
+                            session.updated_at.format("%Y-%m-%d %H:%M")
+                        ),
+                        Style::default().fg(MUTED),
+                    ),
+                ])
+            }
+        };
+        lines.push(line.style(if selected {
+            Style::default().bg(Color::Rgb(42, 48, 58))
+        } else {
+            Style::default()
+        }));
+    }
+    if rows.is_empty() {
+        lines.push(Line::from("No saved sessions."));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(CRAB))
+                .title(Span::styled(
+                    format!(
+                        " Sessions · {} projects · {} sessions ",
+                        picker.projects.len(),
+                        session_count
+                    ),
+                    Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        popup,
+    );
+}
+
+fn render_goal_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(picker) = &app.goal_picker else {
+        return;
+    };
+    let height =
+        (app.goals.len().min(16) as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
+    let popup = centered_rect(area, 82, height);
+    frame.render_widget(Clear, popup);
+    let available = popup.height.saturating_sub(4) as usize;
+    let start = picker
+        .selected
+        .saturating_sub(available.saturating_sub(1))
+        .min(app.goals.len().saturating_sub(available));
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "↑↓ select  •  Enter/Space play or pause  •  D describe  •  Del delete  •  Esc close",
+            Style::default().fg(MUTED),
+        )),
+        Line::default(),
+    ];
+    for (index, goal) in app.goals.iter().enumerate().skip(start).take(available) {
+        let selected = index == picker.selected;
+        let (status, color) = match goal.status {
+            GoalStatus::Active => ("ACTIVE", GOAL),
+            GoalStatus::Paused => ("PAUSED", Color::Yellow),
+            GoalStatus::Completed => ("DONE", AQUA),
+            GoalStatus::Blocked => ("BLOCKED", Color::Red),
+        };
+        let preview = goal.objective.replace('\n', " ");
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    if selected { " › " } else { "   " },
+                    Style::default().fg(GOAL),
+                ),
+                Span::styled(
+                    format!("{status:<8}"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    compact_text(&preview, 62),
+                    Style::default().fg(if selected { Color::White } else { MUTED }),
+                ),
+            ])
+            .style(if selected {
+                Style::default().bg(Color::Rgb(42, 48, 58))
+            } else {
+                Style::default()
+            }),
+        );
+    }
+    if app.goals.is_empty() {
+        lines.push(Line::from("No goals in this session."));
+        lines.push(Line::from(Span::styled(
+            "Create one with /goal followed by its objective.",
+            Style::default().fg(MUTED),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(GOAL))
+                .title(Span::styled(
+                    format!(" Goals ({}) ", app.goals.len()),
+                    Style::default().fg(GOAL).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        popup,
+    );
+
+    if picker.describing
+        && let Some(goal) = app.goals.get(picker.selected)
+    {
+        let description = centered_rect(area, 72, area.height.saturating_sub(8).clamp(8, 24));
+        frame.render_widget(Clear, description);
+        frame.render_widget(
+            Paragraph::new(goal.objective.clone())
+                .wrap(Wrap { trim: false })
+                .scroll((picker.description_scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(GOAL))
+                        .title(Span::styled(
+                            " Goal description · ↑↓/PgUp/PgDn scroll · Esc close ",
+                            Style::default().fg(GOAL).add_modifier(Modifier::BOLD),
+                        )),
+                ),
+            description,
+        );
+    }
+}
+
 fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1604,209 +3661,6 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
             horizontal: 0,
             vertical: 0,
         })
-}
-
-struct SlashCompletionContext<'a> {
-    start: usize,
-    end: usize,
-    prefix: &'a str,
-    commands_allowed: bool,
-}
-
-struct FileCompletionContext {
-    start: usize,
-    end: usize,
-    dir_prefix: String,
-    name_prefix: String,
-    directory: PathBuf,
-}
-
-fn file_completion_context(
-    input: &str,
-    cursor: usize,
-    project_root: &Path,
-) -> Option<FileCompletionContext> {
-    let before = input.get(..cursor)?;
-    let start = before.rfind('@')?;
-    if start > 0
-        && !input[..start]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_whitespace)
-    {
-        return None;
-    }
-    let typed = &input[start + 1..cursor];
-    if typed.chars().any(char::is_whitespace) {
-        return None;
-    }
-    let normalized = typed.replace('\\', "/");
-    let (dir_prefix, name_prefix) = normalized
-        .rfind('/')
-        .map(|slash| {
-            (
-                normalized[..=slash].to_owned(),
-                normalized[slash + 1..].to_owned(),
-            )
-        })
-        .unwrap_or_else(|| (String::new(), normalized));
-    let directory = project_root.join(dir_prefix.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let mut end = cursor;
-    while end < input.len() {
-        let Some(value) = input[end..].chars().next() else {
-            break;
-        };
-        if value.is_whitespace() {
-            break;
-        }
-        end += value.len_utf8();
-    }
-    Some(FileCompletionContext {
-        start,
-        end,
-        dir_prefix,
-        name_prefix,
-        directory,
-    })
-}
-
-fn file_completion_items(context: &FileCompletionContext) -> Vec<CompletionItem> {
-    let Ok(entries) = fs::read_dir(&context.directory) else {
-        return Vec::new();
-    };
-    let prefix = context.name_prefix.to_lowercase();
-    let mut items = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.to_lowercase().starts_with(&prefix) {
-                return None;
-            }
-            let is_dir = entry.file_type().ok()?.is_dir();
-            let kind = if is_dir {
-                CompletionKind::Directory
-            } else {
-                CompletionKind::File
-            };
-            Some(CompletionItem {
-                name: format!("{}{}", context.dir_prefix, name),
-                description: String::new(),
-                icon: Some(if is_dir {
-                    NERD_FOLDER
-                } else {
-                    file_icon(&entry.path())
-                }),
-                kind,
-            })
-        })
-        .collect::<Vec<_>>();
-    items.sort_by(|left, right| {
-        let left_dir = left.kind == CompletionKind::Directory;
-        let right_dir = right.kind == CompletionKind::Directory;
-        right_dir
-            .cmp(&left_dir)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
-    items
-}
-
-const NERD_FOLDER: &str = "";
-const NERD_FILE: &str = "";
-
-fn file_icon(path: &Path) -> &'static str {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match file_name.as_str() {
-        "dockerfile" | "containerfile" => return "󰡨",
-        "makefile" => return "",
-        ".gitignore" | ".gitattributes" | ".gitmodules" => return "",
-        "license" | "license.md" | "license.txt" => return "",
-        _ => {}
-    }
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "js" | "mjs" | "cjs" => "",
-        "jsx" => "",
-        "ts" => "",
-        "tsx" => "",
-        "py" | "pyw" => "",
-        "rs" => "",
-        "go" => "",
-        "java" | "jar" => "",
-        "c" | "h" => "",
-        "cc" | "cpp" | "cxx" | "hpp" => "",
-        "cs" => "󰌛",
-        "html" | "htm" => "",
-        "css" | "scss" | "sass" | "less" => "",
-        "vue" => "",
-        "svelte" => "",
-        "rb" => "",
-        "php" => "",
-        "swift" => "",
-        "kt" | "kts" => "",
-        "lua" => "",
-        "sh" | "bash" | "zsh" | "fish" | "ps1" => "",
-        "json" | "jsonc" => "",
-        "toml" => "",
-        "yaml" | "yml" => "",
-        "xml" => "󰗀",
-        "md" | "markdown" | "rst" => "",
-        "sql" | "db" | "sqlite" => "",
-        "lock" => "",
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" => "",
-        "zip" | "tar" | "gz" | "7z" | "rar" => "",
-        "mp3" | "wav" | "flac" | "ogg" => "",
-        "mp4" | "mov" | "mkv" | "webm" => "",
-        "pdf" => "",
-        "txt" => "󰈙",
-        _ => NERD_FILE,
-    }
-}
-
-fn slash_completion_context(input: &str, cursor: usize) -> Option<SlashCompletionContext<'_>> {
-    let before = input.get(..cursor)?;
-    let start = before.rfind('/')?;
-    if start > 0 && input.as_bytes()[start - 1] == b'/' {
-        return None;
-    }
-    let prefix = &input[start + 1..cursor];
-    if !prefix.bytes().all(is_completion_name_byte) {
-        return None;
-    }
-    let mut end = cursor;
-    while end < input.len() && is_completion_name_byte(input.as_bytes()[end]) {
-        end += 1;
-    }
-    Some(SlashCompletionContext {
-        start,
-        end,
-        prefix,
-        commands_allowed: start == 0,
-    })
-}
-
-fn is_completion_name_byte(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-}
-
-fn is_builtin_command(prompt: &str) -> bool {
-    matches!(
-        prompt,
-        "/help" | "/model" | "/models" | "/skills" | "/clear" | "/quit"
-    )
-}
-
-fn builtin_command_from_input(input: &str) -> Option<&str> {
-    let trimmed = input.trim();
-    (input == trimmed && is_builtin_command(trimmed)).then_some(trimmed)
 }
 
 fn cursor_line_column(input: &str, cursor: usize) -> (usize, usize) {
@@ -1908,34 +3762,58 @@ fn compact_path(path: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-pub(crate) fn print_sessions(sessions: &[SessionSummary]) {
-    if sessions.is_empty() {
+fn compact_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let head = text.chars().take(max.saturating_sub(1)).collect::<String>();
+    format!("{head}…")
+}
+
+pub(crate) fn print_sessions(projects: &[SessionProject]) {
+    if projects.iter().all(|project| project.sessions.is_empty()) {
         println!("No saved sessions.");
         return;
     }
-    println!("{:<10}  {:<20}  {:<18}  TITLE", "ID", "UPDATED", "MODEL");
-    for session in sessions {
-        println!(
-            "{:<10}  {:<20}  {:<18}  {}",
-            &session.id.to_string()[..8],
-            session.updated_at.format("%Y-%m-%d %H:%M"),
-            session.model,
-            session.title
-        );
+    for project in projects {
+        if project.sessions.is_empty() {
+            continue;
+        }
+        println!("\n{}", project.root.display());
+        println!("  {:<10}  {:<20}  {:<18}  TITLE", "ID", "UPDATED", "MODEL");
+        for session in &project.sessions {
+            println!(
+                "  {:<10}  {:<20}  {:<18}  {}",
+                &session.id.to_string()[..8],
+                session.updated_at.format("%Y-%m-%d %H:%M"),
+                session.model,
+                session.title
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use super::*;
     use ratatui::backend::TestBackend;
 
     use crate::{
-        config::Config,
-        provider::{ModelCatalogEntry, OpenAiCompatible, ReasoningOption, ServiceTierOption},
+        completion::{NERD_FOLDER, file_completion_context, file_icon},
+        config::{Config, SessionRegistry, paths_equal},
+        provider::{
+            FunctionCall, ModelCatalogEntry, OpenAiCompatible, ReasoningOption, ServiceTierOption,
+            ToolCall,
+        },
         skills::SkillRegistry,
-        tools::{ApprovalMode, ToolBox},
+        tools::ToolBox,
     };
+
+    fn test_registry(root: &Path) -> SessionRegistry {
+        SessionRegistry::at(root.join("test-global-config.toml"))
+    }
 
     fn test_app(root: &std::path::Path) -> App {
         let config = Config {
@@ -1946,11 +3824,12 @@ mod tests {
         let provider = OpenAiCompatible::new(&config).unwrap();
         let store = SessionStore::new(root).unwrap();
         let session = store.create(config.model).unwrap();
-        let tools = ToolBox::new(root.to_path_buf(), ApprovalMode::Ask);
+        let tools = ToolBox::new(root.to_path_buf());
         App::new(
             Agent::new(provider, tools, SkillRegistry::default(), session).unwrap(),
             Vec::new(),
             None,
+            false,
         )
     }
 
@@ -1973,6 +3852,479 @@ mod tests {
     fn composer_edits_unicode_at_character_boundaries() {
         let (line, column) = cursor_line_column("hola\n🦀", "hola\n🦀".len());
         assert_eq!((line, column), (1, 1));
+    }
+
+    #[test]
+    fn voice_transcript_is_inserted_at_the_cursor_without_sending() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.input = "Reviewthis".into();
+        app.cursor = "Review".len();
+
+        app.insert_transcript("the project");
+
+        assert_eq!(app.input, "Review the project this");
+        assert_eq!(app.cursor, "Review the project ".len());
+        assert!(app.pending_user.is_none());
+    }
+
+    #[test]
+    fn streamed_text_deltas_update_one_live_assistant_message() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        app.event_rx = Some(event_rx);
+        event_tx
+            .send(AgentEvent::AssistantTextDelta {
+                delta: "A long ".into(),
+                start: true,
+            })
+            .unwrap();
+        event_tx
+            .send(AgentEvent::AssistantTextDelta {
+                delta: "answer".into(),
+                start: false,
+            })
+            .unwrap();
+
+        app.drain_agent_events();
+
+        assert_eq!(app.live_messages.len(), 1);
+        assert_eq!(
+            app.live_messages[0].content.as_deref(),
+            Some("A long answer")
+        );
+        assert!(app.auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn submitting_while_the_agent_works_queues_the_next_message() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(root.path());
+        let mut app = test_app(root.path());
+        let agent = app.agent.take().unwrap();
+        let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        app.running = Some(tokio::spawn(async move {
+            let _ = finish_rx.await;
+            (agent, Ok(String::new()))
+        }));
+        app.input = "Follow up after this turn".into();
+        app.cursor = app.input.len();
+
+        app.submit(&registry).unwrap();
+
+        assert_eq!(
+            app.queued_prompt.as_deref(),
+            Some("Follow up after this turn")
+        );
+        assert!(app.input.is_empty());
+        assert!(app.is_running());
+        app.running.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn double_escape_and_the_mouse_only_steer_button_cancel_a_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(root.path());
+        let mut app = test_app(root.path());
+        let agent = app.agent.take().unwrap();
+        let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        app.running = Some(tokio::spawn(async move {
+            let _ = finish_rx.await;
+            (agent, Ok(String::new()))
+        }));
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        app.cancel_tx = Some(cancel_tx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &registry)
+            .unwrap();
+        assert!(!*cancel_rx.borrow());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &registry)
+            .unwrap();
+        assert!(*cancel_rx.borrow_and_update());
+
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        app.cancel_tx = Some(cancel_tx);
+        app.queued_prompt = Some("Steer now".into());
+        app.steer_button = Some(Rect::new(10, 4, 9, 3));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(*cancel_rx.borrow_and_update());
+        app.running.take().unwrap().abort();
+    }
+
+    #[test]
+    fn queued_message_renders_a_compact_steer_button() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.queued_prompt = Some("Use the other implementation".into());
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("QUEUED"));
+        assert!(text.contains("Use the other implementation"));
+        assert!(text.contains("Steer"));
+        assert!(app.steer_button.is_some());
+    }
+
+    #[test]
+    fn goal_picker_pauses_the_active_goal_and_the_goal_row_has_mouse_controls() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(root.path());
+        let mut app = test_app(root.path());
+        let id = app
+            .agent
+            .as_mut()
+            .unwrap()
+            .create_goal("Finish the migration and keep every test green".into());
+        app.sync_goals_from_agent();
+
+        app.open_goal_picker();
+        assert_eq!(app.goal_picker.as_ref().unwrap().selected, 0);
+        app.toggle_selected_goal();
+        app.apply_pending_goal_action(&registry).unwrap();
+
+        assert_eq!(
+            app.goals.iter().find(|goal| goal.id == id).unwrap().status,
+            GoalStatus::Paused
+        );
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("PAUSED"));
+        assert!(text.contains("Finish the migration"));
+        assert!(app.goal_buttons.toggle.is_some());
+        assert!(app.goal_buttons.edit.is_some());
+        assert!(app.goal_buttons.delete.is_some());
+        assert!(app.goal_buttons.list.is_some());
+    }
+
+    #[test]
+    fn hidden_goal_continuations_do_not_render_as_user_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.transcript
+            .push(Message::text(Role::User, "Start the goal"));
+        app.transcript
+            .push(Message::text(Role::Assistant, "First pass."));
+        app.transcript.push(Message::hidden_text(
+            Role::User,
+            "Continue working toward the active goal.",
+        ));
+        app.transcript
+            .push(Message::text(Role::Assistant, "Second pass."));
+
+        let lines = conversation_lines(&app)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines.iter().filter(|line| line.as_str() == " YOU ").count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == " CRAB ")
+                .count(),
+            2
+        );
+        assert!(!lines.iter().any(|line| line.contains("Continue working")));
+        assert!(lines.iter().any(|line| line == "Second pass."));
+    }
+
+    #[test]
+    fn conversation_copy_targets_contain_only_messages_commands_and_file_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.transcript
+            .push(Message::text(Role::User, "Run the checks"));
+        app.transcript.push(Message {
+            role: Role::Assistant,
+            content: Some("I’ll run the checks and update the file.".into()),
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "shell-1".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "shell".into(),
+                        arguments: r#"{"command":"cargo test --all"}"#.into(),
+                    },
+                },
+                ToolCall {
+                    id: "write-1".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "write_file".into(),
+                        arguments: r#"{"path":"src/lib.rs","content":"done"}"#.into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            hidden: false,
+        });
+        app.activities.extend([
+            AgentActivity {
+                id: "shell-1".into(),
+                turn_message_index: 0,
+                tool: "shell".into(),
+                kind: ActivityKind::Shell,
+                status: ActivityStatus::Completed,
+                title: "Ran".into(),
+                detail: "cargo test --all".into(),
+            },
+            AgentActivity {
+                id: "write-1".into(),
+                turn_message_index: 0,
+                tool: "write_file".into(),
+                kind: ActivityKind::Write,
+                status: ActivityStatus::Completed,
+                title: "Wrote".into(),
+                detail: "src/lib.rs".into(),
+            },
+        ]);
+
+        let source = conversation_source(&app);
+        let copied = source
+            .copy_targets
+            .iter()
+            .map(|target| target.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(copied.contains(&"Run the checks"));
+        assert!(copied.contains(&"I’ll run the checks and update the file."));
+        assert!(copied.contains(&"cargo test --all"));
+        assert!(copied.contains(&"src/lib.rs"));
+        assert!(!copied.iter().any(|text| text.contains("Ran cargo")));
+        assert!(!copied.iter().any(|text| text.contains("Wrote src")));
+    }
+
+    #[test]
+    fn dragged_selection_copies_visual_text_without_newlines_at_soft_wraps() {
+        let lines = vec![Line::from("abcdef"), Line::from("🦀x")];
+        let rows = wrap_conversation_lines(&lines, 3);
+        let view = ConversationView {
+            area: Rect::new(0, 0, 3, 3),
+            rows,
+            scroll: 0,
+            copy_targets: Vec::new(),
+        };
+        let selection = TextSelection {
+            anchor: TextPoint { row: 0, unit: 1 },
+            cursor: TextPoint { row: 2, unit: 0 },
+            dragging: false,
+            moved: true,
+            last_column: 0,
+            last_row: 0,
+        };
+
+        assert_eq!(view.selected_text(&selection), "bcdef\n🦀");
+    }
+
+    #[test]
+    fn copy_feedback_reverses_the_target_style() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.copy_flash = Some(CopyFlash {
+            ranges: vec![SourceRange {
+                line: 4,
+                start: 0,
+                end: 4,
+            }],
+            until: Instant::now() + Duration::from_millis(500),
+        });
+        let row = VisualRow {
+            source_line: 4,
+            units: vec![VisualUnit {
+                text: "copy".into(),
+                width: 4,
+                style: Style::default().fg(AQUA),
+                source_line: 4,
+                source_start: 0,
+                source_end: 4,
+            }],
+        };
+
+        let line = visual_row_line(&app, 0, &row);
+
+        assert!(
+            line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn markdown_highlighting_preserves_markers_and_distinguishes_inline_syntax() {
+        let highlighter = shared_markdown_highlighter();
+        let markdown = concat!(
+            "# Main\n",
+            "## Secondary\n",
+            "### Also secondary\n",
+            "**bold** *italic* `inline`\n",
+            "- bullet\n",
+            "12. numbered"
+        );
+
+        let lines = highlighter.render(markdown);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, markdown.lines().collect::<Vec<_>>());
+        assert_eq!(lines[0].spans[0].style.fg, Some(MARKDOWN_H1));
+        assert_eq!(lines[1].spans[0].style.fg, Some(MARKDOWN_HEADING));
+        assert_eq!(lines[2].spans[0].style.fg, Some(MARKDOWN_HEADING));
+        let bold = lines[3]
+            .spans
+            .iter()
+            .find(|span| span.content == "**bold**")
+            .unwrap();
+        assert_eq!(bold.style.fg, Some(MARKDOWN_BOLD));
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        let italic = lines[3]
+            .spans
+            .iter()
+            .find(|span| span.content == "*italic*")
+            .unwrap();
+        assert_eq!(italic.style.fg, Some(MARKDOWN_ITALIC));
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
+        let inline = lines[3]
+            .spans
+            .iter()
+            .find(|span| span.content == "`inline`")
+            .unwrap();
+        assert_eq!(inline.style.fg, Some(MARKDOWN_CODE));
+        assert_eq!(lines[4].spans[0].content, "-");
+        assert_eq!(lines[4].spans[0].style.fg, Some(MARKDOWN_LIST));
+        assert_eq!(lines[5].spans[0].content, "12.");
+        assert_eq!(lines[5].spans[0].style.fg, Some(MARKDOWN_LIST));
+    }
+
+    #[test]
+    fn fenced_code_uses_embedded_syntax_highlighting_and_keeps_the_fences() {
+        let highlighter = shared_markdown_highlighter();
+        let markdown = "```rust\nfn main() { let value = 42; }\n```";
+
+        let lines = highlighter.render(markdown);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let code_colors = lines[1]
+            .spans
+            .iter()
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            rendered,
+            ["```rust", "fn main() { let value = 42; }", "```"]
+        );
+        assert!(code_colors.len() > 1);
+        assert_eq!(lines[0].spans[0].content, "```");
+        assert_eq!(lines[0].spans[0].style.fg, Some(MARKDOWN_FENCE));
+    }
+
+    #[test]
+    fn markdown_styles_apply_to_agent_messages_but_not_user_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.transcript
+            .push(Message::text(Role::User, "**user text**"));
+        app.transcript
+            .push(Message::text(Role::Assistant, "**agent text**"));
+
+        let source = conversation_source(&app);
+        let user = source
+            .lines
+            .iter()
+            .find(|line| line.to_string() == "**user text**")
+            .unwrap();
+        let agent = source
+            .lines
+            .iter()
+            .find(|line| line.to_string() == "**agent text**")
+            .unwrap();
+
+        assert!(!user.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(agent.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(agent.spans[0].content, "**agent text**");
+    }
+
+    #[test]
+    fn dragging_above_the_conversation_scrolls_and_extends_the_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.scroll = 5;
+        app.max_scroll = 15;
+        app.conversation_view = Some(ConversationView {
+            area: Rect::new(0, 3, 40, 5),
+            rows: (0..20)
+                .map(|source_line| VisualRow {
+                    source_line,
+                    units: vec![VisualUnit {
+                        text: "x".into(),
+                        width: 1,
+                        style: Style::default(),
+                        source_line,
+                        source_start: 0,
+                        source_end: 1,
+                    }],
+                })
+                .collect(),
+            scroll: 5,
+            copy_targets: Vec::new(),
+        });
+        app.text_selection = Some(TextSelection {
+            anchor: TextPoint { row: 7, unit: 0 },
+            cursor: TextPoint { row: 7, unit: 0 },
+            dragging: true,
+            moved: false,
+            last_column: 0,
+            last_row: 1,
+        });
+
+        app.update_drag_autoscroll();
+
+        assert_eq!(app.scroll, 3);
+        assert_eq!(
+            app.text_selection.as_ref().unwrap().cursor,
+            TextPoint { row: 3, unit: 0 }
+        );
+        assert!(app.text_selection.as_ref().unwrap().moved);
     }
 
     #[test]
@@ -2043,7 +4395,7 @@ mod tests {
     #[test]
     fn printable_characters_use_the_terminal_resolved_keyboard_layout() {
         let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
+        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
 
         // Spanish layout: AltGr+2 is reported by Windows as Ctrl+Alt+'@'.
@@ -2052,13 +4404,13 @@ mod tests {
                 KeyCode::Char('@'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
-            &store,
+            &registry,
         )
         .unwrap();
         // US layout: Shift+2 is already reported as the logical '@' character.
         app.handle_key(
             KeyEvent::new(KeyCode::Char('@'), KeyModifiers::SHIFT),
-            &store,
+            &registry,
         )
         .unwrap();
         app.handle_key(
@@ -2066,7 +4418,7 @@ mod tests {
                 KeyCode::Char('€'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
-            &store,
+            &registry,
         )
         .unwrap();
 
@@ -2075,7 +4427,7 @@ mod tests {
         // An unknown Ctrl-only chord remains a control chord rather than text.
         app.handle_key(
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-            &store,
+            &registry,
         )
         .unwrap();
         assert_eq!(app.input, "@@€");
@@ -2085,6 +4437,7 @@ mod tests {
     fn renders_wide_and_compact_layouts() {
         let wide = render_text(120, 36);
         assert!(wide.contains("CODECRAB"));
+        assert!(!wide.contains("Conversation"));
         assert!(!wide.contains("Activity"));
         assert!(wide.contains("default"));
         assert!(!wide.contains("What are we building?"));
@@ -2094,6 +4447,162 @@ mod tests {
         assert!(compact.contains("CODECRAB"));
         assert!(!compact.contains("Activity"));
         assert!(compact.contains("Message"));
+    }
+
+    #[test]
+    fn conversation_scroll_stays_manual_until_new_agent_output_arrives() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = test_registry(root.path());
+        let mut app = test_app(root.path());
+        app.max_scroll = 30;
+        app.scroll = 30;
+        app.auto_scroll = true;
+        app.activities.push(AgentActivity {
+            id: "old-call".into(),
+            turn_message_index: 0,
+            tool: "shell".into(),
+            kind: ActivityKind::Shell,
+            status: ActivityStatus::Completed,
+            title: "Ran".into(),
+            detail: "cargo test".into(),
+        });
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(app.scroll, 20);
+        assert!(!app.auto_scroll);
+
+        app.drain_agent_events();
+        assert_eq!(app.scroll, 20);
+        assert!(!app.auto_scroll);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll, 17);
+        assert!(!app.auto_scroll);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll, 20);
+        assert!(!app.auto_scroll);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(app.scroll, 30);
+        assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn agent_actions_are_grouped_under_one_crab_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.transcript
+            .push(Message::text(Role::User, "Inspect the project"));
+        app.transcript.push(Message {
+            role: Role::Assistant,
+            content: Some("I’ll inspect the relevant file first.".into()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call-1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"src/main.rs"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            hidden: false,
+        });
+        app.transcript.push(Message {
+            role: Role::Tool,
+            content: Some("file contents".into()),
+            tool_calls: None,
+            tool_call_id: Some("call-1".into()),
+            hidden: false,
+        });
+        app.activities.push(AgentActivity {
+            id: "call-1".into(),
+            turn_message_index: 0,
+            tool: "read_file".into(),
+            kind: ActivityKind::Read,
+            status: ActivityStatus::Completed,
+            title: "Read".into(),
+            detail: "src/main.rs".into(),
+        });
+        app.transcript
+            .push(Message::text(Role::Assistant, "Inspection complete."));
+
+        let lines = conversation_lines(&app)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == " CRAB ")
+                .count(),
+            1
+        );
+        let you = lines.iter().position(|line| line == " YOU ").unwrap();
+        let crab = lines.iter().position(|line| line == " CRAB ").unwrap();
+        let action = lines
+            .iter()
+            .position(|line| line.contains("Read src/main.rs"))
+            .unwrap();
+        let progress = lines
+            .iter()
+            .position(|line| line == "I’ll inspect the relevant file first.")
+            .unwrap();
+        let answer = lines
+            .iter()
+            .position(|line| line == "Inspection complete.")
+            .unwrap();
+        assert!(you < crab && crab < progress && progress < action && action < answer);
+        assert!(lines[crab - 1].is_empty());
+        assert!(lines[action - 1].is_empty());
+        assert!(lines[answer - 1].is_empty());
+    }
+
+    #[test]
+    fn terminal_file_activities_are_relative_to_the_active_project() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("src");
+        fs::create_dir(&source).unwrap();
+        let file = source.join("main.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+        let activity = AgentActivity {
+            id: "call-1".into(),
+            turn_message_index: 0,
+            tool: "read_file".into(),
+            kind: ActivityKind::Read,
+            status: ActivityStatus::Completed,
+            title: "Read".into(),
+            detail: file.display().to_string(),
+        };
+
+        assert_eq!(
+            activity_detail_for_display(root.path(), &activity),
+            "src/main.rs"
+        );
     }
 
     #[test]
@@ -2258,7 +4767,7 @@ mod tests {
     #[test]
     fn model_picker_walks_model_reasoning_and_service_tier() {
         let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
+        let registry = test_registry(root.path());
         let mut app = test_app(root.path());
         app.model_catalog = vec![
             ModelCatalogEntry {
@@ -2286,19 +4795,19 @@ mod tests {
         ];
 
         app.open_model_picker();
-        app.accept_model_selection(&store).unwrap();
+        app.accept_model_selection(&registry).unwrap();
         assert_eq!(
             app.model_picker.as_ref().unwrap().step,
             ModelPickerStep::Reasoning
         );
         app.model_picker.as_mut().unwrap().selected = 1;
-        app.accept_model_selection(&store).unwrap();
+        app.accept_model_selection(&registry).unwrap();
         assert_eq!(
             app.model_picker.as_ref().unwrap().step,
             ModelPickerStep::Speed
         );
         app.model_picker.as_mut().unwrap().selected = 1;
-        app.accept_model_selection(&store).unwrap();
+        app.accept_model_selection(&registry).unwrap();
 
         assert_eq!(app.model, "future-9-sol");
         assert_eq!(app.reasoning_effort.as_deref(), Some("deep"));
@@ -2330,6 +4839,126 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("future-9-sol"));
         assert!(text.contains("deep"));
-        assert!(text.contains('⚡'));
+        let after_model = text.split_once("future-9-sol").unwrap().1;
+        let (before_fast, after_fast) = after_model.split_once('⚡').unwrap();
+        assert!(!before_fast.contains('│'));
+        let before_thinking = after_fast.split_once("deep").unwrap().0;
+        assert_eq!(before_thinking.matches('│').count(), 1);
+    }
+
+    #[test]
+    fn session_picker_navigates_projects_and_switches_the_agent_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_root = temp.path().join("current-project");
+        let other_root = temp.path().join("other-project");
+        fs::create_dir_all(&current_root).unwrap();
+        fs::create_dir_all(&other_root).unwrap();
+        fs::write(other_root.join("only-in-other.txt"), "hello").unwrap();
+
+        let registry = test_registry(temp.path());
+        let other_store = SessionStore::new(&other_root).unwrap();
+        let mut app = test_app(&current_root);
+        let mut saved = other_store.create("restored-model".into()).unwrap();
+        saved.reasoning_effort = Some("high".into());
+        saved.service_tier = Some("priority".into());
+        saved.title = "Saved conversation".into();
+        saved
+            .messages
+            .push(Message::text(Role::User, "Remember this"));
+        other_store.save(&saved).unwrap();
+        registry.register(&other_root).unwrap();
+
+        app.open_session_picker(&registry).unwrap();
+        let picker = app.session_picker.as_ref().unwrap();
+        assert!(paths_equal(&picker.projects[0].project.root, &current_root));
+        assert!(picker.projects[0].expanded);
+        assert!(matches!(
+            picker.selected_row(),
+            Some(SessionPickerRow::Session(0, _))
+        ));
+
+        app.move_session_left();
+        assert!(matches!(
+            app.session_picker.as_ref().unwrap().selected_row(),
+            Some(SessionPickerRow::Project(0))
+        ));
+        app.move_session_left();
+        assert!(!app.session_picker.as_ref().unwrap().projects[0].expanded);
+        app.move_session_selection(1);
+        assert!(matches!(
+            app.session_picker.as_ref().unwrap().selected_row(),
+            Some(SessionPickerRow::Project(1))
+        ));
+        app.move_session_right();
+        assert!(app.session_picker.as_ref().unwrap().projects[1].expanded);
+        app.move_session_selection(1);
+        assert!(matches!(
+            app.session_picker.as_ref().unwrap().selected_row(),
+            Some(SessionPickerRow::Session(1, _))
+        ));
+
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("other-project"));
+        assert!(text.contains("Saved conversation"));
+        assert!(text.contains("Del delete"));
+
+        app.accept_session_selection().unwrap();
+        assert!(paths_equal(&app.project_root, &other_root));
+        assert!(paths_equal(
+            app.agent.as_ref().unwrap().project_root(),
+            &other_root
+        ));
+        assert_eq!(app.model, "restored-model");
+        assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(app.service_tier.as_deref(), Some("priority"));
+        assert_eq!(app.transcript[0].content.as_deref(), Some("Remember this"));
+
+        app.input = "@".into();
+        app.cursor = 1;
+        app.refresh_completion();
+        assert!(
+            app.completion
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.name == "only-in-other.txt")
+        );
+
+        app.open_session_picker(&registry).unwrap();
+        let saved_row = {
+            let picker = app.session_picker.as_ref().unwrap();
+            picker
+                .rows()
+                .iter()
+                .position(|row| {
+                    matches!(
+                        row,
+                        SessionPickerRow::Session(project, session)
+                            if picker.projects[*project].project.sessions[*session].id == saved.id
+                    )
+                })
+                .unwrap()
+        };
+        app.session_picker.as_mut().unwrap().selected = saved_row;
+        app.delete_session_selection(&registry).unwrap();
+
+        let replacement = app.agent.as_ref().unwrap().session();
+        assert_ne!(replacement.id, saved.id);
+        assert_eq!(replacement.model, "restored-model");
+        assert_eq!(replacement.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(replacement.service_tier.as_deref(), Some("priority"));
+        assert!(replacement.messages.is_empty());
+        assert!(other_store.load(Some(&saved.id.to_string())).is_err());
+        assert!(app.session_picker.is_some());
     }
 }

@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    continue-on-error: ${{ !matrix.required }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows
+            arch: x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable_suffix: .exe
+            asset: windows-x64.exe
+            required: true
+          - platform: Windows
+            arch: ARM64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            executable_suffix: .exe
+            asset: windows-arm64.exe
+            required: false
+          - platform: macOS
+            arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            executable_suffix: ""
+            asset: macos-x64
+            required: true
+          - platform: macOS
+            arch: ARM64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            executable_suffix: ""
+            asset: macos-arm64
+            required: false
+          - platform: Linux
+            arch: x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable_suffix: ""
+            asset: linux-x64
+            required: true
+          - platform: Linux
+            arch: ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable_suffix: ""
+            asset: linux-arm64
+            required: false
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev pkg-config
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage release binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp \
+            "target/${{ matrix.target }}/release/codecrab${{ matrix.executable_suffix }}" \
+            "dist/codecrab-${{ github.ref_name }}-${{ matrix.asset }}"
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: codecrab-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/codecrab-${{ github.ref_name }}-${{ matrix.asset }}
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: codecrab-*
+          path: dist
+          merge-multiple: true
+
+      - name: Require all priority x64 binaries
+        shell: bash
+        run: |
+          test -f "dist/codecrab-${GITHUB_REF_NAME}-windows-x64.exe"
+          test -f "dist/codecrab-${GITHUB_REF_NAME}-macos-x64"
+          test -f "dist/codecrab-${GITHUB_REF_NAME}-linux-x64"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "CodeCrab ${GITHUB_REF_NAME}"
