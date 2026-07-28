@@ -72,7 +72,7 @@ struct ServerInner {
     debug_openai: bool,
     models: RwLock<Vec<ModelCatalogEntry>>,
     catalog_error: RwLock<Option<String>>,
-    dictation_available: bool,
+    oauth_logged_in: bool,
     workspace: Mutex<ServerWorkspace>,
     active_turn: Mutex<Option<watch::Sender<bool>>>,
 }
@@ -194,7 +194,7 @@ pub(crate) async fn serve(
 ) -> Result<()> {
     let store = SessionStore::new(&root)?;
     let registry = SessionRegistry::global();
-    let dictation_available = OAuthStore::new()?.is_logged_in();
+    let oauth_logged_in = OAuthStore::new()?.is_logged_in();
     let active = config.provider(&config.active_provider)?;
     let session =
         store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
@@ -215,7 +215,7 @@ pub(crate) async fn serve(
             debug_openai,
             models: RwLock::new(models),
             catalog_error: RwLock::new(catalog_error),
-            dictation_available,
+            oauth_logged_in,
             workspace: Mutex::new(ServerWorkspace {
                 root,
                 agent: Some(agent),
@@ -350,7 +350,16 @@ async fn snapshot(state: &ServerState) -> Result<StateResponse> {
         .first()
         .map(|project| project.root.display().to_string())
         .unwrap_or_else(|| root.display().to_string());
-    let providers = state.inner.config.read().unwrap().summaries();
+    let config = state.inner.config.read().unwrap();
+    let dictation_available = session.as_ref().is_some_and(|session| {
+        Transcriber::is_available_with_oauth(
+            &config,
+            &session.provider,
+            state.inner.oauth_logged_in,
+        )
+        .unwrap_or(false)
+    });
+    let providers = config.summaries();
     Ok(StateResponse {
         project,
         session,
@@ -358,7 +367,7 @@ async fn snapshot(state: &ServerState) -> Result<StateResponse> {
         skills,
         models: state.inner.models.read().unwrap().clone(),
         catalog_error: state.inner.catalog_error.read().unwrap().clone(),
-        dictation_available: state.inner.dictation_available,
+        dictation_available,
         providers,
     })
 }
@@ -427,10 +436,19 @@ async fn transcribe(
             "recording is empty",
         ));
     }
-    if !state.inner.dictation_available {
+    let provider = {
+        let workspace = state.inner.workspace.lock().await;
+        workspace
+            .agent
+            .as_ref()
+            .map(|agent| agent.session().provider.clone())
+            .context("create or resume a session before using voice dictation")?
+    };
+    let config = state.inner.config.read().unwrap().clone();
+    if !Transcriber::is_available_with_oauth(&config, &provider, state.inner.oauth_logged_in)? {
         return Err(ApiError::message(
-            StatusCode::UNAUTHORIZED,
-            "voice dictation requires ChatGPT OAuth; run `codecrab auth login`",
+            StatusCode::FORBIDDEN,
+            "voice dictation requires the official OpenAI provider and valid authentication",
         ));
     }
     let content_type = headers
@@ -438,7 +456,7 @@ async fn transcribe(
         .and_then(|value| value.to_str().ok())
         .filter(|value| value.starts_with("audio/"))
         .unwrap_or("audio/webm");
-    let text = Transcriber::new(state.inner.debug_openai)?
+    let text = Transcriber::new(&config, &provider, state.inner.debug_openai)?
         .transcribe(body.to_vec(), content_type)
         .await?;
     Ok(Json(TranscriptResponse { text }))
@@ -1085,6 +1103,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcription_rejects_compatible_providers_before_network_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("model", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "model".into())
+            .unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = ServerState {
+            inner: Arc::new(ServerInner {
+                config: RwLock::new(config),
+                registry: SessionRegistry::at(root.join("test-global-config.toml")),
+                debug_openai: false,
+                models: RwLock::new(Vec::new()),
+                catalog_error: RwLock::new(None),
+                oauth_logged_in: true,
+                workspace: Mutex::new(ServerWorkspace {
+                    root,
+                    agent: Some(agent),
+                }),
+                active_turn: Mutex::new(None),
+            }),
+        };
+
+        let error =
+            match transcribe(State(state), HeaderMap::new(), Bytes::from_static(b"audio")).await {
+                Ok(_) => panic!("compatible providers must not expose transcription"),
+                Err(error) => error,
+            };
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(format!("{:#}", error.error).contains("official OpenAI provider"));
+    }
+
+    #[tokio::test]
     async fn cancel_endpoint_signals_the_active_turn() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -1108,7 +1162,7 @@ mod tests {
                 debug_openai: false,
                 models: RwLock::new(Vec::new()),
                 catalog_error: RwLock::new(None),
-                dictation_available: false,
+                oauth_logged_in: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root,
                     agent: Some(agent),
@@ -1146,7 +1200,7 @@ mod tests {
                 debug_openai: false,
                 models: RwLock::new(Vec::new()),
                 catalog_error: RwLock::new(None),
-                dictation_available: false,
+                oauth_logged_in: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root,
                     agent: Some(agent),
@@ -1384,7 +1438,7 @@ mod tests {
                 debug_openai: false,
                 models: RwLock::new(Vec::new()),
                 catalog_error: RwLock::new(None),
-                dictation_available: false,
+                oauth_logged_in: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: root.clone(),
                     agent: Some(agent),
@@ -1465,7 +1519,7 @@ mod tests {
                 debug_openai: false,
                 models: RwLock::new(Vec::new()),
                 catalog_error: RwLock::new(None),
-                dictation_available: false,
+                oauth_logged_in: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: root.clone(),
                     agent: Some(agent),
@@ -1552,7 +1606,7 @@ mod tests {
                 debug_openai: false,
                 models: RwLock::new(Vec::new()),
                 catalog_error: RwLock::new(None),
-                dictation_available: false,
+                oauth_logged_in: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: current_root.clone(),
                     agent: Some(agent),
@@ -1634,7 +1688,7 @@ mod tests {
                 debug_openai: false,
                 models: RwLock::new(Vec::new()),
                 catalog_error: RwLock::new(None),
-                dictation_available: false,
+                oauth_logged_in: false,
                 workspace: Mutex::new(ServerWorkspace {
                     root: root.clone(),
                     agent: Some(agent),

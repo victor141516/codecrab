@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Value};
 
 pub(crate) const DEFAULT_PROVIDER: &str = "openai";
+pub(crate) const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -59,7 +60,7 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             model: "auto".into(),
-            base_url: "https://api.openai.com/v1".into(),
+            base_url: OFFICIAL_OPENAI_BASE_URL.into(),
             auth: "auto".into(),
             api_key: String::new(),
             fetch_models: true,
@@ -265,6 +266,10 @@ impl Config {
 }
 
 impl ProviderConfig {
+    pub(crate) fn is_official_openai(&self) -> bool {
+        self.base_url.trim_end_matches('/') == OFFICIAL_OPENAI_BASE_URL
+    }
+
     #[cfg(test)]
     pub(crate) fn test(model: String, base_url: String) -> Self {
         Self {
@@ -603,6 +608,16 @@ service_tiers = [{ id = "priority" }]
         let model = &provider.model_capabilities["vision-model"];
         assert_eq!(model.reasoning_levels[0].name.as_deref(), Some("Deep"));
         assert_eq!(model.service_tiers[0].name, None);
+    }
+
+    #[test]
+    fn official_openai_detection_is_based_on_the_provider_base_url() {
+        let mut provider = ProviderConfig::default();
+        assert!(provider.is_official_openai());
+        provider.base_url.push('/');
+        assert!(provider.is_official_openai());
+        provider.base_url = "https://provider.example/v1".into();
+        assert!(!provider.is_official_openai());
     }
 
     #[test]

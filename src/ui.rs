@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -842,9 +843,29 @@ impl App {
         true
     }
 
+    fn session_provider(&self) -> Result<&str> {
+        Ok(&self
+            .agent
+            .as_ref()
+            .context("agent is unavailable")?
+            .session()
+            .provider)
+    }
+
+    fn dictation_available(&self) -> bool {
+        self.session_provider()
+            .and_then(|provider| Transcriber::is_available(&self.config, provider))
+            .unwrap_or(false)
+    }
+
     fn toggle_dictation(&mut self) -> Result<()> {
         if self.transcription.is_some() {
             return Ok(());
+        }
+        if !self.dictation_available() {
+            anyhow::bail!(
+                "voice dictation requires the official OpenAI provider and valid authentication"
+            );
         }
         if self.recording.is_some() {
             self.stop_dictation(false)?;
@@ -865,8 +886,10 @@ impl App {
         let audio = recording.finish()?;
         self.send_after_transcription = send_after_transcription;
         let debug_openai = self.debug_openai;
+        let config = self.config.clone();
+        let provider = self.session_provider()?.to_owned();
         self.transcription = Some(tokio::spawn(async move {
-            Transcriber::new(debug_openai)?
+            Transcriber::new(&config, &provider, debug_openai)?
                 .transcribe(audio, "audio/wav")
                 .await
         }));
@@ -2398,11 +2421,7 @@ impl App {
             return Ok(());
         }
 
-        if key
-            .modifiers
-            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-            && matches!(key.code, KeyCode::Char('s' | 'S'))
-        {
+        if is_dictation_shortcut(&key) {
             if let Err(error) = self.toggle_dictation() {
                 self.error = Some(format!("Dictation failed: {error:#}"));
             }
@@ -2538,6 +2557,8 @@ pub(crate) async fn interactive(
         Err(error) => (Vec::new(), Some(format!("{error:#}"))),
     };
     enable_raw_mode()?;
+    let keyboard_enhancement =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -2545,6 +2566,12 @@ pub(crate) async fn interactive(
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
+    if keyboard_enhancement {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -2556,6 +2583,9 @@ pub(crate) async fn interactive(
     )
     .await;
 
+    if keyboard_enhancement {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -3246,8 +3276,13 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         AQUA
     };
+    let recording_title;
     let title = if app.recording.is_some() {
-        " Recording · Ctrl+Shift+S to stop · Enter to send "
+        recording_title = format!(
+            " Recording · {} to stop · Enter to send ",
+            dictation_shortcut_label()
+        );
+        recording_title.as_str()
     } else if app.transcription.is_some() {
         " Transcribing voice… "
     } else if app.is_running() {
@@ -3450,8 +3485,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         )),
         Line::from("  Enter                 complete, send, or send recording"),
         Line::from("  Tab                   complete slash selection"),
-        Line::from("  Shift+Enter / Ctrl+J  insert newline"),
-        Line::from("  Ctrl+Shift+S          start or stop voice dictation"),
+        Line::from(format!("  {:<30}insert newline", newline_shortcut_label())),
+        Line::from(format!(
+            "  {:<30}start or stop voice dictation",
+            dictation_shortcut_label()
+        )),
         Line::from("  ↑ / ↓                 navigate menu or move between lines"),
         Line::from("  PgUp / PgDn           scroll conversation"),
         Line::from("  Ctrl+U / Ctrl+K       delete to line start / end"),
@@ -3962,6 +4000,38 @@ fn display_width(text: &str) -> usize {
     text.chars()
         .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
         .sum()
+}
+
+fn is_dictation_shortcut(key: &KeyEvent) -> bool {
+    is_dictation_shortcut_for_platform(key, cfg!(target_os = "macos"))
+}
+
+fn is_dictation_shortcut_for_platform(key: &KeyEvent, macos: bool) -> bool {
+    if !matches!(key.code, KeyCode::Char('s' | 'S'))
+        || key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && (macos || key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn newline_shortcut_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Alt+Enter / Ctrl+J"
+    } else {
+        "Shift+Enter / Alt+Enter / Ctrl+J"
+    }
+}
+
+fn dictation_shortcut_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Ctrl+S"
+    } else {
+        "Ctrl+Shift+S"
+    }
 }
 
 fn editor_action(key: &KeyEvent) -> Option<EditorAction> {
@@ -5262,6 +5332,25 @@ mod tests {
 
         assert_eq!(rendered, ["a🦀", "bc"]);
         assert_eq!(composer_cursor_position(input, &rows, "a🦀".len()), (1, 0));
+    }
+
+    #[test]
+    fn dictation_shortcut_accounts_for_macos_modifier_collapsing() {
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let ctrl_shift_s = KeyEvent::new(
+            KeyCode::Char('S'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let ctrl_alt_s = KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+
+        assert!(is_dictation_shortcut_for_platform(&ctrl_s, true));
+        assert!(is_dictation_shortcut_for_platform(&ctrl_shift_s, true));
+        assert!(!is_dictation_shortcut_for_platform(&ctrl_alt_s, true));
+        assert!(!is_dictation_shortcut_for_platform(&ctrl_s, false));
+        assert!(is_dictation_shortcut_for_platform(&ctrl_shift_s, false));
     }
 
     #[test]

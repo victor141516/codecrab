@@ -298,8 +298,7 @@ impl OpenAiCompatible {
     pub(crate) fn new(config: &Config, provider_name: &str) -> Result<Self> {
         let provider = config.provider(provider_name)?;
         let client = Client::builder().build()?;
-        let official_openai =
-            provider.base_url.trim_end_matches('/') == "https://api.openai.com/v1";
+        let official_openai = provider.is_official_openai();
         let auth_mode = provider.auth.trim().to_ascii_lowercase();
         let oauth = OAuthStore::new()?;
         let use_oauth = match auth_mode.as_str() {

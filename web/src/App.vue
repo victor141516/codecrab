@@ -2244,7 +2244,7 @@ onBeforeUnmount(() => {
                         ? recording
                           ? 'Stop dictation'
                           : 'Start voice dictation'
-                        : 'Sign in with ChatGPT OAuth to use dictation'
+                        : 'Dictation requires the official OpenAI provider and valid authentication'
                     "
                     :aria-label="recording ? 'Stop dictation' : 'Start voice dictation'"
                     @click="toggleDictation"

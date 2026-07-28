@@ -208,8 +208,10 @@ header shows the current model and thinking level, plus a lightning bolt only
 when the selected provider service tier is Fast. The web client keeps speed in
 its dedicated selector and does not add a bolt to the model name. Terminal
 file activity uses paths relative to the active project whenever possible.
-Assistant Markdown keeps its original delimiters visible while adding terminal
-colors and supported font styles for headings, bold, italic, inline code,
+On terminals that support the enhanced keyboard protocol, CodeCrab enables it
+to preserve modified keys such as `Shift+Enter`; portable fallbacks remain
+available for older macOS terminals. Assistant Markdown keeps its original
+delimiters visible while adding terminal colors and supported font styles for headings, bold, italic, inline code,
 links, quotes, and list markers. Fenced code blocks use embedded, language-aware
 syntax highlighting; CodeCrab does not require or spawn `bat`.
 
@@ -219,8 +221,8 @@ Keyboard shortcuts:
 | --- | --- |
 | `Enter` | Complete a selection, send text, or stop, transcribe, and send an active recording |
 | `Tab` | Complete the selected menu item |
-| `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` | Insert a newline |
-| `Ctrl+Shift+S` | Start or stop voice dictation |
+| `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` | Insert a newline (`Alt+Enter` or `Ctrl+J` on macOS terminals that cannot report `Shift+Enter`) |
+| `Ctrl+Shift+S` | Start or stop voice dictation (`Ctrl+S` on macOS) |
 | `Up` / `Down` | Navigate an open menu, otherwise move between editor lines |
 | `Ctrl`/`Alt` + `Left`/`Right` | Move by word |
 | `Ctrl`/`Alt` + `Backspace` | Delete the previous word |
@@ -446,15 +448,141 @@ CLI `--model` and `--base-url` flags have the highest priority. Run
 `codecrab config` to print two clearly labelled sections: the platform-global
 configuration file path and the effective non-secret configuration content.
 
-Provider catalogs are discovered from `GET /models` by default. Manual
-`providers.<name>.model_capabilities."<model-id>"` tables enrich matching
-entries and add models the endpoint omits. Reasoning levels and service tiers
-use `{ id, name, description }`, with only `id` required; lists and modalities
-are merged additively. Set `fetch_models = false` for providers without a model
-endpoint, and use optional `allowed_models = ["id", ...]` as a closed, ordered
-model list. Every allowed ID must be discovered or manually declared. These
-catalog settings are edited directly in TOML; provider management interfaces do
-not expose them. See the example file for the complete shape.
+### Manual model catalogs and capabilities
+
+Provider catalogs are discovered from `GET /models` by default. The global
+`config.toml` can enrich discovered models, declare models omitted by the
+endpoint, disable catalog discovery, and restrict a provider to an explicit
+model list. These settings must be edited directly in TOML; the CLI, terminal
+UI, and web provider-management interfaces intentionally do not edit them.
+
+Model settings belong to the provider profile and are keyed by the exact model
+ID sent to the provider:
+
+```toml
+[providers.example]
+model = "auto"
+base_url = "https://provider.example/v1"
+auth = "api_key"
+api_key = "provider-secret"
+
+[providers.example.model_capabilities."vendor/model-pro"]
+display_name = "Model Pro"
+description = "General-purpose multimodal model"
+default_reasoning_level = "high"
+default_service_tier = "priority"
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+
+reasoning_levels = [
+    { id = "low" },
+    { id = "medium", name = "Balanced" },
+    { id = "high", name = "Deep", description = "More reasoning for complex tasks" },
+]
+
+service_tiers = [
+    { id = "priority", name = "Fast", description = "Priority processing" },
+]
+```
+
+Quote model IDs in table names because IDs commonly contain `/`, `.`, or `:`.
+Declaring a `model_capabilities` table adds that model even when `GET /models`
+does not return it. `display_name`, `description`, defaults, reasoning levels,
+service tiers, and modalities are all optional, so the smallest useful manual
+model can be as simple as:
+
+```toml
+[providers.example.model_capabilities."hidden-model"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+```
+
+Reasoning levels and service tiers use the same option shape:
+
+```toml
+reasoning_levels = [
+    { id = "low" },
+    { id = "high", name = "Deep", description = "Maximum reasoning effort" },
+]
+service_tiers = [
+    { id = "priority", name = "Fast" },
+]
+```
+
+Only `id` is required. It is the literal value sent to the provider. If `name`
+is omitted, CodeCrab displays the ID; if `description` is omitted, it uses an
+empty description. This is why Fast is configured as a service tier rather than
+as `fast = true`: the provider may expect an ID such as `priority`, while users
+should see a name such as `Fast`.
+
+Manual capabilities merge additively with the discovered entry:
+
+- reasoning levels and service tiers merge by `id`;
+- input and output modalities are appended without duplicates;
+- manually supplied `name` and `description` values replace those fields on a
+  matching option, while omitted fields preserve the endpoint values;
+- manually supplied scalar fields such as `display_name`,
+  `default_reasoning_level`, and `default_service_tier` replace the discovered
+  values;
+- discovered model order is preserved, and models found only in the
+  configuration are added after them.
+
+A configured default reasoning level or service tier must exist in the final
+merged options for that model. Duplicate or empty IDs and modalities are
+rejected when the configuration is loaded.
+
+For an API that does not expose `GET /models`, disable discovery and declare the
+complete catalog manually:
+
+```toml
+[providers.local]
+model = "local-model"
+base_url = "http://localhost:11434/v1"
+auth = "none"
+api_key = ""
+fetch_models = false
+
+[providers.local.model_capabilities."local-model"]
+reasoning_levels = [
+    { id = "low" },
+    { id = "high" },
+]
+input_modalities = ["text"]
+output_modalities = ["text"]
+```
+
+When `fetch_models` is omitted or `true`, a failed `/models` request remains a
+visible catalog error even if manual models are configured. When it is `false`,
+CodeCrab does not make the request and requires the resulting manual catalog to
+contain at least one model.
+
+Use `allowed_models` to expose only a closed, ordered subset of a large provider
+catalog:
+
+```toml
+[providers.example]
+model = "auto"
+base_url = "https://provider.example/v1"
+auth = "api_key"
+api_key = "provider-secret"
+allowed_models = ["vendor/model-pro", "hidden-model"]
+
+[providers.example.model_capabilities."hidden-model"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+```
+
+Only those IDs appear in model selectors, in the order listed, and only those
+models may be used. Every allowed ID must either be returned by `GET /models` or
+be declared under `model_capabilities`; otherwise catalog loading fails with an
+error. If the provider's `model` is an explicit ID instead of `"auto"`, it must
+also be present in `allowed_models`.
+
+Modalities are open string identifiers, allowing values such as `text`,
+`image`, or `audio`. They currently describe catalog capabilities only;
+declaring image or audio support does not by itself add a corresponding upload
+or generation workflow to CodeCrab. See
+[`codecrab.example.toml`](codecrab.example.toml) for another complete example.
 
 `request_timeout_seconds` is the maximum time a model request may receive no
 new response data. Every streamed chunk resets the timer, so a response may run
@@ -534,11 +662,15 @@ effective access is exactly the access granted to the operating-system user
 running the process. Only run it where fully autonomous execution is
 acceptable.
 
-Voice dictation deliberately uses ChatGPT's private subscription-backed
-`/backend-api/transcribe` service, matching the installed Codex/ChatGPT desktop
-client, rather than the separately billed public Audio API. This endpoint is
-not a documented public integration contract and may need updating when the
-desktop client changes.
+Voice dictation is available only when the current session uses the official
+OpenAI provider. With ChatGPT OAuth it deliberately uses ChatGPT's private
+subscription-backed `/backend-api/transcribe` service, matching the installed
+Codex/ChatGPT desktop client; with an OpenAI API key it uses the provider's
+`/audio/transcriptions` endpoint. The private subscription endpoint is not a
+documented public integration contract and may need updating when the desktop
+client changes. Compatible providers are disabled by default; internally,
+transcription URLs are always derived from the selected provider's `base_url`
+so a non-OpenAI profile can never send audio or credentials to OpenAI.
 
 Sessions live under `.codecrab/sessions/` in each project and are ignored by
 the included `.gitignore`. CodeCrab maintains `session_directories` in the
