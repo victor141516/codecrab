@@ -178,6 +178,7 @@ The initial API surface is:
 | `GET` | `/api/health` | Process health and version |
 | `GET` | `/api/state` | Current session, grouped projects/sessions, models, and skills |
 | `POST` | `/api/completions` | Shared slash, skill, and filesystem suggestions for `session_id` |
+| `POST` | `/api/completions/recursive` | Progressive NDJSON batches for the same identified filesystem query |
 | `POST` | `/api/chat` | Run a prompt for `session_id` as an ordered NDJSON stream |
 | `POST` | `/api/chat/cancel` | Cancel only `session_id` and its in-flight provider/tool operation |
 | `POST` | `/api/transcribe` | Transcribe audio for the `X-CodeCrab-Session` session |
@@ -373,14 +374,28 @@ successful sends and session deletion remove the saved draft, and storage
 failures do not prevent navigation. Browser storage is never used to resolve a
 session URL or choose the active project.
 
-Typing `@` opens files and folders from the selected project directory. Use
-`@../` for its parent, `@/` for the filesystem root, and continue selecting
-folders with `Enter` to browse deeper. Selecting a file inserts its `@path`
-without sending the prompt. The compact menu assumes a Nerd Font and renders
-only a type-specific icon followed by the entry name; directories remain
-visually distinct. Path fragments use normal platform path semantics, so
-`@../../`, drive-qualified paths, and other valid relative or absolute paths
-work without special-case parsing.
+Typing `@` immediately opens files and folders from the selected directory.
+Direct entries match the final fragment case-insensitively anywhere in the
+filename, with exact and prefix matches first. After two query characters,
+CodeCrab lazily searches descendants and streams fuzzy matches into the same
+menu while preserving the highlighted item. Recursive rows include their
+relative path context and insert the complete path; accepting a directory still
+enters it and refreshes the menu.
+
+Use `@../` for the project parent, `@/` for the current drive/filesystem root,
+and continue with `@../../`, absolute paths, or drive-qualified paths using
+normal platform semantics. Bare `@` and one-character queries show direct
+children only, so a filesystem root is never scanned automatically. Recursive
+work is capped at 80 results, 12,000 visited entries, 768 directories, ten
+levels, and 750 ms, with at most two scans process-wide; the immediate phase
+examines at most 4,096 entries. Directory symlinks are shown but not followed
+recursively. `.git`, `target`, `node_modules`, and `dist` trees are skipped;
+other hidden or VCS-ignored paths are not implicitly filtered. Permission
+errors and disappearing entries are skipped without closing the menu.
+
+Selecting a file inserts its `@path` without sending the prompt. The compact
+menu assumes a Nerd Font and renders a type-specific icon; directories remain
+visually distinct.
 
 ## Agent Skills
 

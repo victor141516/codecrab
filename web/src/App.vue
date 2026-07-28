@@ -34,6 +34,10 @@ import {
   createComposerDraftController,
   createComposerDraftStore
 } from "./composer-drafts.js";
+import {
+  consumeCompletionNdjson,
+  mergeCompletionUpdate
+} from "./completion-updates.js";
 import { isScrolledToBottom } from "./scroll.js";
 import {
   activityEventTimestamp,
@@ -68,6 +72,7 @@ const editingGoal = ref(null);
 const goalDraft = ref("");
 const editingGoalResume = ref(false);
 let autocompleteRequest = 0;
+let autocompleteController = null;
 let copiedMessageTimer = null;
 const activityDetailElements = new Map();
 const activityDetailObservers = new Map();
@@ -477,6 +482,7 @@ async function runAction(
 }
 
 async function newSession() {
+  closeAutocomplete();
   const source = await composerDrafts.beginNavigation();
   const nextState = await runAction(
     () => api("/api/sessions", { method: "POST", body: "{}" }),
@@ -496,6 +502,7 @@ async function newSession() {
 }
 
 async function resumeSession(project, id) {
+  closeAutocomplete();
   const source = await composerDrafts.beginNavigation();
   const nextState = await runAction(
     () =>
@@ -527,6 +534,7 @@ async function deleteSession(project, id) {
   if (runtimeFor(id).sending) return;
   const deletingActive =
     project === state.value?.project && id === session.value?.id;
+  if (deletingActive) closeAutocomplete();
   const source = deletingActive
     ? await composerDrafts.beginNavigation()
     : null;
@@ -619,6 +627,7 @@ function updateSessionUrl(id, mode = "push") {
 async function handleHistoryNavigation() {
   const id = sessionIdFromLocation();
   if (!id || id === session.value?.id) return;
+  closeAutocomplete();
   const source = await composerDrafts.beginNavigation();
   error.value = "";
   try {
@@ -1353,6 +1362,8 @@ function handleGlobalKeydown(event) {
 }
 
 function closeAutocomplete() {
+  autocompleteController?.abort();
+  autocompleteController = null;
   autocompleteRequest += 1;
   autocomplete.value = null;
   autocompleteSelection.value = 0;
@@ -1363,27 +1374,85 @@ async function refreshAutocomplete(element = composer.value) {
     closeAutocomplete();
     return;
   }
+  autocompleteController?.abort();
+  const controller = new AbortController();
+  autocompleteController = controller;
   const cursor = element.selectionStart ?? draft.value.length;
   const request = ++autocompleteRequest;
+  autocomplete.value = null;
+  autocompleteSelection.value = 0;
+  const payload = {
+    request_id: request,
+    session_id: session.value?.id,
+    before_cursor: draft.value.slice(0, cursor),
+    after_cursor: draft.value.slice(cursor)
+  };
   try {
     const result = await api("/api/completions", {
       method: "POST",
-      body: JSON.stringify({
-        session_id: session.value?.id,
-        before_cursor: draft.value.slice(0, cursor),
-        after_cursor: draft.value.slice(cursor)
-      })
+      body: JSON.stringify(payload),
+      signal: controller.signal
     });
-    if (request !== autocompleteRequest) return;
-    autocomplete.value = result;
-    autocompleteSelection.value = Math.min(
-      autocompleteSelection.value,
-      Math.max((result?.items?.length ?? 1) - 1, 0)
-    );
-  } catch {
+    if (request !== autocompleteRequest || controller.signal.aborted) return;
+    if (!result) {
+      autocomplete.value = null;
+      return;
+    }
+    applyAutocompleteUpdate(result, request);
+    if (result.recursive) {
+      void streamRecursiveCompletions(payload, request, controller);
+    }
+  } catch (cause) {
+    if (cause.name === "AbortError") return;
     if (request === autocompleteRequest) {
       autocomplete.value = null;
       autocompleteSelection.value = 0;
+    }
+  }
+}
+
+function applyAutocompleteUpdate(update, request) {
+  const merged = mergeCompletionUpdate(
+    autocomplete.value,
+    autocompleteSelection.value,
+    update,
+    request
+  );
+  if (!merged.applied) return;
+  autocomplete.value = merged.menu;
+  autocompleteSelection.value = merged.selectedIndex;
+}
+
+async function streamRecursiveCompletions(payload, request, controller) {
+  try {
+    const response = await fetch("/api/completions/recursive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(
+        body.error || `Completion search failed with ${response.status}`
+      );
+    }
+    await consumeCompletionNdjson(response, (message) => {
+      if (
+        message.type === "update" &&
+        request === autocompleteRequest &&
+        !controller.signal.aborted
+      ) {
+        applyAutocompleteUpdate(message, request);
+      }
+    });
+  } catch (cause) {
+    if (cause.name !== "AbortError" && request === autocompleteRequest) {
+      // Immediate directory results remain usable when recursion fails.
+    }
+  } finally {
+    if (autocompleteController === controller) {
+      autocompleteController = null;
     }
   }
 }
@@ -1435,13 +1504,7 @@ function completionLabel(item) {
   if (item.kind !== "file" && item.kind !== "directory") {
     return `/${item.name}`;
   }
-  return (
-    item.name
-      .replaceAll("\\", "/")
-      .split("/")
-      .filter(Boolean)
-      .at(-1) ?? item.name
-  );
+  return item.display;
 }
 
 function handleComposerBlur() {
@@ -1592,6 +1655,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   composerDrafts.persist();
+  autocompleteController?.abort();
   window.removeEventListener("popstate", handleHistoryNavigation);
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.clearTimeout(copiedMessageTimer);
@@ -2354,7 +2418,7 @@ onBeforeUnmount(() => {
               <button
                 v-for="(item, index) in autocomplete.items"
                 :id="`completion-${index}`"
-                :key="`${item.kind}-${item.name}`"
+                :key="item.id"
                 type="button"
                 role="option"
                 :aria-selected="index === autocompleteSelection"

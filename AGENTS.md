@@ -258,6 +258,13 @@ current draft and all later turns until changed.
 - Slash and `@` completion candidates, filtering, ordering, icons, and accepted
   replacement text must come from `src/completion.rs` for both clients. Never
   maintain a second command/skill/file list in Vue.
+- `@` completion has an immediate local substring-ranked phase followed, after
+  two query characters, by bounded recursive fuzzy batches from the same Rust
+  engine. Both clients must cancel stale identified searches, preserve
+  selection by stable item ID, display recursive relative-path context, and
+  retain generic parent/absolute/drive path semantics. Centralize traversal
+  limits and exclusions; do not follow directory symlinks recursively or turn
+  resource controls into filesystem confinement.
 - Keep the terminal UI compact. Do not restore redundant sidebars, activity
   panels, shortcut footers, empty-state slogans, session IDs, message counts,
   skill counts, or duplicated provider/auth labels. Keep the conversation

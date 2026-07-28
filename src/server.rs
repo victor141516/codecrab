@@ -31,7 +31,10 @@ use uuid::Uuid;
 use crate::{
     agent::{Agent, turn_was_cancelled},
     auth::OAuthStore,
-    completion::{CompletionItem, complete as complete_input},
+    completion::{
+        CompletionItem, complete as complete_input, file_completion_context,
+        recursive_file_completion_available, start_file_completion_search,
+    },
     config::{
         Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry,
         validate_provider_name,
@@ -138,6 +141,8 @@ struct SessionRequest {
 
 #[derive(Deserialize)]
 struct CompletionRequest {
+    #[serde(default)]
+    request_id: u64,
     session_id: Option<Uuid>,
     before_cursor: String,
     after_cursor: String,
@@ -163,9 +168,23 @@ struct ProviderRequest {
 
 #[derive(Serialize)]
 struct CompletionResponse {
+    request_id: u64,
     items: Vec<CompletionItem>,
     replace_before: String,
     replace_after: String,
+    recursive: bool,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CompletionStreamMessage {
+    Update {
+        request_id: u64,
+        items: Vec<CompletionItem>,
+    },
+    Done {
+        request_id: u64,
+    },
 }
 
 #[derive(Serialize)]
@@ -259,6 +278,7 @@ pub(crate) async fn serve(
                 .route("/health", get(health))
                 .route("/state", get(get_state))
                 .route("/completions", post(completions))
+                .route("/completions/recursive", post(recursive_completions))
                 .route("/chat", post(chat))
                 .route("/chat/cancel", post(cancel_chat))
                 .route(
@@ -493,7 +513,8 @@ async fn completions(
             )
         })?;
     let snapshot = conversation.snapshot();
-    let Some(menu) = complete_input(
+    let recursive = recursive_file_completion_available(&input, cursor, &snapshot.project_root);
+    let menu = complete_input(
         &input,
         cursor,
         &snapshot.project_root,
@@ -501,14 +522,93 @@ async fn completions(
             .skills
             .iter()
             .map(|skill| (skill.name.as_str(), skill.description.as_str())),
-    ) else {
-        return Ok(Json(None));
+    );
+    let (items, token_start, token_end) = match menu {
+        Some(menu) => (menu.items, menu.token_start, menu.token_end),
+        None if recursive => {
+            let context = file_completion_context(&input, cursor, &snapshot.project_root)
+                .expect("recursive availability requires a file completion context");
+            (Vec::new(), context.start, context.end)
+        }
+        None => return Ok(Json(None)),
     };
     Ok(Json(Some(CompletionResponse {
-        replace_before: input[menu.token_start..cursor].to_owned(),
-        replace_after: input[cursor..menu.token_end].to_owned(),
-        items: menu.items,
+        request_id: request.request_id,
+        replace_before: input[token_start..cursor].to_owned(),
+        replace_after: input[cursor..token_end].to_owned(),
+        items,
+        recursive,
     })))
+}
+
+async fn recursive_completions(
+    State(state): State<ServerState>,
+    Json(request): Json<CompletionRequest>,
+) -> std::result::Result<Response, ApiError> {
+    let cursor = request.before_cursor.len();
+    let input = format!("{}{}", request.before_cursor, request.after_cursor);
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::message(
+                StatusCode::CONFLICT,
+                "create or resume a session before requesting completions",
+            )
+        })?;
+    let snapshot = conversation.snapshot();
+    let search =
+        start_file_completion_search(&input, cursor, &snapshot.project_root, request.request_id);
+    let (output_tx, output_rx) = mpsc::channel::<std::result::Result<Bytes, Infallible>>(8);
+    tokio::spawn(async move {
+        if let Some(mut search) = search {
+            loop {
+                let update = tokio::select! {
+                    _ = output_tx.closed() => return,
+                    update = search.recv() => update,
+                };
+                let Some(update) = update else {
+                    break;
+                };
+                let message = CompletionStreamMessage::Update {
+                    request_id: update.request_id,
+                    items: update.items,
+                };
+                if !send_completion_stream_message(&output_tx, message).await {
+                    return;
+                }
+            }
+        }
+        let _ = send_completion_stream_message(
+            &output_tx,
+            CompletionStreamMessage::Done {
+                request_id: request.request_id,
+            },
+        )
+        .await;
+    });
+
+    let mut response = Body::from_stream(ReceiverStream::new(output_rx)).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache"),
+    );
+    Ok(response)
+}
+
+async fn send_completion_stream_message(
+    output: &mpsc::Sender<std::result::Result<Bytes, Infallible>>,
+    message: CompletionStreamMessage,
+) -> bool {
+    let mut line = match serde_json::to_vec(&message) {
+        Ok(line) => line,
+        Err(_) => return false,
+    };
+    line.push(b'\n');
+    output.send(Ok(Bytes::from(line))).await.is_ok()
 }
 
 #[derive(Serialize)]
@@ -1729,6 +1829,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("hello.txt"), "hello").unwrap();
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        std::fs::write(root.join("nested/deeper/my-config-file.toml"), "").unwrap();
 
         let config = Config::test("auto", "http://127.0.0.1:1/v1");
         let store = SessionStore::new(&root).unwrap();
@@ -1747,6 +1849,7 @@ mod tests {
         let slash = completions(
             State(state.clone()),
             Json(CompletionRequest {
+                request_id: 1,
                 session_id: None,
                 before_cursor: "/".into(),
                 after_cursor: String::new(),
@@ -1769,8 +1872,9 @@ mod tests {
         );
 
         let files = completions(
-            State(state),
+            State(state.clone()),
             Json(CompletionRequest {
+                request_id: 2,
                 session_id: None,
                 before_cursor: "@".into(),
                 after_cursor: String::new(),
@@ -1787,6 +1891,44 @@ mod tests {
             .find(|item| item.name == "hello.txt")
             .unwrap();
         assert_eq!(hello.replacement, "@hello.txt ");
+
+        let immediate = completions(
+            State(state.clone()),
+            Json(CompletionRequest {
+                request_id: 9,
+                session_id: None,
+                before_cursor: "@config".into(),
+                after_cursor: String::new(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0
+        .unwrap();
+        assert!(immediate.recursive);
+        assert_eq!(immediate.request_id, 9);
+
+        let response = recursive_completions(
+            State(state),
+            Json(CompletionRequest {
+                request_id: 9,
+                session_id: None,
+                before_cursor: "@config".into(),
+                after_cursor: String::new(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let messages = String::from_utf8(body.to_vec()).unwrap();
+        assert!(messages.contains("\"type\":\"update\""));
+        assert!(messages.contains("\"request_id\":9"));
+        assert!(messages.contains("nested/deeper/my-config-file.toml"));
+        assert!(messages.contains("\"type\":\"done\""));
     }
 
     #[tokio::test]
@@ -1849,6 +1991,7 @@ mod tests {
         let files = completions(
             State(state),
             Json(CompletionRequest {
+                request_id: 3,
                 session_id: None,
                 before_cursor: "@".into(),
                 after_cursor: String::new(),

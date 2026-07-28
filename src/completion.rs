@@ -1,9 +1,19 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+};
 
 pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("help", "Open keyboard and command help"),
@@ -21,6 +31,38 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
 
 pub(crate) const NERD_FOLDER: &str = "";
 const NERD_FILE: &str = "";
+const RECURSIVE_EXCLUDED_DIRECTORIES: &[&str] = &[".git", "target", "node_modules", "dist"];
+
+#[derive(Clone, Copy)]
+pub(crate) struct RecursiveSearchPolicy {
+    pub(crate) minimum_query_characters: usize,
+    pub(crate) maximum_local_entries: usize,
+    pub(crate) maximum_local_results: usize,
+    pub(crate) maximum_results: usize,
+    pub(crate) maximum_visited_entries: usize,
+    pub(crate) maximum_visited_directories: usize,
+    pub(crate) maximum_depth: usize,
+    pub(crate) maximum_elapsed: Duration,
+    pub(crate) entries_per_batch: usize,
+    pub(crate) update_interval: Duration,
+    pub(crate) debounce: Duration,
+    pub(crate) maximum_concurrent_searches: usize,
+}
+
+pub(crate) const RECURSIVE_SEARCH_POLICY: RecursiveSearchPolicy = RecursiveSearchPolicy {
+    minimum_query_characters: 2,
+    maximum_local_entries: 4_096,
+    maximum_local_results: 48,
+    maximum_results: 80,
+    maximum_visited_entries: 12_000,
+    maximum_visited_directories: 768,
+    maximum_depth: 10,
+    maximum_elapsed: Duration::from_millis(750),
+    entries_per_batch: 192,
+    update_interval: Duration::from_millis(55),
+    debounce: Duration::from_millis(110),
+    maximum_concurrent_searches: 2,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,9 +73,11 @@ pub(crate) enum CompletionKind {
     Directory,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct CompletionItem {
+    pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) display: String,
     pub(crate) description: String,
     pub(crate) icon: Option<&'static str>,
     pub(crate) kind: CompletionKind,
@@ -45,6 +89,37 @@ pub(crate) struct CompletionMenu {
     pub(crate) selected: usize,
     pub(crate) token_start: usize,
     pub(crate) token_end: usize,
+}
+
+pub(crate) struct CompletionUpdate {
+    pub(crate) request_id: u64,
+    pub(crate) items: Vec<CompletionItem>,
+}
+
+pub(crate) struct CompletionSearch {
+    pub(crate) request_id: u64,
+    pub(crate) token_start: usize,
+    pub(crate) token_end: usize,
+    updates: mpsc::UnboundedReceiver<CompletionUpdate>,
+    cancelled: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl CompletionSearch {
+    pub(crate) fn try_recv(&mut self) -> Result<CompletionUpdate, mpsc::error::TryRecvError> {
+        self.updates.try_recv()
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<CompletionUpdate> {
+        self.updates.recv().await
+    }
+}
+
+impl Drop for CompletionSearch {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.task.abort();
+    }
 }
 
 pub(crate) fn complete<'a>(
@@ -71,7 +146,9 @@ pub(crate) fn complete<'a>(
                 .iter()
                 .filter(|(name, _)| name.starts_with(context.prefix))
                 .map(|(name, description)| CompletionItem {
+                    id: format!("command:{name}"),
                     name: (*name).to_owned(),
+                    display: (*name).to_owned(),
                     description: (*description).to_owned(),
                     icon: None,
                     kind: CompletionKind::Command,
@@ -84,7 +161,9 @@ pub(crate) fn complete<'a>(
             .into_iter()
             .filter(|(name, _)| name.starts_with(context.prefix))
             .map(|(name, description)| CompletionItem {
+                id: format!("skill:{name}"),
                 name: name.to_owned(),
+                display: name.to_owned(),
                 description: description.to_owned(),
                 icon: None,
                 kind: CompletionKind::Skill,
@@ -126,6 +205,7 @@ struct SlashCompletionContext<'a> {
     commands_allowed: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct FileCompletionContext {
     pub(crate) start: usize,
     pub(crate) end: usize,
@@ -183,47 +263,460 @@ pub(crate) fn file_completion_context(
     })
 }
 
+pub(crate) fn complete_progressive<'a>(
+    input: &str,
+    cursor: usize,
+    working_directory: &Path,
+    skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+    request_id: u64,
+) -> (Option<CompletionMenu>, Option<CompletionSearch>) {
+    if let Some(context) = file_completion_context(input, cursor, working_directory) {
+        let items = file_completion_items(&context);
+        let menu = (!items.is_empty()).then(|| CompletionMenu {
+            items: items.clone(),
+            selected: 0,
+            token_start: context.start,
+            token_end: context.end,
+        });
+        let search = start_recursive_file_completion(context, items, request_id);
+        return (menu, search);
+    }
+    (complete(input, cursor, working_directory, skills), None)
+}
+
+pub(crate) fn recursive_file_completion_available(
+    input: &str,
+    cursor: usize,
+    working_directory: &Path,
+) -> bool {
+    file_completion_context(input, cursor, working_directory).is_some_and(|context| {
+        context.name_prefix.chars().count() >= RECURSIVE_SEARCH_POLICY.minimum_query_characters
+    })
+}
+
+pub(crate) fn start_file_completion_search(
+    input: &str,
+    cursor: usize,
+    working_directory: &Path,
+    request_id: u64,
+) -> Option<CompletionSearch> {
+    let context = file_completion_context(input, cursor, working_directory)?;
+    let local_items = file_completion_items(&context);
+    start_recursive_file_completion(context, local_items, request_id)
+}
+
 fn file_completion_items(context: &FileCompletionContext) -> Vec<CompletionItem> {
     let Ok(entries) = fs::read_dir(&context.directory) else {
         return Vec::new();
     };
-    let prefix = context.name_prefix.to_lowercase();
+    let query = context.name_prefix.to_lowercase();
     let mut items = entries
+        .take(RECURSIVE_SEARCH_POLICY.maximum_local_entries)
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.to_lowercase().starts_with(&prefix) {
+            let normalized_name = name.to_lowercase();
+            let rank = if normalized_name == query {
+                0
+            } else if normalized_name.starts_with(&query) {
+                1
+            } else if normalized_name.contains(&query) {
+                2
+            } else {
                 return None;
-            }
-            let is_dir = entry.file_type().ok()?.is_dir();
+            };
+            let file_type = entry.file_type().ok()?;
+            let is_dir = file_type.is_dir() || (file_type.is_symlink() && entry.path().is_dir());
             let kind = if is_dir {
                 CompletionKind::Directory
             } else {
                 CompletionKind::File
             };
-            let name = format!("{}{}", context.dir_prefix, name);
+            let completion_name = format!("{}{}", context.dir_prefix, name);
             let suffix = if is_dir { "/" } else { " " };
-            Some(CompletionItem {
-                replacement: format!("@{name}{suffix}"),
-                name,
-                description: String::new(),
-                icon: Some(if is_dir {
-                    NERD_FOLDER
-                } else {
-                    file_icon(&entry.path())
-                }),
-                kind,
-            })
+            let replacement = format!("@{completion_name}{suffix}");
+            Some((
+                rank,
+                CompletionItem {
+                    id: format!("path:{replacement}"),
+                    replacement,
+                    name: completion_name,
+                    display: name,
+                    description: String::new(),
+                    icon: Some(if is_dir {
+                        NERD_FOLDER
+                    } else {
+                        file_icon(&entry.path())
+                    }),
+                    kind,
+                },
+            ))
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| {
-        let left_dir = left.kind == CompletionKind::Directory;
-        let right_dir = right.kind == CompletionKind::Directory;
-        right_dir
-            .cmp(&left_dir)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        let left_dir = left.1.kind == CompletionKind::Directory;
+        let right_dir = right.1.kind == CompletionKind::Directory;
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right_dir.cmp(&left_dir))
+            .then_with(|| left.1.name.to_lowercase().cmp(&right.1.name.to_lowercase()))
+            .then_with(|| left.1.name.cmp(&right.1.name))
     });
     items
+        .into_iter()
+        .map(|(_, item)| item)
+        .take(RECURSIVE_SEARCH_POLICY.maximum_local_results)
+        .collect()
+}
+
+#[derive(Clone)]
+struct RecursiveCandidate {
+    item: CompletionItem,
+    score: i64,
+    depth: usize,
+}
+
+fn start_recursive_file_completion(
+    context: FileCompletionContext,
+    local_items: Vec<CompletionItem>,
+    request_id: u64,
+) -> Option<CompletionSearch> {
+    start_recursive_file_completion_with_policy(
+        context,
+        local_items,
+        request_id,
+        RECURSIVE_SEARCH_POLICY,
+    )
+}
+
+fn start_recursive_file_completion_with_policy(
+    context: FileCompletionContext,
+    local_items: Vec<CompletionItem>,
+    request_id: u64,
+    policy: RecursiveSearchPolicy,
+) -> Option<CompletionSearch> {
+    if context.name_prefix.chars().count() < policy.minimum_query_characters {
+        return None;
+    }
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let task_cancelled = cancelled.clone();
+    let semaphore = recursive_search_semaphore();
+    let token_start = context.start;
+    let token_end = context.end;
+    let task = runtime.spawn(async move {
+        tokio::time::sleep(policy.debounce).await;
+        if task_cancelled.load(Ordering::Acquire) || updates_tx.is_closed() {
+            return;
+        }
+        let Ok(_permit) = semaphore.acquire_owned().await else {
+            return;
+        };
+        if task_cancelled.load(Ordering::Acquire) || updates_tx.is_closed() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            scan_recursive_files(
+                &context,
+                &local_items,
+                request_id,
+                policy,
+                &task_cancelled,
+                &updates_tx,
+            );
+        })
+        .await;
+    });
+    Some(CompletionSearch {
+        request_id,
+        token_start,
+        token_end,
+        updates: updates_rx,
+        cancelled,
+        task,
+    })
+}
+
+fn recursive_search_semaphore() -> Arc<Semaphore> {
+    static SEARCHES: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEARCHES
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                RECURSIVE_SEARCH_POLICY.maximum_concurrent_searches,
+            ))
+        })
+        .clone()
+}
+
+fn scan_recursive_files(
+    context: &FileCompletionContext,
+    local_items: &[CompletionItem],
+    request_id: u64,
+    policy: RecursiveSearchPolicy,
+    cancelled: &AtomicBool,
+    updates: &mpsc::UnboundedSender<CompletionUpdate>,
+) {
+    let started = Instant::now();
+    let mut stack = vec![(context.directory.clone(), String::new(), 0_usize)];
+    let mut candidates = Vec::<RecursiveCandidate>::new();
+    let mut visited_entries = 0_usize;
+    let mut visited_directories = 0_usize;
+    let mut entries_since_update = 0_usize;
+    let mut last_update = Instant::now();
+    let mut candidates_changed = false;
+
+    while let Some((directory, relative_prefix, depth)) = stack.pop() {
+        if search_budget_exhausted(
+            cancelled,
+            updates,
+            started,
+            visited_entries,
+            visited_directories,
+            policy,
+        ) || depth > policy.maximum_depth
+        {
+            break;
+        }
+        visited_directories += 1;
+        let remaining = policy
+            .maximum_visited_entries
+            .saturating_sub(visited_entries);
+        let Ok(read_dir) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut entries = read_dir
+            .take(remaining)
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            let left = left.file_name().to_string_lossy().to_lowercase();
+            let right = right.file_name().to_string_lossy().to_lowercase();
+            left.cmp(&right)
+        });
+        let mut child_directories = Vec::new();
+
+        for entry in entries {
+            if search_budget_exhausted(
+                cancelled,
+                updates,
+                started,
+                visited_entries,
+                visited_directories,
+                policy,
+            ) {
+                break;
+            }
+            visited_entries += 1;
+            entries_since_update += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let relative = if relative_prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative_prefix}/{name}")
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_symlink = file_type.is_symlink();
+            let is_directory = file_type.is_dir() || (is_symlink && entry.path().is_dir());
+            let entry_depth = depth + 1;
+
+            if is_directory
+                && !is_symlink
+                && entry_depth <= policy.maximum_depth
+                && !is_recursive_excluded_directory(&name)
+            {
+                child_directories.push((entry.path(), relative.clone(), entry_depth));
+            }
+
+            if entry_depth > 1
+                && let Some(score) =
+                    recursive_match_score(&name, &relative, &context.name_prefix, entry_depth)
+            {
+                let completion_name = format!("{}{}", context.dir_prefix, relative);
+                let suffix = if is_directory { "/" } else { " " };
+                let replacement = format!("@{completion_name}{suffix}");
+                candidates.push(RecursiveCandidate {
+                    item: CompletionItem {
+                        id: format!("path:{replacement}"),
+                        name: completion_name,
+                        display: relative,
+                        description: String::new(),
+                        icon: Some(if is_directory {
+                            NERD_FOLDER
+                        } else {
+                            file_icon(&entry.path())
+                        }),
+                        kind: if is_directory {
+                            CompletionKind::Directory
+                        } else {
+                            CompletionKind::File
+                        },
+                        replacement,
+                    },
+                    score,
+                    depth: entry_depth,
+                });
+                candidates_changed = true;
+            }
+
+            if candidates.len() > policy.maximum_results.saturating_mul(2) {
+                sort_recursive_candidates(&mut candidates);
+                candidates.truncate(policy.maximum_results);
+            }
+            if !candidates.is_empty()
+                && (entries_since_update >= policy.entries_per_batch
+                    || last_update.elapsed() >= policy.update_interval)
+            {
+                sort_recursive_candidates(&mut candidates);
+                candidates.truncate(policy.maximum_results);
+                if send_completion_update(
+                    local_items,
+                    &candidates,
+                    request_id,
+                    updates,
+                    policy.maximum_results,
+                )
+                .is_err()
+                {
+                    return;
+                }
+                candidates_changed = false;
+                entries_since_update = 0;
+                last_update = Instant::now();
+                std::thread::yield_now();
+            }
+        }
+        child_directories.reverse();
+        stack.extend(child_directories);
+    }
+
+    sort_recursive_candidates(&mut candidates);
+    candidates.truncate(policy.maximum_results);
+    if !candidates.is_empty() && candidates_changed {
+        let _ = send_completion_update(
+            local_items,
+            &candidates,
+            request_id,
+            updates,
+            policy.maximum_results,
+        );
+    }
+}
+
+fn search_budget_exhausted(
+    cancelled: &AtomicBool,
+    updates: &mpsc::UnboundedSender<CompletionUpdate>,
+    started: Instant,
+    visited_entries: usize,
+    visited_directories: usize,
+    policy: RecursiveSearchPolicy,
+) -> bool {
+    cancelled.load(Ordering::Acquire)
+        || updates.is_closed()
+        || visited_entries >= policy.maximum_visited_entries
+        || visited_directories >= policy.maximum_visited_directories
+        || started.elapsed() >= policy.maximum_elapsed
+}
+
+fn send_completion_update(
+    local_items: &[CompletionItem],
+    candidates: &[RecursiveCandidate],
+    request_id: u64,
+    updates: &mpsc::UnboundedSender<CompletionUpdate>,
+    maximum_results: usize,
+) -> Result<(), mpsc::error::SendError<CompletionUpdate>> {
+    let mut seen = HashSet::new();
+    let items = local_items
+        .iter()
+        .chain(candidates.iter().map(|candidate| &candidate.item))
+        .filter(|item| seen.insert(item.id.clone()))
+        .take(maximum_results)
+        .cloned()
+        .collect();
+    updates.send(CompletionUpdate { request_id, items })
+}
+
+fn sort_recursive_candidates(candidates: &mut [RecursiveCandidate]) {
+    candidates.sort_by(|left, right| {
+        let left_dir = left.item.kind == CompletionKind::Directory;
+        let right_dir = right.item.kind == CompletionKind::Directory;
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.depth.cmp(&right.depth))
+            .then_with(|| right_dir.cmp(&left_dir))
+            .then_with(|| {
+                left.item
+                    .display
+                    .to_lowercase()
+                    .cmp(&right.item.display.to_lowercase())
+            })
+            .then_with(|| left.item.display.cmp(&right.item.display))
+    });
+}
+
+fn recursive_match_score(
+    basename: &str,
+    relative_path: &str,
+    query: &str,
+    depth: usize,
+) -> Option<i64> {
+    let basename_score = fuzzy_score(basename, query);
+    let path_score = fuzzy_score(relative_path, query).map(|score| score - 450);
+    basename_score
+        .into_iter()
+        .chain(path_score)
+        .max()
+        .map(|score| score - (depth.saturating_sub(1) as i64 * 70))
+}
+
+fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
+    let candidate = candidate.to_lowercase();
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    if candidate == query {
+        return Some(12_000);
+    }
+    if candidate.starts_with(&query) {
+        return Some(11_000 - candidate.chars().count() as i64);
+    }
+    if let Some(position) = candidate.find(&query) {
+        return Some(10_000 - position as i64 * 20 - candidate.chars().count() as i64);
+    }
+
+    let candidate_chars = candidate.chars().collect::<Vec<_>>();
+    let mut search_from = 0_usize;
+    let mut first = None;
+    let mut previous = None;
+    let mut gaps = 0_usize;
+    for query_char in query.chars() {
+        let offset = candidate_chars[search_from..]
+            .iter()
+            .position(|candidate_char| *candidate_char == query_char)?;
+        let index = search_from + offset;
+        first.get_or_insert(index);
+        if let Some(previous) = previous {
+            gaps += index.saturating_sub(previous + 1);
+        }
+        previous = Some(index);
+        search_from = index + 1;
+    }
+    Some(
+        7_000
+            - first.unwrap_or_default() as i64 * 25
+            - gaps as i64 * 35
+            - candidate_chars.len() as i64,
+    )
+}
+
+fn is_recursive_excluded_directory(name: &str) -> bool {
+    RECURSIVE_EXCLUDED_DIRECTORIES
+        .iter()
+        .any(|excluded| name.eq_ignore_ascii_case(excluded))
 }
 
 pub(crate) fn file_icon(path: &Path) -> &'static str {
@@ -389,5 +882,146 @@ mod tests {
         let input = "@../abo";
         let menu = complete(input, input.len(), &workspace, []).unwrap();
         assert!(menu.items.iter().any(|item| item.name == "../above.md"));
+    }
+
+    #[test]
+    fn local_file_completion_is_case_insensitive_and_ranks_contains_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("CONFIG"), "").unwrap();
+        fs::write(temp.path().join("config-old.toml"), "").unwrap();
+        fs::write(temp.path().join("my-config-file.toml"), "").unwrap();
+        fs::write(temp.path().join("unrelated.toml"), "").unwrap();
+
+        let menu = complete("@config", 7, temp.path(), []).unwrap();
+        let names = menu
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["CONFIG", "config-old.toml", "my-config-file.toml"]
+        );
+        assert_eq!(menu.items[2].display, "my-config-file.toml");
+    }
+
+    #[test]
+    fn fuzzy_scoring_prefers_exact_prefix_and_substring_before_subsequence() {
+        let exact = fuzzy_score("config", "config").unwrap();
+        let prefix = fuzzy_score("configuration", "config").unwrap();
+        let substring = fuzzy_score("my-config-file", "config").unwrap();
+        let subsequence = fuzzy_score("coarse-network-file-index-generator", "config").unwrap();
+
+        assert!(exact > prefix);
+        assert!(prefix > substring);
+        assert!(substring > subsequence);
+    }
+
+    #[tokio::test]
+    async fn recursive_completion_finds_descendants_and_skips_generated_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src/deep")).unwrap();
+        fs::create_dir_all(temp.path().join("target/deep")).unwrap();
+        fs::write(temp.path().join("src/deep/my-config-file.toml"), "").unwrap();
+        fs::write(temp.path().join("target/deep/hidden-config.toml"), "").unwrap();
+        let context = file_completion_context("@config", 7, temp.path()).unwrap();
+        let local = file_completion_items(&context);
+        let mut search =
+            start_recursive_file_completion_with_policy(context, local, 41, test_policy()).unwrap();
+        let mut items = Vec::new();
+
+        while let Some(update) = tokio::time::timeout(Duration::from_secs(1), search.recv())
+            .await
+            .unwrap()
+        {
+            assert_eq!(update.request_id, 41);
+            items = update.items;
+        }
+
+        let match_item = items
+            .iter()
+            .find(|item| item.name == "src/deep/my-config-file.toml")
+            .unwrap();
+        assert_eq!(match_item.display, "src/deep/my-config-file.toml");
+        assert_eq!(match_item.replacement, "@src/deep/my-config-file.toml ");
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.name.contains("hidden-config"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_completion_is_bounded_deduplicated_and_cancellable() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("nested")).unwrap();
+        for index in 0..20 {
+            fs::write(
+                temp.path().join(format!("nested/config-{index:02}.toml")),
+                "",
+            )
+            .unwrap();
+        }
+        let context = file_completion_context("@config", 7, temp.path()).unwrap();
+        let mut policy = test_policy();
+        policy.maximum_results = 3;
+        let mut search =
+            start_recursive_file_completion_with_policy(context, Vec::new(), 9, policy).unwrap();
+        let cancelled = search.cancelled.clone();
+        let mut last = Vec::new();
+        while let Some(update) = tokio::time::timeout(Duration::from_secs(1), search.recv())
+            .await
+            .unwrap()
+        {
+            last = update.items;
+        }
+        assert!(last.len() <= 3);
+        assert_eq!(
+            last.iter()
+                .map(|item| item.id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            last.len()
+        );
+
+        drop(search);
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn absolute_search_roots_keep_complete_platform_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("absolute-file.txt"), "").unwrap();
+        let display_root = temp.path().to_string_lossy().replace('\\', "/");
+        let input = format!("@{display_root}/absolute");
+        let menu = complete(&input, input.len(), Path::new("."), []).unwrap();
+        let item = menu
+            .items
+            .iter()
+            .find(|item| item.display == "absolute-file.txt")
+            .unwrap();
+
+        assert_eq!(
+            item.replacement,
+            format!("@{display_root}/absolute-file.txt ")
+        );
+    }
+
+    fn test_policy() -> RecursiveSearchPolicy {
+        RecursiveSearchPolicy {
+            minimum_query_characters: 2,
+            maximum_local_entries: 100,
+            maximum_local_results: 8,
+            maximum_results: 8,
+            maximum_visited_entries: 200,
+            maximum_visited_directories: 20,
+            maximum_depth: 5,
+            maximum_elapsed: Duration::from_secs(1),
+            entries_per_batch: 1,
+            update_interval: Duration::ZERO,
+            debounce: Duration::ZERO,
+            maximum_concurrent_searches: 2,
+        }
     }
 }

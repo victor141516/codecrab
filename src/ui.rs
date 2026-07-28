@@ -37,8 +37,8 @@ use crate::{
     agent::{Agent, turn_was_cancelled},
     audio::AudioRecording,
     completion::{
-        CompletionKind, CompletionMenu, builtin_command_from_input, complete as complete_input,
-        goal_objective_from_input,
+        CompletionKind, CompletionMenu, CompletionSearch, builtin_command_from_input,
+        complete_progressive, goal_objective_from_input,
     },
     config::{
         Config, ConfigStore, ProviderConfig, SessionRegistry, normalized_root, paths_equal,
@@ -704,6 +704,8 @@ struct App {
     show_skills: bool,
     skill_selection: usize,
     completion: Option<CompletionMenu>,
+    completion_search: Option<CompletionSearch>,
+    completion_request_id: u64,
     model_catalog: Vec<ModelCatalogEntry>,
     model_picker: Option<ModelPicker>,
     session_picker: Option<SessionPicker>,
@@ -810,6 +812,8 @@ impl App {
             show_skills: false,
             skill_selection: 0,
             completion: None,
+            completion_search: None,
+            completion_request_id: 0,
             model_catalog,
             model_picker: None,
             session_picker: None,
@@ -916,7 +920,7 @@ impl App {
             insertion.push(' ');
         }
         self.insert(&insertion);
-        self.completion = None;
+        self.close_completion();
         true
     }
 
@@ -941,7 +945,7 @@ impl App {
             self.stop_dictation(false)?;
         } else {
             self.error = None;
-            self.completion = None;
+            self.close_completion();
             self.send_after_transcription = false;
             self.recording = Some(AudioRecording::start()?);
         }
@@ -1090,36 +1094,89 @@ impl App {
     }
 
     fn refresh_completion(&mut self) {
-        let previous = self.completion.as_ref().and_then(|menu| {
-            menu.items
-                .get(menu.selected)
-                .map(|item| (item.kind, item.name.clone()))
-        });
-        let Some(mut menu) = complete_input(
+        let previous = self
+            .completion
+            .as_ref()
+            .and_then(|menu| menu.items.get(menu.selected).map(|item| item.id.clone()));
+        self.completion_search = None;
+        self.completion_request_id = self.completion_request_id.wrapping_add(1);
+        let (menu, search) = complete_progressive(
             &self.input,
             self.cursor,
             &self.project_root,
             self.skills
                 .iter()
                 .map(|skill| (skill.name.as_str(), skill.description.as_str())),
-        ) else {
-            self.completion = None;
+            self.completion_request_id,
+        );
+        self.completion = menu.map(|mut menu| {
+            menu.selected = previous
+                .and_then(|id| menu.items.iter().position(|item| item.id == id))
+                .unwrap_or(0);
+            menu
+        });
+        self.completion_search = search;
+    }
+
+    fn drain_completion_updates(&mut self) {
+        let Some(search) = &mut self.completion_search else {
             return;
         };
-        menu.selected = previous
-            .and_then(|key| {
-                menu.items
-                    .iter()
-                    .position(|item| (item.kind, item.name.clone()) == key)
-            })
-            .unwrap_or(0);
-        self.completion = Some(menu);
+        let request_id = search.request_id;
+        let token_start = search.token_start;
+        let token_end = search.token_end;
+        let mut updates = Vec::new();
+        let mut finished = false;
+        loop {
+            match search.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        for update in updates {
+            if request_id != self.completion_request_id
+                || update.request_id != self.completion_request_id
+                || update.items.is_empty()
+            {
+                continue;
+            }
+            let previous = self
+                .completion
+                .as_ref()
+                .and_then(|menu| menu.items.get(menu.selected))
+                .map(|item| item.id.clone());
+            let selected = previous
+                .and_then(|id| update.items.iter().position(|item| item.id == id))
+                .unwrap_or(0);
+            self.completion = Some(CompletionMenu {
+                items: update.items,
+                selected,
+                token_start,
+                token_end,
+            });
+        }
+        if finished {
+            self.completion_search = None;
+        }
+    }
+
+    fn close_completion(&mut self) {
+        self.completion = None;
+        self.completion_search = None;
+        self.completion_request_id = self.completion_request_id.wrapping_add(1);
     }
 
     fn move_completion(&mut self, delta: isize) {
         let Some(menu) = &mut self.completion else {
             return;
         };
+        if menu.items.is_empty() {
+            return;
+        }
         let len = menu.items.len() as isize;
         menu.selected = (menu.selected as isize + delta).rem_euclid(len) as usize;
     }
@@ -1128,6 +1185,8 @@ impl App {
         let Some(menu) = self.completion.take() else {
             return false;
         };
+        self.completion_search = None;
+        self.completion_request_id = self.completion_request_id.wrapping_add(1);
         let Some(item) = menu.items.get(menu.selected) else {
             return false;
         };
@@ -1147,7 +1206,7 @@ impl App {
         self.skill_selection = self
             .skill_selection
             .min(self.skills.len().saturating_sub(1));
-        self.completion = None;
+        self.close_completion();
     }
 
     fn move_skill_selection(&mut self, delta: isize) {
@@ -1178,7 +1237,7 @@ impl App {
         mention.push(' ');
         self.show_skills = false;
         self.insert(&mention);
-        self.completion = None;
+        self.close_completion();
     }
 
     fn open_model_picker(&mut self) {
@@ -1198,7 +1257,7 @@ impl App {
             reasoning_effort: self.reasoning_effort.clone(),
             service_tier: self.service_tier.clone(),
         });
-        self.completion = None;
+        self.close_completion();
     }
 
     fn model_picker_item_count(&self) -> usize {
@@ -1410,7 +1469,7 @@ impl App {
         self.show_skills = false;
         self.model_picker = None;
         self.session_picker = None;
-        self.completion = None;
+        self.close_completion();
     }
 
     fn move_goal_selection(&mut self, delta: isize) {
@@ -1479,7 +1538,7 @@ impl App {
         self.input.clone_from(&goal.objective);
         self.cursor = self.input.len();
         self.preferred_column = None;
-        self.completion = None;
+        self.close_completion();
         self.editing_goal_id = Some(id);
     }
 
@@ -1570,7 +1629,7 @@ impl App {
         self.show_help = false;
         self.show_skills = false;
         self.model_picker = None;
-        self.completion = None;
+        self.close_completion();
         Ok(())
     }
 
@@ -2186,7 +2245,7 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
                 self.preferred_column = None;
-                self.completion = None;
+                self.close_completion();
                 self.apply_snapshot(snapshot);
                 self.error = None;
                 if resume {
@@ -2205,7 +2264,7 @@ impl App {
             self.input.clear();
             self.cursor = 0;
             self.preferred_column = None;
-            self.completion = None;
+            self.close_completion();
             self.request_goal_action(PendingGoalAction::Create(objective));
             if !self.is_running() {
                 self.apply_pending_goal_action().await?;
@@ -2216,14 +2275,14 @@ impl App {
             self.input.clear();
             self.cursor = 0;
             self.preferred_column = None;
-            self.completion = None;
+            self.close_completion();
             return self.command(&prompt).await;
         }
         if prompt == "/providers" || prompt.starts_with("/provider ") {
             self.input.clear();
             self.cursor = 0;
             self.preferred_column = None;
-            self.completion = None;
+            self.close_completion();
             return self.provider_command(&prompt);
         }
         if self.is_running() {
@@ -2231,7 +2290,7 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
                 self.preferred_column = None;
-                self.completion = None;
+                self.close_completion();
                 self.queued_prompt = Some(prompt);
             }
             return Ok(());
@@ -2240,7 +2299,7 @@ impl App {
             self.input.clear();
             self.cursor = 0;
             self.preferred_column = None;
-            self.completion = None;
+            self.close_completion();
             return self.command(&prompt).await;
         }
 
@@ -2252,7 +2311,7 @@ impl App {
             self.input.clear();
             self.cursor = 0;
             self.preferred_column = None;
-            self.completion = None;
+            self.close_completion();
         }
         self.error = None;
         self.pending_user = Some(prompt.clone());
@@ -2420,7 +2479,7 @@ impl App {
                     self.request_stop();
                 } else {
                     self.last_escape = Some(now);
-                    self.completion = None;
+                    self.close_completion();
                 }
                 return Ok(());
             }
@@ -2478,7 +2537,7 @@ impl App {
             self.input.clear();
             self.cursor = 0;
             self.preferred_column = None;
-            self.completion = None;
+            self.close_completion();
             self.error = None;
             if resume && let Some(snapshot) = self.conversation.activate_goal(id).await? {
                 self.apply_snapshot(snapshot);
@@ -2537,7 +2596,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Esc => {
-                    self.completion = None;
+                    self.close_completion();
                     return Ok(());
                 }
                 _ => {}
@@ -2601,7 +2660,7 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
                 self.preferred_column = None;
-                self.completion = None;
+                self.close_completion();
             }
             _ => {}
         }
@@ -2681,6 +2740,7 @@ async fn run_tui(
     }
     loop {
         app.drain_agent_events();
+        app.drain_completion_updates();
         app.finish_turn_if_ready().await?;
         if !app.is_running() {
             app.apply_pending_goal_action().await?;
@@ -3580,11 +3640,6 @@ fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rec
                 } else {
                     Color::White
                 };
-                let name = item
-                    .name
-                    .rsplit('/')
-                    .next()
-                    .expect("split always yields at least one component");
                 return Line::from(vec![
                     Span::styled(
                         if selected { " › " } else { "   " },
@@ -3595,7 +3650,7 @@ fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rec
                         Style::default().fg(color),
                     ),
                     Span::styled(
-                        name.to_owned(),
+                        item.display.clone(),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
                 ])
@@ -5805,6 +5860,77 @@ mod tests {
         );
         assert_eq!(file_icon(Path::new("app.js")), "");
         assert_eq!(file_icon(Path::new("script.py")), "");
+    }
+
+    #[tokio::test]
+    async fn at_menu_merges_recursive_results_without_moving_the_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("nested/deeper")).unwrap();
+        fs::write(workspace.join("local-config.toml"), "").unwrap();
+        fs::write(workspace.join("nested/deeper/remote-config.toml"), "").unwrap();
+        let mut app = test_app(&workspace);
+
+        app.insert("@config");
+        let local_id = app.completion.as_ref().unwrap().items[0].id.clone();
+        app.completion.as_mut().unwrap().selected = 0;
+        for _ in 0..100 {
+            app.drain_completion_updates();
+            if app.completion.as_ref().is_some_and(|menu| {
+                menu.items
+                    .iter()
+                    .any(|item| item.name == "nested/deeper/remote-config.toml")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let menu = app.completion.as_ref().unwrap();
+        assert!(
+            menu.items
+                .iter()
+                .any(|item| item.display == "nested/deeper/remote-config.toml")
+        );
+        assert_eq!(menu.items[menu.selected].id, local_id);
+    }
+
+    #[tokio::test]
+    async fn at_menu_drops_recursive_updates_from_a_stale_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("nested")).unwrap();
+        fs::write(workspace.join("nested/old-match.toml"), "").unwrap();
+        fs::write(workspace.join("nested/new-match.toml"), "").unwrap();
+        let mut app = test_app(&workspace);
+
+        app.insert("@old");
+        app.input.clear();
+        app.cursor = 0;
+        app.insert("@new");
+        for _ in 0..100 {
+            app.drain_completion_updates();
+            if app.completion.as_ref().is_some_and(|menu| {
+                menu.items
+                    .iter()
+                    .any(|item| item.name == "nested/new-match.toml")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let menu = app.completion.as_ref().unwrap();
+        assert!(
+            menu.items
+                .iter()
+                .any(|item| item.name == "nested/new-match.toml")
+        );
+        assert!(
+            menu.items
+                .iter()
+                .all(|item| item.name != "nested/old-match.toml")
+        );
     }
 
     #[tokio::test]
