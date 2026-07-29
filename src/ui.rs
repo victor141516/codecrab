@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -688,6 +688,97 @@ impl SessionPicker {
     }
 }
 
+#[derive(Clone)]
+struct QueuedPrompt {
+    id: u64,
+    content: String,
+}
+
+struct PromptQueue {
+    items: VecDeque<QueuedPrompt>,
+    next_id: u64,
+    steered_id: Option<u64>,
+}
+
+impl Default for PromptQueue {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            next_id: 1,
+            steered_id: None,
+        }
+    }
+}
+
+impl PromptQueue {
+    fn push(&mut self, content: String) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.items.push_back(QueuedPrompt { id, content });
+        id
+    }
+
+    fn update(&mut self, id: u64, content: String) -> bool {
+        let Some(prompt) = self.items.iter_mut().find(|prompt| prompt.id == id) else {
+            return false;
+        };
+        prompt.content = content;
+        true
+    }
+
+    fn remove(&mut self, id: u64) -> Option<QueuedPrompt> {
+        let index = self.items.iter().position(|prompt| prompt.id == id)?;
+        if self.steered_id == Some(id) {
+            self.steered_id = None;
+        }
+        self.items.remove(index)
+    }
+
+    fn steer(&mut self, id: u64) -> bool {
+        if !self.items.iter().any(|prompt| prompt.id == id) {
+            return false;
+        }
+        self.steered_id = Some(id);
+        true
+    }
+
+    fn next_id(&self) -> Option<u64> {
+        self.steered_id
+            .filter(|id| self.items.iter().any(|prompt| prompt.id == *id))
+            .or_else(|| self.items.front().map(|prompt| prompt.id))
+    }
+
+    fn pop_next(&mut self, editing_id: Option<u64>) -> Option<QueuedPrompt> {
+        let id = self.next_id()?;
+        if editing_id == Some(id) {
+            return None;
+        }
+        self.steered_id = None;
+        self.remove(id)
+    }
+}
+
+struct QueuedPromptEdit {
+    id: u64,
+    previous_input: String,
+    previous_cursor: usize,
+}
+
+#[derive(Clone, Copy)]
+struct QueuedPromptButtons {
+    id: u64,
+    steer: Rect,
+    edit: Rect,
+    delete: Rect,
+}
+
+#[derive(Clone, Copy)]
+enum QueuedPromptAction {
+    Steer(u64),
+    Edit(u64),
+    Delete(u64),
+}
+
 struct App {
     conversations: ConversationManager,
     conversation: ConversationHandle,
@@ -711,7 +802,9 @@ struct App {
     preferred_column: Option<usize>,
     composer_width: usize,
     pending_user: Option<String>,
-    queued_prompt: Option<String>,
+    prompt_queue: PromptQueue,
+    queued_prompt_edit: Option<QueuedPromptEdit>,
+    resume_goal_after_queue: bool,
     goals: Vec<Goal>,
     visible_goal_id: Option<Uuid>,
     goal_picker: Option<GoalPicker>,
@@ -721,7 +814,7 @@ struct App {
     editing_message: Option<MessageEdit>,
     goal_buttons: GoalButtons,
     last_escape: Option<Instant>,
-    steer_button: Option<Rect>,
+    queued_prompt_buttons: Vec<QueuedPromptButtons>,
     conversation_view: Option<ConversationView>,
     text_selection: Option<TextSelection>,
     copy_flash: Option<CopyFlash>,
@@ -757,10 +850,12 @@ struct App {
 }
 
 struct BackgroundTurn {
-    running: JoinHandle<Result<ConversationTurn>>,
-    event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    running: Option<JoinHandle<Result<ConversationTurn>>>,
+    event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     pending_user: Option<String>,
-    queued_prompt: Option<String>,
+    prompt_queue: PromptQueue,
+    queued_prompt_edit: Option<QueuedPromptEdit>,
+    resume_goal_after_queue: bool,
     pending_goal_action: Option<PendingGoalAction>,
     live_messages: Vec<Message>,
 }
@@ -826,7 +921,9 @@ impl App {
             preferred_column: None,
             composer_width: 80,
             pending_user: None,
-            queued_prompt: None,
+            prompt_queue: PromptQueue::default(),
+            queued_prompt_edit: None,
+            resume_goal_after_queue: false,
             goals,
             visible_goal_id,
             goal_picker: None,
@@ -836,7 +933,7 @@ impl App {
             editing_message: None,
             goal_buttons: GoalButtons::default(),
             last_escape: None,
-            steer_button: None,
+            queued_prompt_buttons: Vec::new(),
             conversation_view: None,
             text_selection: None,
             copy_flash: None,
@@ -1134,10 +1231,6 @@ impl App {
     }
 
     fn refresh_completion(&mut self) {
-        let previous = self
-            .completion
-            .as_ref()
-            .and_then(|menu| menu.items.get(menu.selected).map(|item| item.id.clone()));
         self.completion_search = None;
         self.completion_request_id = self.completion_request_id.wrapping_add(1);
         let (menu, search) = complete_progressive(
@@ -1149,12 +1242,7 @@ impl App {
                 .map(|skill| (skill.name.as_str(), skill.description.as_str())),
             self.completion_request_id,
         );
-        self.completion = menu.map(|mut menu| {
-            menu.selected = previous
-                .and_then(|id| menu.items.iter().position(|item| item.id == id))
-                .unwrap_or(0);
-            menu
-        });
+        self.completion = menu;
         self.completion_search = search;
     }
 
@@ -1976,13 +2064,23 @@ impl App {
     }
 
     fn park_current_turn(&mut self) {
-        let Some(running) = self.running.take() else {
+        if self.running.is_none()
+            && self.prompt_queue.items.is_empty()
+            && self.queued_prompt_edit.is_none()
+            && !self.resume_goal_after_queue
+        {
             return;
-        };
-        let event_rx = self
-            .event_rx
-            .take()
-            .expect("a running terminal turn has an event stream");
+        }
+        let queued_prompt_edit = self.queued_prompt_edit.take();
+        if let Some(edit) = &queued_prompt_edit {
+            self.input.clone_from(&edit.previous_input);
+            self.cursor = edit.previous_cursor.min(self.input.len());
+            self.preferred_column = None;
+            self.close_completion();
+        }
+        let running = self.running.take();
+        let event_rx = self.event_rx.take();
+        debug_assert_eq!(running.is_some(), event_rx.is_some());
         let id = self.conversation.snapshot().session.id;
         self.background_turns.insert(
             id,
@@ -1990,7 +2088,9 @@ impl App {
                 running,
                 event_rx,
                 pending_user: self.pending_user.take(),
-                queued_prompt: self.queued_prompt.take(),
+                prompt_queue: std::mem::take(&mut self.prompt_queue),
+                queued_prompt_edit,
+                resume_goal_after_queue: std::mem::take(&mut self.resume_goal_after_queue),
                 pending_goal_action: self.pending_goal_action.take(),
                 live_messages: std::mem::take(&mut self.live_messages),
             },
@@ -2001,10 +2101,24 @@ impl App {
         let Some(background) = self.background_turns.remove(&id) else {
             return;
         };
-        self.running = Some(background.running);
-        self.event_rx = Some(background.event_rx);
+        self.running = background.running;
+        self.event_rx = background.event_rx;
         self.pending_user = background.pending_user;
-        self.queued_prompt = background.queued_prompt;
+        self.prompt_queue = background.prompt_queue;
+        self.queued_prompt_edit = background.queued_prompt_edit;
+        self.resume_goal_after_queue = background.resume_goal_after_queue;
+        if let Some(edit) = &self.queued_prompt_edit
+            && let Some(prompt) = self
+                .prompt_queue
+                .items
+                .iter()
+                .find(|prompt| prompt.id == edit.id)
+        {
+            self.input.clone_from(&prompt.content);
+            self.cursor = self.input.len();
+            self.preferred_column = None;
+            self.close_completion();
+        }
         self.pending_goal_action = background.pending_goal_action;
         self.live_messages = background.live_messages;
     }
@@ -2091,7 +2205,9 @@ impl App {
         self.apply_snapshot(self.conversation.snapshot());
         self.live_messages.clear();
         self.pending_user = None;
-        self.queued_prompt = None;
+        self.prompt_queue = PromptQueue::default();
+        self.queued_prompt_edit = None;
+        self.resume_goal_after_queue = false;
         self.goal_picker = None;
         self.pending_goal_action = None;
         self.editing_goal_id = None;
@@ -2099,7 +2215,7 @@ impl App {
         self.editing_message = None;
         self.goal_buttons = GoalButtons::default();
         self.last_escape = None;
-        self.steer_button = None;
+        self.queued_prompt_buttons.clear();
         self.conversation_view = None;
         self.text_selection = None;
         self.copy_flash = None;
@@ -2272,6 +2388,86 @@ impl App {
         self.update_selection_cursor(column, row);
     }
 
+    fn begin_queued_prompt_edit(&mut self, id: u64) {
+        if self
+            .queued_prompt_edit
+            .as_ref()
+            .is_some_and(|edit| edit.id == id)
+        {
+            return;
+        }
+        self.cancel_queued_prompt_edit();
+        let Some(content) = self
+            .prompt_queue
+            .items
+            .iter()
+            .find(|prompt| prompt.id == id)
+            .map(|prompt| prompt.content.clone())
+        else {
+            return;
+        };
+        self.queued_prompt_edit = Some(QueuedPromptEdit {
+            id,
+            previous_input: std::mem::take(&mut self.input),
+            previous_cursor: self.cursor,
+        });
+        self.input = content;
+        self.cursor = self.input.len();
+        self.preferred_column = None;
+        self.close_completion();
+        self.error = None;
+    }
+
+    fn cancel_queued_prompt_edit(&mut self) {
+        let Some(edit) = self.queued_prompt_edit.take() else {
+            return;
+        };
+        self.input = edit.previous_input;
+        self.cursor = edit.previous_cursor.min(self.input.len());
+        self.preferred_column = None;
+        self.close_completion();
+        self.error = None;
+    }
+
+    fn finish_queued_prompt_edit(&mut self, content: String) {
+        let Some(edit) = self.queued_prompt_edit.take() else {
+            return;
+        };
+        if !self.prompt_queue.update(edit.id, content) {
+            self.error = Some("The queued message no longer exists.".into());
+        } else {
+            self.error = None;
+        }
+        self.input = edit.previous_input;
+        self.cursor = edit.previous_cursor.min(self.input.len());
+        self.preferred_column = None;
+        self.close_completion();
+    }
+
+    fn delete_queued_prompt(&mut self, id: u64) {
+        if self
+            .queued_prompt_edit
+            .as_ref()
+            .is_some_and(|edit| edit.id == id)
+        {
+            self.cancel_queued_prompt_edit();
+        }
+        self.prompt_queue.remove(id);
+    }
+
+    fn steer_queued_prompt(&mut self, id: u64) {
+        if self
+            .queued_prompt_edit
+            .as_ref()
+            .is_some_and(|edit| edit.id == id)
+        {
+            return;
+        }
+        if self.prompt_queue.steer(id) && self.is_running() {
+            self.cancel_current_turn();
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.goal_picker.is_none()
@@ -2316,14 +2512,28 @@ impl App {
                 }
             }
         }
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.queued_prompt.is_some()
-            && self
-                .steer_button
-                .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
-        {
-            self.cancel_current_turn();
-            return;
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let point = (mouse.column, mouse.row).into();
+            let action = self.queued_prompt_buttons.iter().find_map(|buttons| {
+                if buttons.steer.contains(point) {
+                    Some(QueuedPromptAction::Steer(buttons.id))
+                } else if buttons.edit.contains(point) {
+                    Some(QueuedPromptAction::Edit(buttons.id))
+                } else if buttons.delete.contains(point) {
+                    Some(QueuedPromptAction::Delete(buttons.id))
+                } else {
+                    None
+                }
+            });
+            match action {
+                Some(QueuedPromptAction::Steer(id)) => self.steer_queued_prompt(id),
+                Some(QueuedPromptAction::Edit(id)) => self.begin_queued_prompt_edit(id),
+                Some(QueuedPromptAction::Delete(id)) => self.delete_queued_prompt(id),
+                None => {}
+            }
+            if action.is_some() {
+                return;
+            }
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Right) => {
@@ -2439,6 +2649,7 @@ impl App {
         if !self.running.as_ref().is_some_and(JoinHandle::is_finished) {
             return Ok(());
         }
+        let editing_id = self.queued_prompt_edit.as_ref().map(|edit| edit.id);
         let handle = self.running.take().expect("checked above");
         let turn = handle.await.context("conversation turn task failed")??;
         self.apply_snapshot(turn.snapshot);
@@ -2463,12 +2674,38 @@ impl App {
         if self.apply_pending_goal_action().await? {
             return Ok(());
         }
-        if let Some(prompt) = self.queued_prompt.take() {
-            self.start_turn(prompt, false)?;
-        } else if turn_succeeded && self.active_goal_id().is_some() {
+        if let Some(prompt) = self.prompt_queue.pop_next(editing_id) {
+            self.start_turn(prompt.content, false)?;
+        } else if turn_succeeded
+            && self.prompt_queue.items.is_empty()
+            && self.active_goal_id().is_some()
+        {
+            self.resume_goal_after_queue = false;
             self.start_goal_continuation()?;
+        } else if turn_succeeded && self.active_goal_id().is_some() {
+            self.resume_goal_after_queue = true;
         }
         Ok(())
+    }
+
+    fn dispatch_queued_prompt_if_idle(&mut self) -> Result<bool> {
+        if self.is_running() {
+            return Ok(false);
+        }
+        let editing_id = self.queued_prompt_edit.as_ref().map(|edit| edit.id);
+        if let Some(prompt) = self.prompt_queue.pop_next(editing_id) {
+            self.start_turn(prompt.content, false)?;
+            return Ok(true);
+        }
+        if self.prompt_queue.items.is_empty()
+            && self.resume_goal_after_queue
+            && self.active_goal_id().is_some()
+        {
+            self.resume_goal_after_queue = false;
+            self.start_goal_continuation()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn submit(&mut self) -> Result<()> {
@@ -2477,6 +2714,13 @@ impl App {
         }
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() {
+            if self.queued_prompt_edit.is_some() {
+                self.error = Some("A queued message cannot be empty; delete it instead.".into());
+            }
+            return Ok(());
+        }
+        if self.queued_prompt_edit.is_some() {
+            self.finish_queued_prompt_edit(prompt);
             return Ok(());
         }
         if let Some(edit) = self.editing_message.take() {
@@ -2534,13 +2778,11 @@ impl App {
             return self.provider_command(&prompt);
         }
         if self.is_running() {
-            if self.queued_prompt.is_none() {
-                self.input.clear();
-                self.cursor = 0;
-                self.preferred_column = None;
-                self.close_completion();
-                self.queued_prompt = Some(prompt);
-            }
+            self.input.clear();
+            self.cursor = 0;
+            self.preferred_column = None;
+            self.close_completion();
+            self.prompt_queue.push(prompt);
             return Ok(());
         }
         if builtin_command_from_input(&self.input).is_some() {
@@ -2755,6 +2997,10 @@ impl App {
                 KeyCode::Esc => self.goal_picker = None,
                 _ => {}
             }
+            return Ok(());
+        }
+        if self.queued_prompt_edit.is_some() && key.code == KeyCode::Esc {
+            self.cancel_queued_prompt_edit();
             return Ok(());
         }
         if self.is_running() {
@@ -3045,6 +3291,7 @@ async fn run_tui(
         app.finish_turn_if_ready().await?;
         if !app.is_running() {
             app.apply_pending_goal_action().await?;
+            app.dispatch_queued_prompt_if_idle()?;
         }
         app.finish_transcription_if_ready().await?;
         app.update_drag_autoscroll();
@@ -3086,8 +3333,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let input_lines = composer_rows(&app.input, app.composer_width)
         .len()
         .clamp(1, 6) as u16;
-    let queued_height = if app.queued_prompt.is_some() { 3 } else { 0 };
     let goal_height = if app.visible_goal().is_some() { 3 } else { 0 };
+    let fixed_height = 3 + 8 + goal_height + input_lines + 2;
+    let available_queue_height = area.height.saturating_sub(fixed_height);
+    let queued_height =
+        ((app.prompt_queue.items.len() as u16 * 3).min(available_queue_height)) / 3 * 3;
     let [header, body, queued, goal, composer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(8),
@@ -3110,7 +3360,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         render_chat(frame, app, body);
     }
-    render_queued_prompt(frame, app, queued);
+    render_queued_prompts(frame, app, queued);
     render_goal(frame, app, goal);
     render_composer(frame, app, composer);
     if app.completion.is_some() {
@@ -3134,45 +3384,119 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn render_queued_prompt(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let Some(prompt) = &app.queued_prompt else {
-        app.steer_button = None;
-        return;
-    };
-    if area.width < 16 || area.height < 3 {
-        app.steer_button = None;
+fn render_queued_prompts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    app.queued_prompt_buttons.clear();
+    let visible = (area.height / 3).min(app.prompt_queue.items.len() as u16) as usize;
+    if visible == 0 || area.width < 16 {
         return;
     }
-
-    let button_width = 9.min(area.width);
-    let message_width = area.width.saturating_sub(button_width);
-    let [message, button] = Layout::horizontal([
-        Constraint::Length(message_width),
-        Constraint::Length(button_width),
-    ])
-    .areas(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" QUEUED  ", Style::default().fg(MUTED)),
-            Span::raw(prompt.clone()),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MUTED)),
-        )
-        .wrap(Wrap { trim: true }),
-        message,
-    );
-    frame.render_widget(
-        Paragraph::new("Steer").centered().block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(CRAB)),
-        ),
-        button,
-    );
-    app.steer_button = Some(button);
+    let rows = Layout::vertical(vec![Constraint::Length(3); visible]).split(area);
+    let total = app.prompt_queue.items.len();
+    let editing_id = app.queued_prompt_edit.as_ref().map(|edit| edit.id);
+    for (index, (prompt, row)) in app
+        .prompt_queue
+        .items
+        .iter()
+        .take(visible)
+        .zip(rows.iter().copied())
+        .enumerate()
+    {
+        let editing = editing_id == Some(prompt.id);
+        if row.width < 25 {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            " {} {}/{}  ",
+                            if editing { "EDITING" } else { "QUEUED" },
+                            index + 1,
+                            total
+                        ),
+                        Style::default().fg(if editing { CRAB } else { MUTED }),
+                    ),
+                    Span::raw(prompt.content.clone()),
+                ]))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(if editing { CRAB } else { MUTED })),
+                )
+                .wrap(Wrap { trim: true }),
+                row,
+            );
+            continue;
+        }
+        let compact_controls = row.width < 41;
+        let (controls_width, steer_width, edit_width, delete_width) = if compact_controls {
+            (9, 3, 3, 3)
+        } else {
+            (25, 9, 7, 9)
+        };
+        let [message, steer, edit, delete] = Layout::horizontal([
+            Constraint::Length(row.width.saturating_sub(controls_width)),
+            Constraint::Length(steer_width),
+            Constraint::Length(edit_width),
+            Constraint::Length(delete_width),
+        ])
+        .areas(row);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        " {} {}/{}  ",
+                        if editing { "EDITING" } else { "QUEUED" },
+                        index + 1,
+                        total
+                    ),
+                    Style::default().fg(if editing { CRAB } else { MUTED }),
+                ),
+                Span::raw(prompt.content.clone()),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if editing { CRAB } else { MUTED })),
+            )
+            .wrap(Wrap { trim: true }),
+            message,
+        );
+        frame.render_widget(
+            Paragraph::new(if compact_controls { "S" } else { "Steer" })
+                .centered()
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(if editing { MUTED } else { CRAB })),
+                ),
+            steer,
+        );
+        frame.render_widget(
+            Paragraph::new(if compact_controls { "E" } else { "Edit" })
+                .centered()
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(CRAB)),
+                ),
+            edit,
+        );
+        frame.render_widget(
+            Paragraph::new(if compact_controls { "X" } else { "Delete" })
+                .centered()
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(MUTED)),
+                ),
+            delete,
+        );
+        app.queued_prompt_buttons.push(QueuedPromptButtons {
+            id: prompt.id,
+            steer,
+            edit,
+            delete,
+        });
+    }
 }
 
 fn render_goal(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -5389,7 +5713,7 @@ mod tests {
         assert_eq!(app.input, "beforeone\ntwo\nthree\nafter");
         assert_eq!(app.cursor, "beforeone\ntwo\nthree\n".len());
         assert!(app.pending_user.is_none());
-        assert!(app.queued_prompt.is_none());
+        assert!(app.prompt_queue.items.is_empty());
         assert!(!app.is_running());
     }
 
@@ -5496,7 +5820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submitting_while_the_agent_works_queues_the_next_message() {
+    async fn submitting_while_the_agent_works_queues_multiple_messages() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
         let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
@@ -5508,10 +5832,17 @@ mod tests {
         app.cursor = app.input.len();
 
         app.submit().await.unwrap();
+        app.input = "Then run the focused tests".into();
+        app.cursor = app.input.len();
+        app.submit().await.unwrap();
 
         assert_eq!(
-            app.queued_prompt.as_deref(),
-            Some("Follow up after this turn")
+            app.prompt_queue
+                .items
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Follow up after this turn", "Then run the focused tests"]
         );
         assert!(app.input.is_empty());
         assert!(app.is_running());
@@ -5537,24 +5868,31 @@ mod tests {
             .unwrap();
         assert!(app.last_escape.is_none());
 
-        app.queued_prompt = Some("Steer now".into());
-        app.steer_button = Some(Rect::new(10, 4, 9, 3));
+        let id = app.prompt_queue.push("Steer now".into());
+        app.queued_prompt_buttons.push(QueuedPromptButtons {
+            id,
+            steer: Rect::new(10, 4, 9, 3),
+            edit: Rect::new(19, 4, 7, 3),
+            delete: Rect::new(26, 4, 9, 3),
+        });
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 12,
             row: 5,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.queued_prompt.as_deref(), Some("Steer now"));
+        assert_eq!(app.prompt_queue.steered_id, Some(id));
+        assert_eq!(app.prompt_queue.items.front().unwrap().content, "Steer now");
         app.running.take().unwrap().abort();
     }
 
     #[test]
-    fn queued_message_renders_a_compact_steer_button() {
+    fn queued_messages_render_compact_controls_above_the_composer() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
-        app.queued_prompt = Some("Use the other implementation".into());
-        let backend = TestBackend::new(100, 30);
+        app.prompt_queue.push("Use the other implementation".into());
+        app.prompt_queue.push("Then update its tests".into());
+        let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = terminal
@@ -5567,8 +5905,110 @@ mod tests {
 
         assert!(text.contains("QUEUED"));
         assert!(text.contains("Use the other implementation"));
+        assert!(text.contains("Then update its tests"));
         assert!(text.contains("Steer"));
-        assert!(app.steer_button.is_some());
+        assert!(text.contains("Edit"));
+        assert!(text.contains("Delete"));
+        assert_eq!(app.queued_prompt_buttons.len(), 2);
+
+        let controls = app.queued_prompt_buttons[1];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: controls.edit.x + 1,
+            row: controls.edit.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.queued_prompt_edit.as_ref().map(|edit| edit.id),
+            Some(controls.id)
+        );
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: controls.delete.x + 1,
+            row: controls.delete.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.queued_prompt_edit.is_none());
+        assert_eq!(app.prompt_queue.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn editing_and_deleting_queued_messages_preserves_queue_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let first = app.prompt_queue.push("first".into());
+        let second = app.prompt_queue.push("second".into());
+        let third = app.prompt_queue.push("third".into());
+        app.input = "unsent draft".into();
+        app.cursor = app.input.len();
+
+        app.begin_queued_prompt_edit(second);
+        assert_eq!(app.input, "second");
+        app.input = "edited second".into();
+        app.cursor = app.input.len();
+        app.submit().await.unwrap();
+
+        assert_eq!(app.input, "unsent draft");
+        assert_eq!(
+            app.prompt_queue
+                .items
+                .iter()
+                .map(|prompt| (prompt.id, prompt.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (first, "first"),
+                (second, "edited second"),
+                (third, "third")
+            ]
+        );
+
+        app.delete_queued_prompt(first);
+        assert_eq!(
+            app.prompt_queue
+                .items
+                .iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            vec![second, third]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edited_front_message_waits_then_dispatches_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let first = app.prompt_queue.push("first".into());
+        let second = app.prompt_queue.push("second".into());
+
+        app.begin_queued_prompt_edit(first);
+        assert!(!app.dispatch_queued_prompt_if_idle().unwrap());
+        app.finish_queued_prompt_edit("edited first".into());
+        assert!(app.dispatch_queued_prompt_if_idle().unwrap());
+
+        assert_eq!(app.pending_user.as_deref(), Some("edited first"));
+        assert_eq!(
+            app.prompt_queue
+                .items
+                .iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            vec![second]
+        );
+        app.running.take().unwrap().abort();
+    }
+
+    #[test]
+    fn prompt_queue_is_fifo_but_steer_targets_the_selected_message() {
+        let mut queue = PromptQueue::default();
+        let first = queue.push("first".into());
+        let second = queue.push("second".into());
+        let third = queue.push("third".into());
+
+        assert!(queue.steer(second));
+        assert_eq!(queue.pop_next(None).unwrap().id, second);
+        assert_eq!(queue.pop_next(None).unwrap().id, first);
+        assert!(queue.pop_next(Some(third)).is_none());
+        assert_eq!(queue.pop_next(None).unwrap().id, third);
     }
 
     #[tokio::test]
@@ -6712,6 +7152,20 @@ mod tests {
                 .any(|item| item.display == "nested/deeper/remote-config.toml")
         );
         assert_eq!(menu.items[menu.selected].id, local_id);
+    }
+
+    #[test]
+    fn at_menu_resets_selection_when_the_composer_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("alpha.txt"), "").unwrap();
+        fs::write(temp.path().join("alpine.txt"), "").unwrap();
+        let mut app = test_app(temp.path());
+
+        app.insert("@a");
+        app.completion.as_mut().unwrap().selected = 1;
+        app.insert("l");
+
+        assert_eq!(app.completion.as_ref().unwrap().selected, 0);
     }
 
     #[tokio::test]

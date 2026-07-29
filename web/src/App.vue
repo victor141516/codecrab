@@ -56,6 +56,14 @@ import {
   projectEditedSession,
   routeContainsEdge
 } from "./branches.js";
+import {
+  createPromptQueue,
+  enqueuePrompt,
+  removeQueuedPrompt,
+  steerQueuedPrompt as prioritizeQueuedPrompt,
+  takeNextQueuedPrompt,
+  updateQueuedPrompt
+} from "./prompt-queue.js";
 
 const state = ref(null);
 const draft = ref("");
@@ -147,7 +155,9 @@ function runtimeFor(id) {
     return {
       sending: false,
       cancelling: false,
-      queuedPrompt: "",
+      promptQueue: createPromptQueue(),
+      queuedPromptEdit: null,
+      resumeGoalAfterQueue: false,
       pendingGoalAction: null,
       error: ""
     };
@@ -156,7 +166,9 @@ function runtimeFor(id) {
     sessionRuntimes.set(id, reactive({
       sending: false,
       cancelling: false,
-      queuedPrompt: "",
+      promptQueue: createPromptQueue(),
+      queuedPromptEdit: null,
+      resumeGoalAfterQueue: false,
       pendingGoalAction: null,
       error: ""
     }));
@@ -176,12 +188,7 @@ const cancelling = computed({
     selectedRuntime.value.cancelling = value;
   }
 });
-const queuedPrompt = computed({
-  get: () => selectedRuntime.value.queuedPrompt,
-  set: (value) => {
-    selectedRuntime.value.queuedPrompt = value;
-  }
-});
+const queuedPrompts = computed(() => selectedRuntime.value.promptQueue.items);
 const projects = computed(() => state.value?.projects ?? []);
 const selectedProject = computed(
   () =>
@@ -1562,7 +1569,17 @@ async function sendPrompt() {
   }
   if (transcribing.value) return;
   const prompt = draft.value.trim();
-  if (!prompt) return;
+  const runtime = selectedRuntime.value;
+  if (!prompt) {
+    if (runtime.queuedPromptEdit) {
+      error.value = "A queued message cannot be empty; delete it instead.";
+    }
+    return;
+  }
+  if (runtime.queuedPromptEdit) {
+    await finishQueuedPromptEdit(prompt);
+    return;
+  }
   if (prompt === "/goals") {
     await clearComposer();
     closeAutocomplete();
@@ -1586,11 +1603,9 @@ async function sendPrompt() {
     return;
   }
   if (sending.value) {
-    if (!queuedPrompt.value) {
-      queuedPrompt.value = prompt;
-      await clearComposer();
-      closeAutocomplete();
-    }
+    enqueuePrompt(runtime.promptQueue, prompt);
+    await clearComposer();
+    closeAutocomplete();
     return;
   }
   const sent = composerDrafts.snapshot();
@@ -1643,14 +1658,20 @@ async function runPrompt(
     const goalAction = runtime.pendingGoalAction;
     runtime.pendingGoalAction = null;
     if (goalAction) {
-      void goalAction();
+      runtime.resumeGoalAfterQueue = false;
+      void goalAction().finally(() => dispatchQueuedPromptIfIdle(sessionId));
       return;
     }
-    const nextPrompt = runtime.queuedPrompt;
-    runtime.queuedPrompt = "";
+    runtime.resumeGoalAfterQueue =
+      completed && Boolean(activeGoalFor(sessionId));
+    const nextPrompt = takeNextQueuedPrompt(runtime.promptQueue);
     if (nextPrompt) {
-      void runPrompt(nextPrompt, { sessionId });
-    } else if (completed && activeGoalFor(sessionId)) {
+      void runPrompt(nextPrompt.content, { sessionId });
+    } else if (
+      runtime.promptQueue.items.length === 0 &&
+      runtime.resumeGoalAfterQueue
+    ) {
+      runtime.resumeGoalAfterQueue = false;
       void runPrompt("", { continuation: true, sessionId });
     } else if (session.value?.id === sessionId) {
       composer.value?.focus();
@@ -1682,8 +1703,104 @@ async function cancelTurn({ pauseGoal = true } = {}) {
   }
 }
 
-function steerQueuedPrompt() {
-  cancelTurn({ pauseGoal: false });
+async function beginQueuedPromptEdit(item) {
+  const runtime = selectedRuntime.value;
+  if (runtime.queuedPromptEdit?.id === item.id) {
+    composer.value?.focus();
+    return;
+  }
+  if (runtime.queuedPromptEdit) {
+    await cancelQueuedPromptEdit({ dispatch: false });
+  }
+  runtime.queuedPromptEdit = {
+    id: item.id,
+    previousDraft: draft.value
+  };
+  runtime.promptQueue.editingId = item.id;
+  draft.value = item.content;
+  closeAutocomplete();
+  error.value = "";
+  await nextTick();
+  resizeComposer();
+  composer.value?.focus();
+  composer.value?.setSelectionRange(draft.value.length, draft.value.length);
+}
+
+async function restoreDraftAfterQueuedPromptEdit(runtime, edit) {
+  runtime.queuedPromptEdit = null;
+  runtime.promptQueue.editingId = null;
+  draft.value = edit.previousDraft;
+  closeAutocomplete();
+  await nextTick();
+  resizeComposer();
+  composer.value?.focus();
+}
+
+function dispatchQueuedPromptIfIdle(sessionId) {
+  const runtime = runtimeFor(sessionId);
+  if (runtime.sending || runtime.pendingGoalAction) return false;
+  const nextPrompt = takeNextQueuedPrompt(runtime.promptQueue);
+  if (nextPrompt) {
+    void runPrompt(nextPrompt.content, { sessionId });
+    return true;
+  }
+  if (
+    runtime.promptQueue.items.length === 0 &&
+    runtime.resumeGoalAfterQueue &&
+    activeGoalFor(sessionId)
+  ) {
+    runtime.resumeGoalAfterQueue = false;
+    void runPrompt("", { continuation: true, sessionId });
+    return true;
+  }
+  return false;
+}
+
+async function finishQueuedPromptEdit(content) {
+  const runtime = selectedRuntime.value;
+  const edit = runtime.queuedPromptEdit;
+  if (!edit) return;
+  if (!updateQueuedPrompt(runtime.promptQueue, edit.id, content)) {
+    error.value = "The queued message no longer exists.";
+  } else {
+    error.value = "";
+  }
+  const sessionId = session.value?.id;
+  await restoreDraftAfterQueuedPromptEdit(runtime, edit);
+  dispatchQueuedPromptIfIdle(sessionId);
+}
+
+async function cancelQueuedPromptEdit({ dispatch = true } = {}) {
+  const runtime = selectedRuntime.value;
+  const edit = runtime.queuedPromptEdit;
+  if (!edit) return;
+  const sessionId = session.value?.id;
+  await restoreDraftAfterQueuedPromptEdit(runtime, edit);
+  if (dispatch) dispatchQueuedPromptIfIdle(sessionId);
+}
+
+async function deleteQueuedPrompt(item) {
+  const runtime = selectedRuntime.value;
+  const edit =
+    runtime.queuedPromptEdit?.id === item.id
+      ? runtime.queuedPromptEdit
+      : null;
+  if (edit) {
+    await restoreDraftAfterQueuedPromptEdit(runtime, edit);
+  }
+  removeQueuedPrompt(runtime.promptQueue, item.id);
+  dispatchQueuedPromptIfIdle(session.value?.id);
+}
+
+function steerQueuedPrompt(item) {
+  const runtime = selectedRuntime.value;
+  if (runtime.queuedPromptEdit?.id === item.id) return;
+  if (!prioritizeQueuedPrompt(runtime.promptQueue, item.id)) return;
+  if (runtime.sending) {
+    cancelTurn({ pauseGoal: false });
+  } else {
+    dispatchQueuedPromptIfIdle(session.value?.id);
+  }
 }
 
 function handleGlobalKeydown(event) {
@@ -1707,6 +1824,11 @@ function handleGlobalKeydown(event) {
   if (editingGoal.value) {
     event.preventDefault();
     void cancelGoalEdit();
+    return;
+  }
+  if (selectedRuntime.value.queuedPromptEdit) {
+    event.preventDefault();
+    void cancelQueuedPromptEdit();
     return;
   }
   if (describedGoal.value) {
@@ -3181,24 +3303,56 @@ onBeforeUnmount(() => {
           </div>
           <div v-if="session" class="relative">
             <div
-              v-if="queuedPrompt"
-              class="mb-2 flex items-center gap-3 rounded-lg border border-white/8 bg-white/3 px-3 py-2"
+              v-if="queuedPrompts.length"
+              class="mb-2 max-h-48 space-y-1.5 overflow-y-auto"
             >
-              <span class="shrink-0 text-[9px] font-semibold uppercase tracking-[0.16em] text-zinc-600">
-                Queued
-              </span>
-              <span class="min-w-0 flex-1 truncate text-xs text-zinc-300">
-                {{ queuedPrompt }}
-              </span>
-              <button
-                type="button"
-                class="shrink-0 rounded-md border border-coral/25 bg-coral/8 px-2 py-1 text-[10px] font-semibold text-coral transition hover:bg-coral/15 disabled:cursor-wait disabled:opacity-50"
-                :disabled="cancelling"
-                title="Stop the current turn and send this message"
-                @click="steerQueuedPrompt"
+              <div
+                v-for="(item, index) in queuedPrompts"
+                :key="item.id"
+                class="flex items-center gap-2 rounded-lg border px-3 py-2"
+                :class="
+                  selectedRuntime.queuedPromptEdit?.id === item.id
+                    ? 'border-coral/25 bg-coral/6'
+                    : 'border-white/8 bg-white/3'
+                "
               >
-                Steer
-              </button>
+                <span class="shrink-0 text-[9px] font-semibold uppercase tracking-[0.16em] text-zinc-600">
+                  {{ selectedRuntime.queuedPromptEdit?.id === item.id ? "Editing" : `Queued ${index + 1}` }}
+                </span>
+                <span class="min-w-0 flex-1 truncate text-xs text-zinc-300">
+                  {{ item.content }}
+                </span>
+                <button
+                  type="button"
+                  class="shrink-0 rounded-md border border-coral/25 bg-coral/8 px-2 py-1 text-[10px] font-semibold text-coral transition hover:bg-coral/15 disabled:cursor-not-allowed disabled:opacity-40"
+                  :disabled="
+                    cancelling ||
+                    selectedRuntime.queuedPromptEdit?.id === item.id
+                  "
+                  title="Stop the current turn and send this message next"
+                  @click="steerQueuedPrompt(item)"
+                >
+                  Steer
+                </button>
+                <button
+                  type="button"
+                  class="grid size-6 shrink-0 place-items-center rounded text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"
+                  title="Edit queued message"
+                  aria-label="Edit queued message"
+                  @click="beginQueuedPromptEdit(item)"
+                >
+                  <Pencil class="size-3.5" aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  class="grid size-6 shrink-0 place-items-center rounded text-zinc-500 transition hover:bg-red-500/10 hover:text-red-300"
+                  title="Delete queued message"
+                  aria-label="Delete queued message"
+                  @click="deleteQueuedPrompt(item)"
+                >
+                  <Trash2 class="size-3.5" aria-hidden="true" />
+                </button>
+              </div>
             </div>
             <div
               v-if="visibleGoal"

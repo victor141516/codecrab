@@ -1,14 +1,18 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
+use ignore::{
+    Match, WalkBuilder,
+    gitignore::{Gitignore, GitignoreBuilder},
+};
 use serde::Serialize;
 use tokio::{
     sync::{Semaphore, mpsc},
@@ -213,6 +217,132 @@ pub(crate) struct FileCompletionContext {
     dir_prefix: String,
     name_prefix: String,
     pub(crate) directory: PathBuf,
+    priority: Arc<FilePriorityIndex>,
+}
+
+struct FilePriorityIndex {
+    project_root: PathBuf,
+    global: Gitignore,
+    rules: Vec<ScopedGitignore>,
+}
+
+struct ScopedGitignore {
+    root: PathBuf,
+    matcher: Gitignore,
+}
+
+impl FilePriorityIndex {
+    fn load(project_root: &Path) -> Self {
+        let project_root = normalize_absolute(project_root);
+        let (global, _) = GitignoreBuilder::new(&project_root).build_global();
+        let mut gitignore_files = WalkBuilder::new(&project_root)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .follow_links(false)
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .filter(|entry| entry.file_name() == ".gitignore")
+            .map(|entry| entry.into_path())
+            .collect::<Vec<_>>();
+        gitignore_files.sort_by(|left, right| {
+            path_depth(left)
+                .cmp(&path_depth(right))
+                .then_with(|| left.cmp(right))
+        });
+        let git_exclude = project_root.join(".git/info/exclude");
+        let ignore_files = git_exclude
+            .is_file()
+            .then_some(git_exclude)
+            .into_iter()
+            .chain(gitignore_files);
+        let rules = ignore_files
+            .filter_map(|path| {
+                let root = if path.ends_with(Path::new(".git/info/exclude")) {
+                    project_root.clone()
+                } else {
+                    path.parent()?.to_path_buf()
+                };
+                let mut builder = GitignoreBuilder::new(&root);
+                let _ = builder.add(&path);
+                builder
+                    .build()
+                    .ok()
+                    .map(|matcher| ScopedGitignore { root, matcher })
+            })
+            .collect();
+        Self {
+            project_root,
+            global,
+            rules,
+        }
+    }
+
+    fn is_low_priority(&self, path: &Path, is_dir: bool, relative: &Path) -> bool {
+        path_has_hidden_component(relative) || self.is_git_ignored(path, is_dir)
+    }
+
+    fn is_git_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let path = normalize_absolute(path);
+        let Ok(relative) = path.strip_prefix(&self.project_root) else {
+            return self.global.matched(path, is_dir).is_ignore();
+        };
+        let components = relative.components().collect::<Vec<_>>();
+        let mut current = self.project_root.clone();
+        for (index, component) in components.iter().enumerate() {
+            current.push(component.as_os_str());
+            let current_is_dir = index + 1 < components.len() || is_dir;
+            let mut ignored = match self.global.matched(&current, current_is_dir) {
+                Match::Ignore(_) => true,
+                Match::Whitelist(_) | Match::None => false,
+            };
+            for rule in &self.rules {
+                if !current.starts_with(&rule.root) {
+                    continue;
+                }
+                match rule.matcher.matched(&current, current_is_dir) {
+                    Match::Ignore(_) => ignored = true,
+                    Match::Whitelist(_) => ignored = false,
+                    Match::None => {}
+                }
+            }
+            if ignored {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn file_priority_index(project_root: &Path) -> Arc<FilePriorityIndex> {
+    static INDEXES: OnceLock<Mutex<HashMap<PathBuf, Arc<FilePriorityIndex>>>> = OnceLock::new();
+    let project_root = normalize_absolute(project_root);
+    let indexes = INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut indexes = indexes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    indexes
+        .entry(project_root.clone())
+        .or_insert_with(|| Arc::new(FilePriorityIndex::load(&project_root)))
+        .clone()
+}
+
+fn normalize_absolute(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
+}
+
+fn path_has_hidden_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
 }
 
 pub(crate) fn file_completion_context(
@@ -261,6 +391,7 @@ pub(crate) fn file_completion_context(
         dir_prefix,
         name_prefix,
         directory,
+        priority: file_priority_index(working_directory),
     })
 }
 
@@ -334,9 +465,15 @@ fn file_completion_items(context: &FileCompletionContext) -> Vec<CompletionItem>
                 CompletionKind::File
             };
             let completion_name = format!("{}{}", context.dir_prefix, name);
+            let low_priority = context.priority.is_low_priority(
+                &normalize_absolute(&entry.path()),
+                is_dir,
+                Path::new(&completion_name),
+            );
             let suffix = if is_dir { "/" } else { " " };
             let replacement = format!("@{completion_name}{suffix}");
             Some((
+                low_priority,
                 rank,
                 CompletionItem {
                     id: format!("path:{replacement}"),
@@ -355,17 +492,18 @@ fn file_completion_items(context: &FileCompletionContext) -> Vec<CompletionItem>
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| {
-        let left_dir = left.1.kind == CompletionKind::Directory;
-        let right_dir = right.1.kind == CompletionKind::Directory;
+        let left_dir = left.2.kind == CompletionKind::Directory;
+        let right_dir = right.2.kind == CompletionKind::Directory;
         left.0
             .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
             .then_with(|| right_dir.cmp(&left_dir))
-            .then_with(|| left.1.name.to_lowercase().cmp(&right.1.name.to_lowercase()))
-            .then_with(|| left.1.name.cmp(&right.1.name))
+            .then_with(|| left.2.name.to_lowercase().cmp(&right.2.name.to_lowercase()))
+            .then_with(|| left.2.name.cmp(&right.2.name))
     });
     items
         .into_iter()
-        .map(|(_, item)| item)
+        .map(|(_, _, item)| item)
         .take(RECURSIVE_SEARCH_POLICY.maximum_local_results)
         .collect()
 }
@@ -373,6 +511,7 @@ fn file_completion_items(context: &FileCompletionContext) -> Vec<CompletionItem>
 #[derive(Clone)]
 struct RecursiveCandidate {
     item: CompletionItem,
+    low_priority: bool,
     score: i64,
     depth: usize,
 }
@@ -539,6 +678,11 @@ fn scan_recursive_files(
                 let suffix = if is_directory { "/" } else { " " };
                 let replacement = format!("@{completion_name}{suffix}");
                 candidates.push(RecursiveCandidate {
+                    low_priority: context.priority.is_low_priority(
+                        &normalize_absolute(&entry.path()),
+                        is_directory,
+                        Path::new(&relative),
+                    ),
                     item: CompletionItem {
                         id: format!("path:{replacement}"),
                         name: completion_name,
@@ -643,9 +787,9 @@ fn sort_recursive_candidates(candidates: &mut [RecursiveCandidate]) {
     candidates.sort_by(|left, right| {
         let left_dir = left.item.kind == CompletionKind::Directory;
         let right_dir = right.item.kind == CompletionKind::Directory;
-        right
-            .score
-            .cmp(&left.score)
+        left.low_priority
+            .cmp(&right.low_priority)
+            .then_with(|| right.score.cmp(&left.score))
             .then_with(|| left.depth.cmp(&right.depth))
             .then_with(|| right_dir.cmp(&left_dir))
             .then_with(|| {
@@ -951,6 +1095,90 @@ mod tests {
                 .iter()
                 .all(|item| !item.name.contains("hidden-config"))
         );
+    }
+
+    #[tokio::test]
+    async fn recursive_completion_prioritizes_normal_paths_before_hidden_and_ignored_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::create_dir_all(temp.path().join(".secret")).unwrap();
+        fs::create_dir_all(temp.path().join("generated")).unwrap();
+        fs::write(temp.path().join(".gitignore"), "generated/\n").unwrap();
+        fs::write(temp.path().join("src/normal-match.txt"), "").unwrap();
+        fs::write(temp.path().join(".secret/hidden-match.txt"), "").unwrap();
+        fs::write(temp.path().join("generated/ignored-match.txt"), "").unwrap();
+        let context = file_completion_context("@match", 6, temp.path()).unwrap();
+        let mut search =
+            start_recursive_file_completion_with_policy(context, Vec::new(), 51, test_policy())
+                .unwrap();
+        let mut items = Vec::new();
+
+        while let Some(update) = tokio::time::timeout(Duration::from_secs(1), search.recv())
+            .await
+            .unwrap()
+        {
+            items = update.items;
+        }
+
+        let positions = [
+            "src/normal-match.txt",
+            ".secret/hidden-match.txt",
+            "generated/ignored-match.txt",
+        ]
+        .map(|name| items.iter().position(|item| item.name == name).unwrap());
+        assert!(positions[0] < positions[1]);
+        assert!(positions[0] < positions[2]);
+    }
+
+    #[test]
+    fn local_completion_applies_nested_gitignore_rules_and_negations() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("sub")).unwrap();
+        fs::write(temp.path().join(".gitignore"), "*.tmp\nblocked/\n").unwrap();
+        fs::write(temp.path().join("sub/.gitignore"), "!keep.tmp\nhide.txt\n").unwrap();
+        fs::create_dir_all(temp.path().join("sub/blocked")).unwrap();
+        fs::write(temp.path().join("sub/normal.txt"), "").unwrap();
+        fs::write(temp.path().join("sub/keep.tmp"), "").unwrap();
+        fs::write(temp.path().join("sub/drop.tmp"), "").unwrap();
+        fs::write(temp.path().join("sub/hide.txt"), "").unwrap();
+        fs::write(temp.path().join("sub/blocked/child.txt"), "").unwrap();
+
+        let menu = complete("@sub/", 5, temp.path(), []).unwrap();
+        let position = |name| {
+            menu.items
+                .iter()
+                .position(|item| item.display == name)
+                .unwrap()
+        };
+
+        assert!(position("normal.txt") < position("drop.tmp"));
+        assert!(position("keep.tmp") < position("drop.tmp"));
+        assert!(position("keep.tmp") < position("hide.txt"));
+        let blocked = temp.path().join("sub/blocked/child.txt");
+        assert!(file_priority_index(temp.path()).is_git_ignored(&blocked, false));
+    }
+
+    #[tokio::test]
+    async fn recursive_completion_keeps_local_results_before_higher_priority_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join(".local-match.txt"), "").unwrap();
+        fs::write(temp.path().join("src/normal-match.txt"), "").unwrap();
+        let context = file_completion_context("@match", 6, temp.path()).unwrap();
+        let local = file_completion_items(&context);
+        let mut search =
+            start_recursive_file_completion_with_policy(context, local, 52, test_policy()).unwrap();
+        let mut items = Vec::new();
+
+        while let Some(update) = tokio::time::timeout(Duration::from_secs(1), search.recv())
+            .await
+            .unwrap()
+        {
+            items = update.items;
+        }
+
+        assert_eq!(items[0].name, ".local-match.txt");
+        assert!(items.iter().any(|item| item.name == "src/normal-match.txt"));
     }
 
     #[tokio::test]

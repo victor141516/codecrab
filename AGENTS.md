@@ -201,12 +201,14 @@ current draft and all later turns until changed.
   both clients. A typical block is progress text, the related actions, then the
   final assistant content, all under one `CRAB`/`CodeCrab` label; never
   visually attach actions to `YOU`.
-- While a turn runs, each presentation layer owns one queued follow-up rather
-  than putting queue state in `Agent`. Send it automatically after the active
-  turn finishes. `Steer` cancels the active turn while preserving and then
-  sending that queued prompt; its TUI control is mouse-only. Both clients stop
-  on two `Esc` presses within one second, and the web Send control becomes a
-  square Stop control while active.
+- While a turn runs, each presentation layer owns an ordered queue of visible
+  follow-ups rather than putting queue state in `Agent`. Send them
+  automatically in order after the active turn finishes. Both clients expose
+  in-place editing and deletion for every queued message. `Steer` targets one
+  queued message, cancels the active turn, and sends that target next without
+  reordering the remaining queue; its TUI control is mouse-only. Both clients
+  stop on two `Esc` presses within one second, and the web Send control becomes
+  a square Stop control while active.
 - Goals are persisted inside `Session`; keep every historical goal and
   `visible_goal_id`, but enforce at most one `active` goal. Creating or
   activating a goal pauses the previous active one. Completed and blocked goals
@@ -223,7 +225,8 @@ current draft and all later turns until changed.
   another hidden continuation only after a successful turn. Provider or tool
   errors stop automatic continuation without silently completing the goal.
 - Stop and double-Escape pause the active goal before another continuation can
-  start. `Steer` preserves the goal and sends the queued visible prompt.
+  start. `Steer` preserves the goal and sends the selected queued visible
+  prompt.
   Editing an active goal pauses it during editing and resumes it afterward.
 - Goal management must retain terminal/web parity. The terminal goal row has
   mouse-only pause/play, edit, delete, and list controls; `/goals` provides
