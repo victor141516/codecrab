@@ -15,3 +15,9 @@ export function sortChronologically(events) {
     (left, right) => eventSequence(left) - eventSequence(right)
   );
 }
+
+export function matchesMessageNode(targetNodeId, messageNodeId) {
+  return Boolean(
+    targetNodeId && messageNodeId && targetNodeId === messageNodeId
+  );
+}

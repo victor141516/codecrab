@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { sortChronologically } from "./timeline.js";
+import { matchesMessageNode, sortChronologically } from "./timeline.js";
 
 test("tool-only activities stay before a later assistant message", () => {
   const events = [
@@ -26,4 +26,15 @@ test("legacy events without sequences keep their reconstructed order", () => {
   ];
 
   assert.equal(sortChronologically(events), events);
+});
+
+test("an optimistic message without a node id is not an edit or hover target", () => {
+  assert.equal(matchesMessageNode(null, null), false);
+  assert.equal(matchesMessageNode("node-1", null), false);
+  assert.equal(matchesMessageNode(null, "node-1"), false);
+});
+
+test("persisted message nodes match only their active target", () => {
+  assert.equal(matchesMessageNode("node-1", "node-1"), true);
+  assert.equal(matchesMessageNode("node-1", "node-2"), false);
 });

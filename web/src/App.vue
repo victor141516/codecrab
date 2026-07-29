@@ -44,7 +44,7 @@ import {
   activityEventTimestamp,
   formatEventTimestamp
 } from "./timestamps.js";
-import { sortChronologically } from "./timeline.js";
+import { matchesMessageNode, sortChronologically } from "./timeline.js";
 import {
   VIRTUAL_TIMELINE_OVERSCAN,
   VirtualTimelineStore
@@ -2915,7 +2915,7 @@ onBeforeUnmount(() => {
               class="message-row group"
               :class="{
                 'branch-message-highlight':
-                  hoveredBranchNode === item.nodeId
+                  matchesMessageNode(hoveredBranchNode, item.nodeId)
               }"
             >
               <div
@@ -2924,7 +2924,11 @@ onBeforeUnmount(() => {
                 U
               </div>
               <div class="min-w-0 flex-1">
-                <template v-if="editingMessageNode === item.nodeId">
+                <template
+                  v-if="
+                    matchesMessageNode(editingMessageNode, item.nodeId)
+                  "
+                >
                   <textarea
                     ref="messageEditor"
                     v-model="messageEditDraft"
