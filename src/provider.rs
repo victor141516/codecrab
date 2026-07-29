@@ -148,6 +148,26 @@ pub(crate) fn default_model_selection(catalog: &[ModelCatalogEntry]) -> Option<M
     })
 }
 
+pub(crate) fn new_session_model_selection(
+    configured_model: &str,
+    catalog: &[ModelCatalogEntry],
+) -> Option<ModelSelection> {
+    if configured_model == "auto" {
+        return default_model_selection(catalog);
+    }
+    let model = catalog
+        .iter()
+        .find(|model| model.slug == configured_model)?;
+    Some(ModelSelection {
+        model: model.slug.clone(),
+        reasoning_effort: model.default_reasoning_level.clone(),
+        service_tier: model
+            .default_service_tier
+            .clone()
+            .filter(|tier| tier != "default"),
+    })
+}
+
 #[derive(Deserialize)]
 struct CodexModelsResponse {
     models: Vec<ModelCatalogEntry>,
@@ -1910,6 +1930,33 @@ mod tests {
         assert_eq!(tiers.len(), 1);
         assert_eq!(tiers[0].id, "priority");
         assert_eq!(tiers[0].name, "Fast");
+    }
+
+    #[test]
+    fn explicit_model_uses_its_declared_defaults_for_a_new_session() {
+        let catalog = vec![ModelCatalogEntry {
+            slug: "custom-reasoning-model".into(),
+            display_name: "Custom reasoning model".into(),
+            default_reasoning_level: Some("high".into()),
+            supported_reasoning_levels: vec![ReasoningOption {
+                effort: "high".into(),
+                name: "high".into(),
+                description: "Deeper reasoning".into(),
+            }],
+            service_tiers: vec![ServiceTierOption {
+                id: "default".into(),
+                name: "Standard".into(),
+                description: "Normal speed".into(),
+            }],
+            default_service_tier: Some("default".into()),
+            ..ModelCatalogEntry::from_id("custom-reasoning-model".into())
+        }];
+
+        let selection = new_session_model_selection("custom-reasoning-model", &catalog).unwrap();
+
+        assert_eq!(selection.model, "custom-reasoning-model");
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(selection.service_tier, None);
     }
 
     #[test]

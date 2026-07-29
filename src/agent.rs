@@ -22,7 +22,7 @@ use crate::{
     events::{AgentActivity, AgentEvent},
     provider::{
         Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role, ToolCall,
-        context_length_exceeded, default_model_selection,
+        context_length_exceeded, default_model_selection, new_session_model_selection,
     },
     session::{
         CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
@@ -135,6 +135,14 @@ impl Agent {
             return false;
         }
         let Some(selection) = default_model_selection(catalog) else {
+            return false;
+        };
+        self.set_model_selection(selection);
+        true
+    }
+
+    pub(crate) fn resolve_new_session_model(&mut self, catalog: &[ModelCatalogEntry]) -> bool {
+        let Some(selection) = new_session_model_selection(&self.session.model, catalog) else {
             return false;
         };
         self.set_model_selection(selection);

@@ -282,7 +282,7 @@ pub(crate) async fn serve(
     let mut agent = build_agent(&root, &config, debug_openai, session)?;
     let (models, catalog_error) = match agent.fetch_models().await {
         Ok(models) => {
-            agent.resolve_auto_model(&models);
+            agent.resolve_new_session_model(&models);
             (models, None)
         }
         Err(error) => (Vec::new(), Some(format!("{error:#}"))),
@@ -394,10 +394,17 @@ fn build_agent(
     Agent::new(provider, tools, SkillRegistry::discover(root), session)
 }
 
-async fn load_catalog(agent: &mut Agent) -> (Vec<ModelCatalogEntry>, Option<String>) {
+async fn load_catalog(
+    agent: &mut Agent,
+    new_session: bool,
+) -> (Vec<ModelCatalogEntry>, Option<String>) {
     match agent.fetch_models().await {
         Ok(models) => {
-            agent.resolve_auto_model(&models);
+            if new_session {
+                agent.resolve_new_session_model(&models);
+            } else {
+                agent.resolve_auto_model(&models);
+            }
             (models, None)
         }
         Err(error) => (Vec::new(), Some(format!("{error:#}"))),
@@ -1052,7 +1059,7 @@ async fn new_session(State(state): State<ServerState>) -> ApiResult<StateRespons
         state.inner.debug_openai,
         session,
     )?;
-    let catalog = load_catalog(&mut agent).await;
+    let catalog = load_catalog(&mut agent, true).await;
     let conversation = install_conversation(&state, root, agent).await?;
     let session_id = conversation.snapshot().session.id;
     install_catalog(&state.inner, session_id, catalog);
@@ -1096,7 +1103,7 @@ async fn resume_session(
         state.inner.debug_openai,
         session,
     )?;
-    let catalog = load_catalog(&mut agent).await;
+    let catalog = load_catalog(&mut agent, false).await;
     let conversation = install_conversation(&state, root, agent).await?;
     install_catalog(&state.inner, conversation.snapshot().session.id, catalog);
     Ok(Json(snapshot(&state).await?))
@@ -1154,7 +1161,7 @@ async fn delete_session(
                     state.inner.debug_openai,
                     session,
                 )?;
-                let catalog = load_catalog(&mut agent).await;
+                let catalog = load_catalog(&mut agent, false).await;
                 let conversation = install_conversation(&state, root.clone(), agent).await?;
                 install_catalog(&state.inner, conversation.snapshot().session.id, catalog);
             }

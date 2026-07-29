@@ -439,7 +439,9 @@ const selectedModel = computed(() =>
 const reasoningOptions = computed(
   () => selectedModel.value?.supported_reasoning_levels ?? []
 );
-const speedOptions = computed(() => selectedModel.value?.service_tiers ?? []);
+const speedOptions = computed(() =>
+  (selectedModel.value?.service_tiers ?? []).filter((tier) => tier.id !== "default")
+);
 
 async function api(path, options = {}) {
   const response = await fetch(path, {

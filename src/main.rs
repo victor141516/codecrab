@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
             let mut agent = Agent::new(provider, tools, skills, session)?;
             match agent.fetch_models().await {
                 Ok(catalog) => {
-                    agent.resolve_auto_model(&catalog);
+                    agent.resolve_new_session_model(&catalog);
                 }
                 Err(error) => {
                     return Err(error).context("cannot load the provider model catalog");
@@ -284,7 +284,7 @@ async fn main() -> Result<()> {
                 SkillRegistry::discover(&session_root),
                 session,
             )?;
-            ui::interactive(agent, &registry, cli.debug_openai, config.clone()).await?;
+            ui::interactive(agent, &registry, cli.debug_openai, config.clone(), false).await?;
         }
         None => {
             let provider = new_provider(&config, &config.active_provider, cli.debug_openai)?;
@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
             let session =
                 store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
             let agent = Agent::new(provider, tools, skills, session)?;
-            ui::interactive(agent, &registry, cli.debug_openai, config.clone()).await?;
+            ui::interactive(agent, &registry, cli.debug_openai, config.clone(), true).await?;
         }
     }
 

@@ -1364,78 +1364,104 @@ impl App {
     }
 
     async fn accept_model_selection(&mut self) -> Result<()> {
-        let Some(picker) = &mut self.model_picker else {
-            return Ok(());
-        };
-        match picker.step {
-            ModelPickerStep::Model => {
-                picker.model_index = picker.selected;
-                let Some(model) = self.model_catalog.get(picker.model_index) else {
-                    return Ok(());
-                };
-                let keep_current_reasoning = model.slug == self.model
-                    && picker.reasoning_effort.as_deref().is_some_and(|effort| {
+        let selection = {
+            let Some(picker) = &mut self.model_picker else {
+                return Ok(());
+            };
+            match picker.step {
+                ModelPickerStep::Model => {
+                    picker.model_index = picker.selected;
+                    let Some(model) = self.model_catalog.get(picker.model_index) else {
+                        return Ok(());
+                    };
+                    let keep_current_reasoning = model.slug == self.model
+                        && picker.reasoning_effort.as_deref().is_some_and(|effort| {
+                            model
+                                .supported_reasoning_levels
+                                .iter()
+                                .any(|option| option.effort == effort)
+                        });
+                    if !keep_current_reasoning {
+                        picker.reasoning_effort = model.default_reasoning_level.clone();
+                    }
+                    picker.service_tier = if model.slug == self.model {
+                        self.service_tier.clone()
+                    } else {
                         model
+                            .default_service_tier
+                            .clone()
+                            .filter(|tier| tier != "default")
+                    };
+                    if model.supported_reasoning_levels.is_empty() {
+                        if model.available_service_tiers().is_empty() {
+                            picker.service_tier = None;
+                            Some(ModelSelection {
+                                model: model.slug.clone(),
+                                reasoning_effort: picker.reasoning_effort.clone(),
+                                service_tier: None,
+                            })
+                        } else {
+                            picker.step = ModelPickerStep::Speed;
+                            picker.selected =
+                                speed_tier_index(model, picker.service_tier.as_deref());
+                            None
+                        }
+                    } else {
+                        picker.step = ModelPickerStep::Reasoning;
+                        picker.selected = model
                             .supported_reasoning_levels
                             .iter()
-                            .any(|option| option.effort == effort)
-                    });
-                if !keep_current_reasoning {
-                    picker.reasoning_effort = model.default_reasoning_level.clone();
+                            .position(|option| {
+                                Some(option.effort.as_str()) == picker.reasoning_effort.as_deref()
+                            })
+                            .unwrap_or(0);
+                        None
+                    }
                 }
-                picker.service_tier = if model.slug == self.model {
-                    self.service_tier.clone()
-                } else {
-                    model
-                        .default_service_tier
-                        .clone()
-                        .filter(|tier| tier != "default")
-                };
-                if model.supported_reasoning_levels.is_empty() {
-                    picker.step = ModelPickerStep::Speed;
-                    picker.selected = speed_tier_index(model, picker.service_tier.as_deref());
-                } else {
-                    picker.step = ModelPickerStep::Reasoning;
-                    picker.selected = model
+                ModelPickerStep::Reasoning => {
+                    let Some(model) = self.model_catalog.get(picker.model_index) else {
+                        return Ok(());
+                    };
+                    picker.reasoning_effort = model
                         .supported_reasoning_levels
-                        .iter()
-                        .position(|option| {
-                            Some(option.effort.as_str()) == picker.reasoning_effort.as_deref()
+                        .get(picker.selected)
+                        .map(|option| option.effort.clone());
+                    if model.available_service_tiers().is_empty() {
+                        picker.service_tier = None;
+                        Some(ModelSelection {
+                            model: model.slug.clone(),
+                            reasoning_effort: picker.reasoning_effort.clone(),
+                            service_tier: None,
                         })
-                        .unwrap_or(0);
+                    } else {
+                        picker.step = ModelPickerStep::Speed;
+                        picker.selected = speed_tier_index(model, picker.service_tier.as_deref());
+                        None
+                    }
+                }
+                ModelPickerStep::Speed => {
+                    let Some(model) = self.model_catalog.get(picker.model_index) else {
+                        return Ok(());
+                    };
+                    let tiers = model.available_service_tiers();
+                    let service_tier = picker
+                        .selected
+                        .checked_sub(1)
+                        .and_then(|index| tiers.get(index))
+                        .map(|tier| tier.id.clone());
+                    Some(ModelSelection {
+                        model: model.slug.clone(),
+                        reasoning_effort: picker.reasoning_effort.clone(),
+                        service_tier,
+                    })
                 }
             }
-            ModelPickerStep::Reasoning => {
-                let Some(model) = self.model_catalog.get(picker.model_index) else {
-                    return Ok(());
-                };
-                picker.reasoning_effort = model
-                    .supported_reasoning_levels
-                    .get(picker.selected)
-                    .map(|option| option.effort.clone());
-                picker.step = ModelPickerStep::Speed;
-                picker.selected = speed_tier_index(model, picker.service_tier.as_deref());
-            }
-            ModelPickerStep::Speed => {
-                let Some(model) = self.model_catalog.get(picker.model_index) else {
-                    return Ok(());
-                };
-                let tiers = model.available_service_tiers();
-                let service_tier = picker
-                    .selected
-                    .checked_sub(1)
-                    .and_then(|index| tiers.get(index))
-                    .map(|tier| tier.id.clone());
-                let selection = ModelSelection {
-                    model: model.slug.clone(),
-                    reasoning_effort: picker.reasoning_effort.clone(),
-                    service_tier,
-                };
-                let snapshot = self.conversation.set_model(selection).await?;
-                self.apply_snapshot(snapshot);
-                self.error = None;
-                self.model_picker = None;
-            }
+        };
+        if let Some(selection) = selection {
+            let snapshot = self.conversation.set_model(selection).await?;
+            self.apply_snapshot(snapshot);
+            self.error = None;
+            self.model_picker = None;
         }
         Ok(())
     }
@@ -2943,10 +2969,15 @@ pub(crate) async fn interactive(
     registry: &SessionRegistry,
     debug_openai: bool,
     config: Config,
+    new_session: bool,
 ) -> Result<()> {
     let (model_catalog, catalog_error) = match agent.fetch_models().await {
         Ok(catalog) => {
-            agent.resolve_auto_model(&catalog);
+            if new_session {
+                agent.resolve_new_session_model(&catalog);
+            } else {
+                agent.resolve_auto_model(&catalog);
+            }
             (catalog, None)
         }
         Err(error) => (Vec::new(), Some(format!("{error:#}"))),
@@ -6798,6 +6829,50 @@ mod tests {
         assert!(!before_fast.contains('│'));
         let before_thinking = after_fast.split_once("deep").unwrap().0;
         assert!(!before_thinking.contains('│'));
+    }
+
+    #[tokio::test]
+    async fn model_picker_skips_speed_when_only_standard_is_available() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.model_catalog = vec![ModelCatalogEntry {
+            slug: "custom-reasoning-model".into(),
+            display_name: "Custom reasoning model".into(),
+            default_reasoning_level: Some("high".into()),
+            supported_reasoning_levels: vec![ReasoningOption {
+                effort: "high".into(),
+                name: "high".into(),
+                description: "Deeper reasoning".into(),
+            }],
+            service_tiers: vec![ServiceTierOption {
+                id: "default".into(),
+                name: "Standard".into(),
+                description: "Normal speed".into(),
+            }],
+            default_service_tier: Some("default".into()),
+            ..ModelCatalogEntry::from_id("custom-reasoning-model".into())
+        }];
+
+        app.open_model_picker();
+        app.accept_model_selection().await.unwrap();
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().step,
+            ModelPickerStep::Reasoning
+        );
+        app.accept_model_selection().await.unwrap();
+
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.model, "custom-reasoning-model");
+        assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(app.service_tier, None);
+        assert_eq!(
+            app.conversation
+                .snapshot()
+                .session
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
