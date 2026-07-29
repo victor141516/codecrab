@@ -85,7 +85,7 @@ needed.
   persisted human-readable tool lifecycle state.
 - `src/provider.rs`: ChatGPT Responses and OpenAI-compatible Chat Completions
   protocols, model-catalog parsing, and model selection.
-- `src/auth.rs`: ChatGPT OAuth PKCE, refresh, and credential-store integration.
+- `src/auth.rs`: ChatGPT OAuth PKCE, refresh, and global TOML persistence.
 - `src/tools.rs`: filesystem and shell tools. Relative tool paths start at the
   selected working directory; arbitrary filesystem paths are allowed.
 - `src/skills.rs`: Agent Skills discovery, catalog prompting, activation, and

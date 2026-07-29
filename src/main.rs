@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
             },
             AuthCommand::Logout => {
                 auth.logout()?;
-                println!("CodeCrab's ChatGPT credentials were removed.");
+                println!("CodeCrab's ChatGPT login was removed from the global configuration.");
             }
         }
         return Ok(());

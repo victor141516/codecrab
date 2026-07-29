@@ -3,9 +3,12 @@
 #   Linux:   ~/.config/codecrab/config.toml
 #   macOS:   ~/Library/Application Support/codecrab/config.toml
 #
-# API keys are stored as plain text in this file. Protect it with the normal
-# permissions of your operating-system account. `codecrab config`, the TUI,
-# and the web API redact configured keys from their output.
+# API keys and ChatGPT OAuth tokens are stored as plain text in this file.
+# Protect it with the normal permissions of your operating-system account.
+# `codecrab config`, the TUI, and the web API redact secrets from their output.
+#
+# `codecrab auth login` creates and manages a [chatgpt_oauth] section here.
+# Do not add that section manually unless you intend to supply every field.
 
 active_provider = "openai"
 # Maximum time without receiving new model response data. Each chunk resets the timer.

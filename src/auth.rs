@@ -2,10 +2,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use keyring::Entry;
 use rand::RngCore;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -15,39 +14,16 @@ use tokio::{
 };
 use url::Url;
 
-use crate::http_debug;
+use crate::{
+    config::{ChatGptOAuthConfig, ConfigStore},
+    http_debug,
+};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
-const KEYRING_SERVICE: &str = "codecrab";
-const ACCESS_ENTRIES: [&str; 4] = [
-    "openai-oauth-access-1",
-    "openai-oauth-access-2",
-    "openai-oauth-access-3",
-    "openai-oauth-access-4",
-];
-const METADATA_ENTRY: &str = "openai-oauth-metadata";
-const REFRESH_ENTRY: &str = "openai-oauth-refresh";
-const TOKEN_CHUNK_CHARS: usize = 900;
 const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 const SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
-
-struct OAuthAccess {
-    pub access_token: String,
-    pub expires_at: u64,
-    pub account_id: String,
-    pub email: Option<String>,
-    pub plan: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct OAuthMetadata {
-    expires_at: u64,
-    account_id: String,
-    email: Option<String>,
-    plan: Option<String>,
-}
 
 pub(crate) struct OAuthCredentials {
     pub access_token: String,
@@ -79,13 +55,19 @@ struct TokenClaims {
 pub(crate) struct OAuthStore {
     client: Client,
     debug_openai: bool,
+    store: ConfigStore,
 }
 
 impl OAuthStore {
     pub(crate) fn new() -> Result<Self> {
+        Self::with_store(ConfigStore::global()?)
+    }
+
+    fn with_store(store: ConfigStore) -> Result<Self> {
         Ok(Self {
             client: Client::builder().timeout(Duration::from_secs(60)).build()?,
             debug_openai: false,
+            store,
         })
     }
 
@@ -94,18 +76,14 @@ impl OAuthStore {
     }
 
     pub(crate) fn is_logged_in(&self) -> bool {
-        self.load_access().is_ok() && self.load_refresh().is_ok()
+        self.load().is_ok_and(|oauth| oauth.is_some())
     }
 
     pub(crate) fn status(&self) -> Result<Option<AuthIdentity>> {
-        match self.load_access() {
-            Ok(access) => Ok(Some(AuthIdentity {
-                email: access.email,
-                plan: access.plan,
-            })),
-            Err(error) if is_missing_credential(&error) => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(self.load()?.map(|oauth| AuthIdentity {
+            email: oauth.email,
+            plan: oauth.plan,
+        }))
     }
 
     pub(crate) async fn login(&self) -> Result<AuthIdentity> {
@@ -150,12 +128,7 @@ impl OAuthStore {
     }
 
     pub(crate) fn logout(&self) -> Result<()> {
-        for username in ACCESS_ENTRIES {
-            delete_entry(username)?;
-        }
-        delete_entry(METADATA_ENTRY)?;
-        delete_entry(REFRESH_ENTRY)?;
-        Ok(())
+        self.store.set_chatgpt_oauth(None)
     }
 
     pub(crate) async fn credentials(&self) -> Result<OAuthCredentials> {
@@ -168,8 +141,8 @@ impl OAuthStore {
 
     async fn credentials_inner(&self, force_refresh: bool) -> Result<OAuthCredentials> {
         let access = self
-            .load_access()
-            .with_context(|| "not signed in with ChatGPT; run `codecrab auth login` first")?;
+            .load()?
+            .context("not signed in with ChatGPT; run `codecrab auth login` first")?;
         if !force_refresh && access.expires_at > now_epoch() + 60 {
             return Ok(OAuthCredentials {
                 access_token: access.access_token,
@@ -177,7 +150,7 @@ impl OAuthStore {
             });
         }
 
-        let refresh = self.load_refresh()?;
+        let refresh = access.refresh_token.clone();
         let request = self
             .client
             .post(format!("{ISSUER}/oauth/token"))
@@ -207,8 +180,10 @@ impl OAuthStore {
         }
         let tokens: TokenResponse =
             serde_json::from_str(&body).context("invalid token refresh response")?;
-        self.save_token_response(tokens, Some((&refresh, &access)))?;
-        let current = self.load_access()?;
+        self.save_token_response(tokens, Some(&access))?;
+        let current = self
+            .load()?
+            .context("ChatGPT login disappeared from the global configuration")?;
         Ok(OAuthCredentials {
             access_token: current.access_token,
             account_id: current.account_id,
@@ -254,134 +229,61 @@ impl OAuthStore {
     fn save_token_response(
         &self,
         tokens: TokenResponse,
-        previous: Option<(&str, &OAuthAccess)>,
+        previous: Option<&ChatGptOAuthConfig>,
     ) -> Result<AuthIdentity> {
         let claims = tokens
             .id_token
             .as_deref()
             .and_then(parse_claims)
             .or_else(|| parse_claims(&tokens.access_token));
-        let previous_access = previous.map(|(_, access)| access);
         let account_id = claims
             .as_ref()
             .and_then(|claims| claims.account_id.clone())
-            .or_else(|| previous_access.map(|access| access.account_id.clone()))
+            .or_else(|| previous.map(|oauth| oauth.account_id.clone()))
             .context("ChatGPT login did not include an account id")?;
-        let access = OAuthAccess {
+        let oauth = ChatGptOAuthConfig {
             access_token: tokens.access_token,
+            refresh_token: tokens
+                .refresh_token
+                .or_else(|| previous.map(|oauth| oauth.refresh_token.clone()))
+                .context("ChatGPT login did not include a refresh token")?,
             expires_at: now_epoch() + tokens.expires_in,
             account_id,
             email: claims
                 .as_ref()
                 .and_then(|claims| claims.email.clone())
-                .or_else(|| previous_access.and_then(|access| access.email.clone())),
+                .or_else(|| previous.and_then(|oauth| oauth.email.clone())),
             plan: claims
                 .as_ref()
                 .and_then(|claims| claims.plan.clone())
-                .or_else(|| previous_access.and_then(|access| access.plan.clone())),
+                .or_else(|| previous.and_then(|oauth| oauth.plan.clone())),
         };
-        let refresh = tokens
-            .refresh_token
-            .as_deref()
-            .or_else(|| previous.map(|(refresh, _)| refresh))
-            .context("ChatGPT login did not include a refresh token")?;
-        self.save(&access, refresh)?;
+        self.save(&oauth)?;
         Ok(AuthIdentity {
-            email: access.email,
-            plan: access.plan,
+            email: oauth.email,
+            plan: oauth.plan,
         })
     }
 
-    fn save(&self, access: &OAuthAccess, refresh: &str) -> Result<()> {
-        let chunks = access
-            .access_token
-            .as_bytes()
-            .chunks(TOKEN_CHUNK_CHARS)
-            .map(|chunk| std::str::from_utf8(chunk).expect("OAuth tokens are ASCII"))
-            .collect::<Vec<_>>();
-        if chunks.len() > ACCESS_ENTRIES.len() {
-            anyhow::bail!("ChatGPT access token is too large for the OS credential store");
-        }
-        for (index, username) in ACCESS_ENTRIES.iter().enumerate() {
-            if let Some(chunk) = chunks.get(index) {
-                entry(username)?
-                    .set_password(chunk)
-                    .context("could not save ChatGPT access token in the OS credential store")?;
-            } else {
-                delete_entry(username)?;
-            }
-        }
-        let metadata = OAuthMetadata {
-            expires_at: access.expires_at,
-            account_id: access.account_id.clone(),
-            email: access.email.clone(),
-            plan: access.plan.clone(),
-        };
-        entry(METADATA_ENTRY)?
-            .set_password(&serde_json::to_string(&metadata)?)
-            .context("could not save ChatGPT metadata in the OS credential store")?;
-        entry(REFRESH_ENTRY)?
-            .set_password(refresh)
-            .context("could not save ChatGPT refresh token in the OS credential store")?;
-        Ok(())
+    fn save(&self, oauth: &ChatGptOAuthConfig) -> Result<()> {
+        self.store.set_chatgpt_oauth(Some(oauth.clone()))
     }
 
-    fn load_access(&self) -> Result<OAuthAccess> {
-        let metadata_value = entry(METADATA_ENTRY)?
-            .get_password()
-            .context("could not read ChatGPT metadata from the OS credential store")?;
-        let metadata: OAuthMetadata =
-            serde_json::from_str(&metadata_value).context("stored ChatGPT metadata is invalid")?;
-        let mut access_token = String::new();
-        for username in ACCESS_ENTRIES {
-            match entry(username)?.get_password() {
-                Ok(chunk) => access_token.push_str(&chunk),
-                Err(keyring::Error::NoEntry) => break,
-                Err(error) => {
-                    return Err(error).context(
-                        "could not read ChatGPT access token from the OS credential store",
-                    );
+    fn load(&self) -> Result<Option<ChatGptOAuthConfig>> {
+        let oauth = self.store.load()?.chatgpt_oauth;
+        if let Some(oauth) = &oauth {
+            for (name, value) in [
+                ("access_token", oauth.access_token.as_str()),
+                ("refresh_token", oauth.refresh_token.as_str()),
+                ("account_id", oauth.account_id.as_str()),
+            ] {
+                if value.is_empty() {
+                    anyhow::bail!("chatgpt_oauth.{name} is empty in the global configuration");
                 }
             }
         }
-        if access_token.is_empty() {
-            anyhow::bail!("stored ChatGPT access token is missing");
-        }
-        Ok(OAuthAccess {
-            access_token,
-            expires_at: metadata.expires_at,
-            account_id: metadata.account_id,
-            email: metadata.email,
-            plan: metadata.plan,
-        })
+        Ok(oauth)
     }
-
-    fn load_refresh(&self) -> Result<String> {
-        entry(REFRESH_ENTRY)?
-            .get_password()
-            .context("could not read ChatGPT refresh token from the OS credential store")
-    }
-}
-
-fn entry(username: &str) -> Result<Entry> {
-    Entry::new(KEYRING_SERVICE, username).context("OS credential store is unavailable")
-}
-
-fn delete_entry(username: &str) -> Result<()> {
-    let entry = entry(username)?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(error).context("could not remove credential from the OS store"),
-    }
-}
-
-fn is_missing_credential(error: &anyhow::Error) -> bool {
-    error.chain().any(|source| {
-        matches!(
-            source.downcast_ref::<keyring::Error>(),
-            Some(keyring::Error::NoEntry)
-        )
-    })
 }
 
 async fn bind_callback() -> Result<(TcpListener, u16)> {
@@ -545,5 +447,37 @@ mod tests {
         assert_eq!(claims.account_id.as_deref(), Some("acct_123"));
         assert_eq!(claims.email.as_deref(), Some("user@example.com"));
         assert_eq!(claims.plan.as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn oauth_login_round_trips_only_through_the_global_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let auth = OAuthStore::with_store(ConfigStore::new(path.clone())).unwrap();
+        let oauth = ChatGptOAuthConfig {
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            expires_at: now_epoch() + 3600,
+            account_id: "account-id".into(),
+            email: Some("user@example.com".into()),
+            plan: Some("Pro".into()),
+        };
+
+        auth.save(&oauth).unwrap();
+
+        assert_eq!(auth.load().unwrap(), Some(oauth));
+        assert!(auth.is_logged_in());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[chatgpt_oauth]"));
+        assert!(text.contains("access-secret"));
+        assert!(text.contains("refresh-secret"));
+
+        auth.logout().unwrap();
+
+        assert_eq!(auth.load().unwrap(), None);
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("[chatgpt_oauth]"));
+        assert!(!text.contains("access-secret"));
+        assert!(!text.contains("refresh-secret"));
     }
 }

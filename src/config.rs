@@ -32,6 +32,18 @@ pub(crate) struct ProviderConfig {
     pub model_capabilities: BTreeMap<String, ModelCapabilitiesConfig>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct ChatGptOAuthConfig {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: u64,
+    pub account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ModelCapabilitiesConfig {
@@ -89,6 +101,8 @@ pub(crate) struct Config {
     pub providers: BTreeMap<String, ProviderConfig>,
     pub request_timeout_seconds: u64,
     pub session_directories: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chatgpt_oauth: Option<ChatGptOAuthConfig>,
 }
 
 impl Default for Config {
@@ -98,6 +112,7 @@ impl Default for Config {
             providers: BTreeMap::from([(DEFAULT_PROVIDER.into(), ProviderConfig::default())]),
             request_timeout_seconds: 180,
             session_directories: Vec::new(),
+            chatgpt_oauth: None,
         }
     }
 }
@@ -451,7 +466,22 @@ impl ConfigStore {
             let current: Config = toml::from_str(&text)
                 .with_context(|| format!("invalid config {}", self.path.display()))?;
             config.session_directories = current.session_directories;
+            config.chatgpt_oauth = current.chatgpt_oauth;
         }
+        self.write(&config)
+    }
+
+    pub(crate) fn set_chatgpt_oauth(&self, oauth: Option<ChatGptOAuthConfig>) -> Result<()> {
+        let _guard = global_config_mutation_lock()
+            .lock()
+            .expect("global configuration mutation lock poisoned");
+        let mut config = self.load()?;
+        config.chatgpt_oauth = oauth;
+        self.write(&config)
+    }
+
+    fn write(&self, config: &Config) -> Result<()> {
+        config.validate()?;
         let parent = self
             .path
             .parent()
@@ -613,21 +643,29 @@ mod tests {
         let store = ConfigStore::new(temp.path().join("config.toml"));
         let mut config = Config::default();
         config.providers.get_mut(DEFAULT_PROVIDER).unwrap().api_key = "sk-secret".into();
+        let oauth = ChatGptOAuthConfig {
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            expires_at: 123,
+            account_id: "account-id".into(),
+            email: Some("user@example.com".into()),
+            plan: Some("Pro".into()),
+        };
+        config.chatgpt_oauth = Some(oauth.clone());
         store.save(&config).unwrap();
 
+        let loaded = store.load().unwrap();
         assert_eq!(
-            store
-                .load()
-                .unwrap()
-                .providers
-                .get(DEFAULT_PROVIDER)
-                .unwrap()
-                .api_key,
+            loaded.providers.get(DEFAULT_PROVIDER).unwrap().api_key,
             "sk-secret"
         );
+        assert_eq!(loaded.chatgpt_oauth, Some(oauth));
         let public = toml::to_string(&config.public_view()).unwrap();
         assert!(public.contains("<redacted>"));
         assert!(!public.contains("sk-secret"));
+        assert!(!public.contains("access-secret"));
+        assert!(!public.contains("refresh-secret"));
+        assert!(!public.contains("chatgpt_oauth"));
     }
 
     #[test]
@@ -746,7 +784,16 @@ service_tiers = [{ id = "priority" }]
         let registry = SessionRegistry::at(path);
         let project = temp.path().join("project");
         fs::create_dir(&project).unwrap();
+        let oauth = ChatGptOAuthConfig {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 123,
+            account_id: "account".into(),
+            email: None,
+            plan: None,
+        };
 
+        store.set_chatgpt_oauth(Some(oauth.clone())).unwrap();
         registry.register(&project).unwrap();
         store.save(&stale).unwrap();
 
@@ -754,5 +801,6 @@ service_tiers = [{ id = "priority" }]
             registry.directories().unwrap(),
             vec![normalized_root(&project)]
         );
+        assert_eq!(store.load().unwrap().chatgpt_oauth, Some(oauth));
     }
 }

@@ -50,7 +50,7 @@ terminal interface and an optional embedded web application.
   billing required.
 - Voice dictation through the signed-in ChatGPT subscription in terminal and
   web composers; transcripts are inserted for review instead of auto-sent.
-- OAuth PKCE, automatic token refresh, and OS credential-store integration.
+- OAuth PKCE, automatic token refresh, and platform-global TOML persistence.
 - Model tools for listing, reading, searching, writing, exact editing, and shell
   commands.
 - Relative, parent, and absolute paths across the filesystem.
@@ -660,9 +660,10 @@ codecrab auth logout
 ```
 
 `auth login` opens OpenAI's browser authorization flow. CodeCrab uses OAuth
-PKCE and stores the access token, refresh token, and metadata as separate
-entries in the operating system credential store. Tokens are never written
-inside the project.
+PKCE and stores the access token, refresh token, and metadata as plain text
+under `[chatgpt_oauth]` in the platform-global `config.toml`. Protect that file
+with the normal permissions of your operating-system account. Tokens are never
+written inside the project.
 
 The default OpenAI profile's `auth = "auto"` chooses the ChatGPT subscription
 whenever a CodeCrab OAuth login exists. Use `auth = "oauth"` to require
@@ -714,9 +715,9 @@ parent paths, absolute paths, other drives, and symbolic links are allowed.
 Reads, writes, edits, and shell commands run immediately without confirmation
 in terminal, one-shot, resume, and web modes.
 
-OAuth tokens are stored in the OS credential manager and split across secure
-entries where platform size limits require it. `codecrab auth logout` removes
-only CodeCrab's copy; it does not sign the official Codex CLI out.
+OAuth tokens and provider API keys are stored as plain text in the
+platform-global `config.toml`. `codecrab auth logout` removes the
+`[chatgpt_oauth]` section only; it does not sign the official Codex CLI out.
 
 CodeCrab does not sandbox or impose a filesystem boundary on the agent. Its
 effective access is exactly the access granted to the operating-system user
@@ -815,7 +816,7 @@ The code is intentionally split by responsibility:
 - `http_debug.rs`: explicit unredacted HTTP request/response tracing.
 - `audio.rs`: native microphone capture and WAV encoding for the terminal.
 - `transcription.rs`: subscription-backed ChatGPT voice transcription.
-- `auth.rs`: OAuth PKCE, token refresh, and secure credential storage.
+- `auth.rs`: OAuth PKCE, token refresh, and global TOML persistence.
 - `tools.rs`: project-scoped file and shell capabilities.
 - `session.rs`: persistence and resume.
 - `skills.rs`: Agent Skills discovery, validation, activation, and resources.
