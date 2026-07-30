@@ -226,7 +226,7 @@ async fn main() -> Result<()> {
 
     let store = SessionStore::new(&root)?;
     let skills = SkillRegistry::discover(&root);
-    let registry = SessionRegistry::global();
+    let registry = SessionRegistry::global()?;
 
     match cli.command {
         Some(Command::Sessions) => {
@@ -239,10 +239,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::Config) => {
             let contents = toml::to_string_pretty(&config.public_view())?;
-            println!(
-                "{}",
-                format_config_output(Config::file_path().as_deref(), &contents)
-            );
+            println!("{}", format_config_output(&Config::file_path()?, &contents));
             return Ok(());
         }
         Some(Command::Serve { host, port }) => {
@@ -461,12 +458,10 @@ fn one_shot_prompt(prompt: Option<String>) -> Result<String> {
     })
 }
 
-fn format_config_output(path: Option<&Path>, contents: &str) -> String {
-    let path = path
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "(platform configuration path unavailable)".into());
+fn format_config_output(path: &Path, contents: &str) -> String {
     format!(
-        "Configuration file path:\n{path}\n\nEffective configuration content:\n{}",
+        "Configuration file path:\n{}\n\nEffective configuration content:\n{}",
+        path.display(),
         contents.trim_end()
     )
 }
@@ -478,7 +473,7 @@ mod tests {
     #[test]
     fn config_output_separates_the_file_path_from_effective_content() {
         let output = format_config_output(
-            Some(Path::new("/config/codecrab/config.toml")),
+            Path::new("/config/codecrab/config.toml"),
             "model = \"auto\"\n",
         );
 

@@ -302,7 +302,7 @@ pub(crate) async fn serve(
     debug_openai: DebugOutput,
 ) -> Result<()> {
     let store = SessionStore::new(&root)?;
-    let registry = SessionRegistry::global();
+    let registry = SessionRegistry::global()?;
     let oauth_logged_in = OAuthStore::new()?.is_logged_in();
     let active = config.provider(&config.active_provider)?;
     let session =

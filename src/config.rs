@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Value};
 
@@ -155,7 +155,7 @@ pub(crate) struct ConfigStore {
 
 #[derive(Clone)]
 pub(crate) struct SessionRegistry {
-    path: Option<PathBuf>,
+    path: PathBuf,
     mutation_lock: Arc<Mutex<()>>,
 }
 
@@ -171,12 +171,13 @@ impl Config {
         }
     }
 
-    pub(crate) fn file_path() -> Option<PathBuf> {
-        ProjectDirs::from("", "", "codecrab").map(|dirs| dirs.config_dir().join("config.toml"))
+    pub(crate) fn file_path() -> Result<PathBuf> {
+        Ok(global_data_dir()?.join("config.toml"))
     }
 
     pub(crate) fn load() -> Result<Self> {
-        let mut config = if let Some(path) = Self::file_path().filter(|path| path.exists()) {
+        let path = Self::file_path()?;
+        let mut config = if path.exists() {
             ConfigStore::new(path).load()?
         } else {
             Self::default()
@@ -429,9 +430,7 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<()> {
 
 impl ConfigStore {
     pub(crate) fn global() -> Result<Self> {
-        Ok(Self::new(
-            Config::file_path().context("platform configuration path is unavailable")?,
-        ))
+        Ok(Self::new(Config::file_path()?))
     }
 
     pub(crate) fn new(path: PathBuf) -> Self {
@@ -506,25 +505,23 @@ impl ConfigStore {
 }
 
 impl SessionRegistry {
-    pub(crate) fn global() -> Self {
-        Self {
-            path: Config::file_path(),
+    pub(crate) fn global() -> Result<Self> {
+        Ok(Self {
+            path: Config::file_path()?,
             mutation_lock: Arc::new(Mutex::new(())),
-        }
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn at(path: PathBuf) -> Self {
         Self {
-            path: Some(path),
+            path,
             mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub(crate) fn directories(&self) -> Result<Vec<PathBuf>> {
-        let Some(path) = &self.path else {
-            return Ok(Vec::new());
-        };
+        let path = &self.path;
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -556,9 +553,7 @@ impl SessionRegistry {
     }
 
     fn write_directories(&self, directories: &[PathBuf]) -> Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
+        let path = &self.path;
         let mut document = if path.exists() {
             fs::read_to_string(path)
                 .with_context(|| format!("cannot read {}", path.display()))?
@@ -584,6 +579,16 @@ impl SessionRegistry {
         }
         fs::rename(&temp, path).with_context(|| format!("cannot update {}", path.display()))
     }
+}
+
+pub(crate) fn global_data_dir() -> Result<PathBuf> {
+    let base_dirs = BaseDirs::new();
+    global_data_dir_from_home(base_dirs.as_ref().map(BaseDirs::home_dir))
+}
+
+fn global_data_dir_from_home(home: Option<&Path>) -> Result<PathBuf> {
+    let home = home.context("cannot resolve the user's home directory")?;
+    Ok(home.join(".config").join("codecrab"))
 }
 
 pub(crate) fn normalized_root(root: &Path) -> PathBuf {
@@ -620,9 +625,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn global_data_directory_is_canonical_for_any_home_directory() {
+        let home = Path::new("home");
+
+        assert_eq!(
+            global_data_dir_from_home(Some(home)).unwrap(),
+            home.join(".config").join("codecrab")
+        );
+    }
+
+    #[test]
+    fn missing_home_directory_has_a_clear_error() {
+        let error = global_data_dir_from_home(None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cannot resolve the user's home directory"
+        );
+    }
+
+    #[test]
     fn config_store_round_trips_secrets_but_public_view_redacts_them() {
         let temp = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let store = ConfigStore::new(
+            temp.path()
+                .join(".config")
+                .join("codecrab")
+                .join("config.toml"),
+        );
         let mut config = Config::default();
         config.providers.get_mut(DEFAULT_PROVIDER).unwrap().api_key = "sk-secret".into();
         let oauth = ChatGptOAuthConfig {
@@ -636,6 +666,7 @@ mod tests {
         config.chatgpt_oauth = Some(oauth.clone());
         store.save(&config).unwrap();
 
+        assert!(store.path().parent().unwrap().is_dir());
         let loaded = store.load().unwrap();
         assert_eq!(
             loaded.providers.get(DEFAULT_PROVIDER).unwrap().api_key,
