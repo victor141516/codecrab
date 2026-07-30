@@ -155,29 +155,42 @@ Start the API and embedded frontend:
 codecrab serve
 ```
 
-The command prints only the API and frontend URLs. The default address is
-`http://127.0.0.1:4096`; use an automatically selected port with:
+One process serves the same frontend, API routes, streaming responses, and
+conversation state over HTTP and HTTPS. The default origins are
+`http://127.0.0.1:4096` and `https://127.0.0.1:4097`. Use automatically
+selected ports for both listeners with:
 
 ```console
-codecrab serve --port 0
+codecrab serve --port 0 --https-port 0
 ```
 
-Press `Ctrl+C` to start a graceful shutdown. If active HTTP requests or open
-connections still prevent exit after 100 ms, CodeCrab explains what it is
-waiting for on `stderr`. Press `Ctrl+C` a second time to terminate the process
-immediately.
+The command prints the HTTP and HTTPS API and frontend origins after both
+listeners bind, including the actual ports selected for `0`.
+
+CodeCrab generates a fresh self-signed certificate and private key at every
+`serve` startup. Both remain in memory only and are discarded when the process
+exits. The certificate covers `localhost`, `127.0.0.1`, `::1`, and a configured
+concrete host or IP when applicable. Browsers show a certificate warning unless
+that execution's certificate is explicitly trusted, and its fingerprint changes
+on every restart.
+
+Press `Ctrl+C` to start a graceful shutdown of both listeners. If active
+HTTP/HTTPS requests or open connections still prevent exit after 100 ms,
+CodeCrab explains what it is waiting for on `stderr`. Press `Ctrl+C` a second
+time to terminate the process immediately.
 
 The frontend always calls relative `/api` URLs, so it automatically uses the
 same scheme, hostname, port, and reverse-proxy origin that served it. To listen
 outside localhost:
 
 ```console
-codecrab serve --host 0.0.0.0 --port 4096
+codecrab serve --host 0.0.0.0 --port 4096 --https-port 4097
 ```
 
 Web mode allows file mutations and shell commands without confirmation. This
-first server implementation has no built-in HTTP authentication; it is intended
-for local use or deployment behind an authenticated gateway.
+server has no built-in authentication on either HTTP or HTTPS; it is intended
+for local use or deployment behind an authenticated gateway. HTTPS encrypts the
+connection but does not authenticate users.
 
 The initial API surface is:
 

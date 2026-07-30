@@ -109,6 +109,9 @@ enum Command {
         /// TCP port. Use 0 to select an available port.
         #[arg(long, default_value_t = 4096)]
         port: u16,
+        /// HTTPS TCP port. Use 0 to select an available port.
+        #[arg(long, default_value_t = 4097)]
+        https_port: u16,
     },
 }
 
@@ -240,8 +243,12 @@ async fn main() -> Result<()> {
             println!("{}", format_config_output(&Config::file_path()?, &contents));
             return Ok(());
         }
-        Some(Command::Serve { host, port }) => {
-            server::serve(root, config, host, port, debug_openai).await?;
+        Some(Command::Serve {
+            host,
+            port,
+            https_port,
+        }) => {
+            server::serve(root, config, host, port, https_port, debug_openai).await?;
             return Ok(());
         }
         Some(Command::Auth { .. } | Command::Provider { .. }) => {
@@ -505,6 +512,30 @@ mod tests {
             Some(Command::Run {
                 prompt: Some(ref prompt)
             }) if prompt == "hello"
+        ));
+    }
+
+    #[test]
+    fn serve_has_distinct_http_and_https_ports_with_zero_supported() {
+        let cli = Cli::try_parse_from(["codecrab", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve {
+                port: 4096,
+                https_port: 4097,
+                ..
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["codecrab", "serve", "--port", "0", "--https-port", "0"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve {
+                port: 0,
+                https_port: 0,
+                ..
+            })
         ));
     }
 }
