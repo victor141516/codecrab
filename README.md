@@ -68,6 +68,9 @@ terminal interface and an optional embedded web application.
 - Concurrent session workers in one process: a turn keeps running after
   navigation, another session can start immediately, and Stop/model/goals are
   routed to the selected session only.
+- Agent-to-agent delegation through persistent child sessions with isolated
+  context, live status/message observation, follow-up, waiting, and exact-turn
+  cancellation.
 - Config file, environment overrides, and CLI overrides.
 
 ## Install
@@ -831,6 +834,42 @@ plus the selected leaf. The ordinary `messages` field returned by the web API
 is only the active root-to-leaf projection; inactive branches remain in
 `conversation.nodes` and are never discarded by branch selection.
 
+### Agent-to-agent session delegation
+
+Every agent can control other CodeCrab sessions in the same process through
+seven model tools:
+
+| Tool | Contract |
+| --- | --- |
+| `session_create` | Persist a fresh child with a required visible `prompt`, optional existing `project`, and `parent_session_id`; start its first turn asynchronously and return its stable UUID immediately |
+| `session_list` | Discover persisted and live sessions in the current project, an explicit project, or every registered project |
+| `session_status` | Read content-free lifecycle, revision, timestamps, visible-message outline, goal state, and current/latest activity metadata |
+| `session_messages` | Read bounded, cursor-based visible user/assistant content, including live partial text without hidden or tool-protocol messages |
+| `session_send` | Append one visible prompt to an idle target and return when the turn is accepted |
+| `session_stop` | Cancel exactly the target's active provider/tool future without deleting or shutting down its reusable worker |
+| `session_wait` | Wait up to 60 seconds for one of up to eight observation revisions to change, without hot polling |
+
+A child is a normal session with its own `Agent`, model state, tools, skills,
+root `AGENTS.md`, transcript, activities, goals, and worker. It receives only
+the delegated prompt and normal system/project context: the parent's
+transcript, compaction summary, hidden prompts, and tool history are never
+copied. Persisted lineage makes the relationship inspectable, and child
+sessions appear in the existing terminal session picker and web sidebar and
+remain resumable after restart.
+
+The default policy is deliberately conservative. Explicit requests for another
+agent/session/conversation, delegation, parallel work, or independent
+validation enable these tools; ordinary tasks do not fan out automatically.
+Project or personal `AGENTS.md` instructions may opt into proactive
+delegation. A delegated prompt must therefore contain all required context.
+
+Coordination is process-local; there is no cross-process IPC or remote worker
+control. All sessions run as the same operating-system account and share the
+same filesystem, with no automatic worktree, sandbox, write locking, or
+conflict prevention. Delegate disjoint writes or coordinate them explicitly.
+Normal shutdown cancels active child turns, persists their terminal outcome,
+closes managed terminals, and stops every worker before exit.
+
 ### Automatic context compaction
 
 Before model requests, CodeCrab compares the latest provider-reported input
@@ -867,10 +906,13 @@ projection. Compaction is intentionally automatic; there is no normal
 ## Architecture
 
 ```text
-TUI / run / JSON API
-         |
-         v
-ConversationManager
+TUI / run / JSON API / session tools
+                 |
+                 v
+       SessionCoordinator
+                 |
+                 v
+       ConversationManager
    ├── session A ──> ConversationHandle ──> Tokio worker ──> Agent A
    ├── session B ──> ConversationHandle ──> Tokio worker ──> Agent B
    └── session C ──> ConversationHandle ──> Tokio worker ──> Agent C
@@ -893,7 +935,10 @@ The code is intentionally split by responsibility:
 - `compaction/`: context projection, safe turn boundaries, summary prompt, and
   all documented production tuning values.
 - `conversation.rs`: multi-worker manager plus persistent Tokio workers that
-  serialize per-session mutations and expose commands/events/snapshots.
+  serialize per-session mutations and expose commands, live observations, and
+  authoritative snapshots.
+- `coordination.rs`: acyclic shared agent factory and weak session-control
+  facade used by terminal, one-shot, web, and delegated sessions.
 - `completion.rs`: shared slash, skill, and filesystem completion engine.
 - `events.rs`: ordered assistant-message events plus persisted tool activity
   and lifecycle labels shared by clients.

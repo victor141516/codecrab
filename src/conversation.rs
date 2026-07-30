@@ -3,11 +3,12 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -16,11 +17,11 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    agent::Agent,
+    agent::{Agent, turn_was_cancelled},
     config::SessionRegistry,
-    events::AgentEvent,
-    provider::ModelSelection,
-    session::{Session, SessionStore},
+    events::{ActivityStatus, AgentActivity, AgentEvent},
+    provider::{Message, ModelCatalogEntry, ModelSelection, Role},
+    session::{GoalStatus, Session, SessionStore, TurnOutcome},
 };
 
 #[derive(Clone)]
@@ -28,6 +29,7 @@ pub(crate) struct ConversationSnapshot {
     pub project_root: PathBuf,
     pub session: Session,
     pub skills: Vec<ConversationSkill>,
+    pub model_catalog: Vec<ModelCatalogEntry>,
 }
 
 #[derive(Clone)]
@@ -68,6 +70,77 @@ impl ConversationLifecycle {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ObservedMessage {
+    pub id: String,
+    pub role: &'static str,
+    pub created_at: DateTime<Utc>,
+    pub content: String,
+    pub partial: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ObservedActivity {
+    pub tool: String,
+    pub status: ActivityStatus,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ObservedTurn {
+    pub outcome: TurnOutcome,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ObservedGoal {
+    pub id: Uuid,
+    pub status: GoalStatus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ConversationObservation {
+    pub revision: u64,
+    pub title: String,
+    pub lifecycle: ConversationLifecycle,
+    pub active_turn_started_at: Option<DateTime<Utc>>,
+    pub latest_event_at: DateTime<Utc>,
+    pub catalog_error: Option<String>,
+    pub last_turn: Option<ObservedTurn>,
+    pub visible_goal: Option<ObservedGoal>,
+    pub messages: Vec<ObservedMessage>,
+    pub activity: Option<ObservedActivity>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObservationHub {
+    revision: Arc<AtomicU64>,
+    changes: watch::Sender<u64>,
+}
+
+impl Default for ObservationHub {
+    fn default() -> Self {
+        let (changes, _) = watch::channel(0);
+        Self {
+            revision: Arc::new(AtomicU64::new(0)),
+            changes,
+        }
+    }
+}
+
+impl ObservationHub {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn publish(&self) {
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.changes.send(revision);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConversationHandle {
     commands: mpsc::UnboundedSender<ConversationCommand>,
@@ -77,6 +150,8 @@ pub(crate) struct ConversationHandle {
     accepting_commands: Arc<AtomicBool>,
     turn_reserved: Arc<AtomicBool>,
     lifecycle: Arc<AtomicU8>,
+    observation: Arc<Mutex<ConversationObservation>>,
+    observation_hub: ObservationHub,
 }
 
 enum ConversationCommand {
@@ -84,6 +159,7 @@ enum ConversationCommand {
         prompt: String,
         hidden: bool,
         edit_node_id: Option<Uuid>,
+        initialize_catalog: bool,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         cancellation: watch::Receiver<bool>,
         reply: oneshot::Sender<ConversationTurn>,
@@ -129,24 +205,52 @@ enum ConversationCommand {
     },
 }
 
+struct ConversationWorkerState {
+    registry: SessionRegistry,
+    snapshots: watch::Sender<ConversationSnapshot>,
+    active_cancellation: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    turn_reserved: Arc<AtomicBool>,
+    lifecycle: Arc<AtomicU8>,
+    observation: Arc<Mutex<ConversationObservation>>,
+    observation_hub: ObservationHub,
+}
+
 impl ConversationHandle {
+    #[cfg(test)]
     pub(crate) fn spawn(agent: Agent, registry: SessionRegistry) -> Result<Self> {
+        Self::spawn_with_hub(agent, registry, ObservationHub::default())
+    }
+
+    pub(crate) fn spawn_with_hub(
+        agent: Agent,
+        registry: SessionRegistry,
+        observation_hub: ObservationHub,
+    ) -> Result<Self> {
         let initial = snapshot(&agent);
         let (commands, command_rx) = mpsc::unbounded_channel();
-        let (snapshot_tx, snapshot_rx) = watch::channel(initial);
+        let (snapshot_tx, snapshot_rx) = watch::channel(initial.clone());
         let active_cancellation = Arc::new(Mutex::new(None));
         let command_gate = Arc::new(Mutex::new(()));
         let accepting_commands = Arc::new(AtomicBool::new(true));
         let turn_reserved = Arc::new(AtomicBool::new(false));
         let lifecycle = Arc::new(AtomicU8::new(ConversationLifecycle::Idle.as_u8()));
+        let observation = Arc::new(Mutex::new(observation_from_snapshot(
+            &initial,
+            ConversationLifecycle::Idle,
+            0,
+        )));
         spawn_worker(run_worker(
             agent,
-            registry,
             command_rx,
-            snapshot_tx,
-            active_cancellation.clone(),
-            turn_reserved.clone(),
-            lifecycle.clone(),
+            ConversationWorkerState {
+                registry,
+                snapshots: snapshot_tx,
+                active_cancellation: active_cancellation.clone(),
+                turn_reserved: turn_reserved.clone(),
+                lifecycle: lifecycle.clone(),
+                observation: observation.clone(),
+                observation_hub: observation_hub.clone(),
+            },
         ))?;
         Ok(Self {
             commands,
@@ -156,6 +260,8 @@ impl ConversationHandle {
             accepting_commands,
             turn_reserved,
             lifecycle,
+            observation,
+            observation_hub,
         })
     }
 
@@ -171,12 +277,28 @@ impl ConversationHandle {
         ConversationLifecycle::from_u8(self.lifecycle.load(Ordering::Acquire))
     }
 
+    pub(crate) fn observation(&self) -> ConversationObservation {
+        self.observation
+            .lock()
+            .expect("conversation observation mutex poisoned")
+            .clone()
+    }
+
     pub(crate) fn cancel(&self) -> bool {
-        self.active_cancellation
+        let requested = self
+            .active_cancellation
             .lock()
             .expect("conversation cancellation mutex poisoned")
             .as_ref()
-            .is_some_and(|sender| sender.send(true).is_ok())
+            .is_some_and(|sender| sender.send(true).is_ok());
+        if requested {
+            self.lifecycle
+                .store(ConversationLifecycle::Stopping.as_u8(), Ordering::Release);
+            update_observation(&self.observation, &self.observation_hub, |observation| {
+                observation.lifecycle = ConversationLifecycle::Stopping;
+            });
+        }
+        requested
     }
 
     pub(crate) fn start_turn(
@@ -184,7 +306,14 @@ impl ConversationHandle {
         prompt: String,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(prompt, false, None, events)
+        self.start_turn_kind(prompt, false, None, false, events)
+    }
+
+    pub(crate) fn start_new_session_turn(
+        &self,
+        prompt: String,
+    ) -> Result<JoinHandle<Result<ConversationTurn>>> {
+        self.start_turn_kind(prompt, false, None, true, None)
     }
 
     pub(crate) fn start_edit_turn(
@@ -193,14 +322,14 @@ impl ConversationHandle {
         prompt: String,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(prompt, false, Some(node_id), events)
+        self.start_turn_kind(prompt, false, Some(node_id), false, events)
     }
 
     pub(crate) fn start_goal_continuation(
         &self,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(String::new(), true, None, events)
+        self.start_turn_kind(String::new(), true, None, false, events)
     }
 
     fn start_turn_kind(
@@ -208,6 +337,7 @@ impl ConversationHandle {
         prompt: String,
         hidden: bool,
         edit_node_id: Option<Uuid>,
+        initialize_catalog: bool,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
         let _gate = self
@@ -229,11 +359,17 @@ impl ConversationHandle {
             .expect("conversation cancellation mutex poisoned") = Some(cancel_tx);
         self.lifecycle
             .store(ConversationLifecycle::Running.as_u8(), Ordering::Release);
+        update_observation(&self.observation, &self.observation_hub, |observation| {
+            observation.lifecycle = ConversationLifecycle::Running;
+            observation.active_turn_started_at = Some(Utc::now());
+            observation.activity = None;
+        });
         let (reply, response) = oneshot::channel();
         if let Err(error) = self.send_unchecked(ConversationCommand::Turn {
             prompt,
             hidden,
             edit_node_id,
+            initialize_catalog,
             events,
             cancellation,
             reply,
@@ -245,6 +381,10 @@ impl ConversationHandle {
             self.turn_reserved.store(false, Ordering::Release);
             self.lifecycle
                 .store(ConversationLifecycle::Idle.as_u8(), Ordering::Release);
+            update_observation(&self.observation, &self.observation_hub, |observation| {
+                observation.lifecycle = ConversationLifecycle::Idle;
+                observation.active_turn_started_at = None;
+            });
             return Err(error);
         }
         Ok(tokio::spawn(async move {
@@ -431,13 +571,18 @@ async fn receive<T>(receiver: oneshot::Receiver<T>, action: &str) -> Result<T> {
 
 async fn run_worker(
     mut agent: Agent,
-    registry: SessionRegistry,
     mut commands: mpsc::UnboundedReceiver<ConversationCommand>,
-    snapshots: watch::Sender<ConversationSnapshot>,
-    active_cancellation: Arc<Mutex<Option<watch::Sender<bool>>>>,
-    turn_reserved: Arc<AtomicBool>,
-    lifecycle: Arc<AtomicU8>,
+    state: ConversationWorkerState,
 ) {
+    let ConversationWorkerState {
+        registry,
+        snapshots,
+        active_cancellation,
+        turn_reserved,
+        lifecycle,
+        observation,
+        observation_hub,
+    } = state;
     let mut explicitly_stopped = false;
     while let Some(command) = commands.recv().await {
         let stop = match command {
@@ -445,25 +590,74 @@ async fn run_worker(
                 prompt,
                 hidden,
                 edit_node_id,
+                initialize_catalog,
                 events,
-                cancellation,
+                mut cancellation,
                 reply,
             } => {
+                update_observation(&observation, &observation_hub, |_| {});
+                let (internal_events, mut event_rx) = mpsc::unbounded_channel();
+                let live_observation = observation.clone();
+                let live_hub = observation_hub.clone();
+                let forwarded_events = events.clone();
+                let observer = tokio::spawn(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        apply_agent_event(&live_observation, &live_hub, &event);
+                        if let Some(events) = &forwarded_events {
+                            let _ = events.send(event);
+                        } else if let AgentEvent::Activity(activity) = &event
+                            && activity.status == ActivityStatus::Running
+                        {
+                            eprintln!(
+                                "\x1b[2m  crab → {} · {}\x1b[0m",
+                                activity.title, activity.detail
+                            );
+                        }
+                    }
+                });
+                if initialize_catalog {
+                    let catalog_result = tokio::select! {
+                        result = agent.fetch_models() => result,
+                        () = wait_for_cancellation(&mut cancellation) => {
+                            Err(crate::agent::TurnCancelled.into())
+                        }
+                    };
+                    match catalog_result {
+                        Ok(catalog) => {
+                            agent.resolve_new_session_model(&catalog);
+                        }
+                        Err(error) if turn_was_cancelled(&error) => {}
+                        Err(error) => {
+                            let error = format!("{error:#}");
+                            update_observation(&observation, &observation_hub, |observation| {
+                                observation.catalog_error = Some(error)
+                            });
+                        }
+                    }
+                }
                 let result = if let Some(node_id) = edit_node_id {
                     agent
-                        .edit_turn_controlled(node_id, &prompt, events, cancellation)
+                        .edit_turn_controlled(node_id, &prompt, Some(internal_events), cancellation)
                         .await
                 } else if hidden {
-                    match events {
-                        Some(events) => agent.continue_goal_with_events(events, cancellation).await,
-                        None => agent.continue_goal_controlled(None, cancellation).await,
-                    }
+                    agent
+                        .continue_goal_with_events(internal_events, cancellation)
+                        .await
                 } else {
-                    agent.turn_controlled(&prompt, events, cancellation).await
+                    agent
+                        .turn_controlled(&prompt, Some(internal_events), cancellation)
+                        .await
                 };
+                let _ = observer.await;
                 *active_cancellation
                     .lock()
                     .expect("conversation cancellation mutex poisoned") = None;
+                let outcome = match &result {
+                    Ok(_) => TurnOutcome::Completed,
+                    Err(error) if turn_was_cancelled(error) => TurnOutcome::Cancelled,
+                    Err(_) => TurnOutcome::Failed,
+                };
+                agent.record_turn_outcome(outcome);
                 let save_result = persist(&agent, &registry);
                 let current = snapshot(&agent);
                 let _ = snapshots.send(current.clone());
@@ -476,7 +670,13 @@ async fn run_worker(
                     ))),
                 };
                 turn_reserved.store(false, Ordering::Release);
-                lifecycle.store(ConversationLifecycle::Idle.as_u8(), Ordering::Release);
+                let terminal_lifecycle = match outcome {
+                    TurnOutcome::Completed => ConversationLifecycle::Idle,
+                    TurnOutcome::Cancelled => ConversationLifecycle::Stopped,
+                    TurnOutcome::Failed => ConversationLifecycle::Failed,
+                };
+                lifecycle.store(terminal_lifecycle.as_u8(), Ordering::Release);
+                reconcile_observation(&observation, &observation_hub, &current, terminal_lifecycle);
                 let _ = reply.send(ConversationTurn {
                     result,
                     snapshot: current,
@@ -569,6 +769,217 @@ async fn run_worker(
         },
         Ordering::Release,
     );
+    update_observation(&observation, &observation_hub, |observation| {
+        observation.lifecycle = if explicitly_stopped {
+            ConversationLifecycle::Stopped
+        } else {
+            ConversationLifecycle::Failed
+        };
+        observation.active_turn_started_at = None;
+    });
+}
+
+fn update_observation(
+    observation: &Arc<Mutex<ConversationObservation>>,
+    hub: &ObservationHub,
+    update: impl FnOnce(&mut ConversationObservation),
+) {
+    {
+        let mut observation = observation
+            .lock()
+            .expect("conversation observation mutex poisoned");
+        update(&mut observation);
+        observation.revision = observation.revision.saturating_add(1);
+        observation.latest_event_at = Utc::now();
+    }
+    hub.publish();
+}
+
+fn apply_agent_event(
+    observation: &Arc<Mutex<ConversationObservation>>,
+    hub: &ObservationHub,
+    event: &AgentEvent,
+) {
+    update_observation(observation, hub, |observation| match event {
+        AgentEvent::UserMessage(message) => {
+            if observation.messages.is_empty()
+                && let Some(content) = message.content.as_deref()
+            {
+                observation.title = content.chars().take(72).collect();
+            }
+            if let Some(message) = observed_message(message, false) {
+                observation.messages.push(message);
+            }
+        }
+        AgentEvent::AssistantMessage(message) => {
+            if let Some(message) = observed_message(message, false) {
+                upsert_observed_message(&mut observation.messages, message);
+            }
+        }
+        AgentEvent::AssistantTextDelta {
+            delta,
+            start,
+            sequence,
+            created_at,
+        } => {
+            let id = format!("assistant:{sequence}");
+            if *start {
+                observation.messages.push(ObservedMessage {
+                    id,
+                    role: "assistant",
+                    created_at: *created_at,
+                    content: delta.clone(),
+                    partial: true,
+                });
+            } else if let Some(message) = observation
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.id == id)
+            {
+                message.content.push_str(delta);
+            }
+        }
+        AgentEvent::AssistantStreamReset => {
+            observation
+                .messages
+                .retain(|message| !(message.role == "assistant" && message.partial));
+        }
+        AgentEvent::AssistantMessageCompleted(message) => {
+            if let Some(message) = observed_message(message, false) {
+                upsert_observed_message(&mut observation.messages, message);
+            }
+        }
+        AgentEvent::Activity(activity) => {
+            observation.activity = Some(observed_activity(activity));
+        }
+    });
+}
+
+fn reconcile_observation(
+    observation: &Arc<Mutex<ConversationObservation>>,
+    hub: &ObservationHub,
+    snapshot: &ConversationSnapshot,
+    lifecycle: ConversationLifecycle,
+) {
+    update_observation(observation, hub, |observation| {
+        let revision = observation.revision;
+        let catalog_error = observation.catalog_error.clone();
+        *observation = observation_from_snapshot(snapshot, lifecycle, revision);
+        observation.catalog_error = catalog_error;
+    });
+}
+
+fn observation_from_snapshot(
+    snapshot: &ConversationSnapshot,
+    lifecycle: ConversationLifecycle,
+    revision: u64,
+) -> ConversationObservation {
+    let session = &snapshot.session;
+    let mut messages = session
+        .messages
+        .active_entries()
+        .filter_map(|(_, message)| observed_message(message, false))
+        .collect::<Vec<_>>();
+    let last_turn = session.turns.last().and_then(|turn| {
+        let ended_at = turn.completed_at?;
+        Some(ObservedTurn {
+            outcome: turn.outcome.unwrap_or(TurnOutcome::Completed),
+            started_at: turn.started_at,
+            ended_at,
+        })
+    });
+    if last_turn
+        .as_ref()
+        .is_some_and(|turn| turn.outcome != TurnOutcome::Completed)
+        && let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == "assistant")
+    {
+        message.partial = true;
+    }
+    let visible_goal = session
+        .visible_goal_id
+        .and_then(|id| session.goals.iter().find(|goal| goal.id == id))
+        .map(|goal| ObservedGoal {
+            id: goal.id,
+            status: goal.status,
+        });
+    ConversationObservation {
+        revision,
+        title: session.title.clone(),
+        lifecycle,
+        active_turn_started_at: (lifecycle == ConversationLifecycle::Running)
+            .then(|| session.turns.last().map(|turn| turn.started_at))
+            .flatten(),
+        latest_event_at: session.updated_at,
+        catalog_error: None,
+        last_turn,
+        visible_goal,
+        messages,
+        activity: session.activities.last().map(observed_activity),
+    }
+}
+
+async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+fn observed_message(message: &Message, partial: bool) -> Option<ObservedMessage> {
+    if message.hidden || !matches!(message.role, Role::User | Role::Assistant) {
+        return None;
+    }
+    let created_at = message.created_at.unwrap_or_else(Utc::now);
+    let role = match message.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        _ => unreachable!("visible observation filters protocol roles"),
+    };
+    let id = message
+        .sequence
+        .map(|sequence| format!("assistant:{sequence}"))
+        .unwrap_or_else(|| {
+            format!(
+                "{role}:{}",
+                created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            )
+        });
+    Some(ObservedMessage {
+        id,
+        role,
+        created_at,
+        content: message.content.clone().unwrap_or_default(),
+        partial,
+    })
+}
+
+fn upsert_observed_message(messages: &mut Vec<ObservedMessage>, message: ObservedMessage) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .rev()
+        .find(|existing| existing.id == message.id)
+    {
+        *existing = message;
+    } else {
+        messages.push(message);
+    }
+}
+
+fn observed_activity(activity: &AgentActivity) -> ObservedActivity {
+    ObservedActivity {
+        tool: activity.tool.clone(),
+        status: activity.status,
+        started_at: activity.started_at,
+        completed_at: activity.completed_at,
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -582,6 +993,7 @@ pub(crate) struct ConversationStatus {
 pub(crate) struct ConversationManager {
     conversations: Arc<RwLock<HashMap<Uuid, ConversationHandle>>>,
     registry: SessionRegistry,
+    observation_hub: ObservationHub,
 }
 
 impl ConversationManager {
@@ -589,9 +1001,11 @@ impl ConversationManager {
         Self {
             conversations: Arc::new(RwLock::new(HashMap::new())),
             registry,
+            observation_hub: ObservationHub::default(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_handle(registry: SessionRegistry, handle: ConversationHandle) -> Self {
         let manager = Self::new(registry);
         let id = handle.snapshot().session.id;
@@ -612,7 +1026,11 @@ impl ConversationManager {
         if let Some(existing) = conversations.get(&id) {
             return Ok(existing.clone());
         }
-        let handle = ConversationHandle::spawn(agent, self.registry.clone())?;
+        let handle = ConversationHandle::spawn_with_hub(
+            agent,
+            self.registry.clone(),
+            self.observation_hub.clone(),
+        )?;
         conversations.insert(id, handle.clone());
         Ok(handle)
     }
@@ -670,7 +1088,21 @@ impl ConversationManager {
         }
     }
 
+    pub(crate) fn observation_hub(&self) -> ObservationHub {
+        self.observation_hub.clone()
+    }
+
     pub(crate) async fn shutdown_all(&self) -> Result<Vec<ConversationSnapshot>> {
+        self.cancel_all();
+        while self
+            .conversations
+            .read()
+            .expect("conversation manager lock poisoned")
+            .values()
+            .any(ConversationHandle::is_running)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let handles = {
             let mut conversations = self
                 .conversations
@@ -739,6 +1171,7 @@ fn snapshot(agent: &Agent) -> ConversationSnapshot {
                 scope: skill.scope.label(),
             })
             .collect(),
+        model_catalog: agent.model_catalog().to_vec(),
     }
 }
 

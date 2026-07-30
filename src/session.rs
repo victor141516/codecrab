@@ -93,6 +93,13 @@ impl ConversationTree {
         &self.active_node_ids
     }
 
+    pub(crate) fn active_entries(&self) -> impl Iterator<Item = (Uuid, &Message)> {
+        self.active_node_ids
+            .iter()
+            .copied()
+            .zip(self.active_messages.iter())
+    }
+
     pub(crate) fn active_node_id(&self, message_index: usize) -> Option<Uuid> {
         self.active_node_ids.get(message_index).copied()
     }
@@ -323,6 +330,16 @@ pub(crate) struct AgentTurn {
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TurnOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TurnOutcome {
+    Completed,
+    Cancelled,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -395,6 +412,8 @@ pub(crate) struct RequestUsage {
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Session {
     pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<Uuid>,
     pub updated_at: DateTime<Utc>,
     #[serde(default = "default_provider")]
     pub provider: String,
@@ -453,6 +472,7 @@ impl Session {
             message_index,
             started_at,
             completed_at: None,
+            outcome: None,
         });
     }
 
@@ -464,7 +484,16 @@ impl Session {
             .find(|turn| turn.message_id == message_id)
         {
             turn.completed_at = Some(completed_at);
+            turn.outcome = Some(TurnOutcome::Completed);
         }
+    }
+
+    pub(crate) fn finish_latest_turn(&mut self, outcome: TurnOutcome, completed_at: DateTime<Utc>) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.completed_at = Some(completed_at);
+            turn.outcome = Some(outcome);
+        }
+        self.updated_at = completed_at;
     }
 
     pub(crate) fn active_goal(&self) -> Option<&Goal> {
@@ -700,6 +729,7 @@ impl SessionStore {
         let now = Utc::now();
         Ok(Session {
             id: Uuid::new_v4(),
+            parent_session_id: None,
             updated_at: now,
             provider,
             model,

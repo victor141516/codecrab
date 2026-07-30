@@ -7,6 +7,7 @@ mod compaction;
 mod completion;
 mod config;
 mod conversation;
+mod coordination;
 mod diagnostics;
 mod events;
 mod http_debug;
@@ -28,15 +29,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::{
-    agent::Agent,
     auth::OAuthStore,
     config::{Config, ConfigStore, ProviderConfig, SessionRegistry, validate_provider_name},
-    conversation::{ConversationHandle, ConversationManager},
+    coordination::SessionCoordinator,
     diagnostics::{DebugOutput, DiagnosticLog},
-    provider::OpenAiCompatible,
     session::{SessionStore, list_session_projects, resolve_global_session},
-    skills::SkillRegistry,
-    tools::ToolBox,
 };
 
 #[derive(Parser)]
@@ -227,8 +224,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let store = SessionStore::new(&root)?;
-    let skills = SkillRegistry::discover(&root);
     let registry = SessionRegistry::global()?;
 
     match cli.command {
@@ -237,7 +232,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Skills) => {
-            skills.print();
+            crate::skills::SkillRegistry::discover(&root).print();
             return Ok(());
         }
         Some(Command::Config) => {
@@ -257,19 +252,15 @@ async fn main() -> Result<()> {
             if prompt.trim().is_empty() {
                 anyhow::bail!("prompt is empty");
             }
-            let provider = new_provider(&config, &config.active_provider, debug_openai)?;
-            let tools = ToolBox::with_shell(root.clone(), config.shell.clone());
-            let active = config.provider(&config.active_provider)?;
-            let session =
-                store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
-            let mut agent = Agent::new(
-                provider,
-                tools,
-                skills,
-                session,
-                Config::instructions_path()?,
+            let coordinator = SessionCoordinator::new(
+                config.clone(),
+                registry.clone(),
+                debug_openai,
                 DiagnosticLog::stderr(),
-            )?;
+                Config::instructions_path()?,
+            );
+            let session = coordinator.create_session(&root)?;
+            let mut agent = coordinator.build_agent(&root, session)?;
             match agent.fetch_models().await {
                 Ok(catalog) => {
                     agent.resolve_new_session_model(&catalog);
@@ -278,9 +269,8 @@ async fn main() -> Result<()> {
                     return Err(error).context("cannot load the provider model catalog");
                 }
             }
-            let conversation = ConversationHandle::spawn(agent, registry.clone())?;
-            let conversations =
-                ConversationManager::with_handle(registry.clone(), conversation.clone());
+            let conversation = coordinator.install(agent)?;
+            let conversations = coordinator.manager();
             let turn = conversation.turn(prompt.trim().to_owned()).await?;
             let result = turn.result;
             let shutdown = conversations.shutdown_all().await.map(|_| ());
@@ -301,17 +291,15 @@ async fn main() -> Result<()> {
             let (session_root, session_id) = resolve_global_session(&projects, id.as_deref())?;
             let session_store = SessionStore::new(&session_root)?;
             let session = session_store.load(Some(&session_id.to_string()))?;
-            let provider = new_provider(&config, &session.provider, debug_openai.clone())?;
-            let tools = ToolBox::with_shell(session_root.clone(), config.shell.clone());
             let diagnostics = DiagnosticLog::tui(cli.error_log.clone());
-            let agent = Agent::new(
-                provider,
-                tools,
-                SkillRegistry::discover(&session_root),
-                session,
-                Config::instructions_path()?,
+            let coordinator = SessionCoordinator::new(
+                config.clone(),
+                registry.clone(),
+                debug_openai.clone(),
                 diagnostics.clone(),
-            )?;
+                Config::instructions_path()?,
+            );
+            let agent = coordinator.build_agent(&session_root, session)?;
             ui::interactive(
                 agent,
                 &registry,
@@ -319,24 +307,21 @@ async fn main() -> Result<()> {
                 diagnostics,
                 config.clone(),
                 false,
+                coordinator,
             )
             .await?;
         }
         None => {
-            let provider = new_provider(&config, &config.active_provider, debug_openai.clone())?;
-            let tools = ToolBox::with_shell(root, config.shell.clone());
-            let active = config.provider(&config.active_provider)?;
-            let session =
-                store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
             let diagnostics = DiagnosticLog::tui(cli.error_log.clone());
-            let agent = Agent::new(
-                provider,
-                tools,
-                skills,
-                session,
-                Config::instructions_path()?,
+            let coordinator = SessionCoordinator::new(
+                config.clone(),
+                registry.clone(),
+                debug_openai.clone(),
                 diagnostics.clone(),
-            )?;
+                Config::instructions_path()?,
+            );
+            let session = coordinator.create_session(&root)?;
+            let agent = coordinator.build_agent(&root, session)?;
             ui::interactive(
                 agent,
                 &registry,
@@ -344,6 +329,7 @@ async fn main() -> Result<()> {
                 diagnostics,
                 config.clone(),
                 true,
+                coordinator,
             )
             .await?;
         }
@@ -445,16 +431,6 @@ fn manage_provider(command: &ProviderCommand) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn new_provider(
-    config: &Config,
-    provider_name: &str,
-    debug_openai: DebugOutput,
-) -> Result<OpenAiCompatible> {
-    let mut provider = OpenAiCompatible::new(config, provider_name)?;
-    provider.set_debug_openai(debug_openai);
-    Ok(provider)
 }
 
 fn one_shot_prompt(prompt: Option<String>) -> Result<String> {

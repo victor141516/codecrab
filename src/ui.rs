@@ -48,15 +48,14 @@ use crate::{
         ConversationHandle, ConversationLifecycle, ConversationManager, ConversationSnapshot,
         ConversationTurn,
     },
+    coordination::SessionCoordinator,
     diagnostics::{DebugOutput, DiagnosticLog},
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
-    provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role},
+    provider::{Message, ModelCatalogEntry, ModelSelection, Role},
     session::{
         AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionProject, SessionStore,
         list_session_projects,
     },
-    skills::SkillRegistry,
-    tools::ToolBox,
     transcription::Transcriber,
 };
 use uuid::Uuid;
@@ -784,6 +783,7 @@ enum QueuedPromptAction {
 }
 
 struct App {
+    coordinator: SessionCoordinator,
     conversations: ConversationManager,
     conversation: ConversationHandle,
     transcript: Vec<Message>,
@@ -797,7 +797,6 @@ struct App {
     transcription: Option<JoinHandle<Result<String>>>,
     send_after_transcription: bool,
     debug_openai: DebugOutput,
-    diagnostics: DiagnosticLog,
     config: Config,
     registry: SessionRegistry,
     clipboard: Option<arboard::Clipboard>,
@@ -871,9 +870,9 @@ impl App {
         model_catalog: Vec<ModelCatalogEntry>,
         catalog_error: Option<String>,
         debug_openai: DebugOutput,
-        diagnostics: DiagnosticLog,
         config: Config,
         registry: SessionRegistry,
+        coordinator: SessionCoordinator,
     ) -> Result<Self> {
         let project_root = agent.project_root().to_path_buf();
         let project = project_root.display().to_string();
@@ -899,12 +898,12 @@ impl App {
         let initial_error = catalog_error
             .as_ref()
             .map(|error| format!("Could not load the model catalog: {error}"));
-        let conversation = ConversationHandle::spawn(agent, registry.clone())?;
+        let conversation = coordinator.install(agent)?;
         let session_id = conversation.snapshot().session.id;
-        let conversations =
-            ConversationManager::with_handle(registry.clone(), conversation.clone());
+        let conversations = coordinator.manager();
         let model_catalogs = HashMap::from([(session_id, model_catalog.clone())]);
         Ok(Self {
+            coordinator,
             conversations,
             conversation,
             transcript,
@@ -918,7 +917,6 @@ impl App {
             transcription: None,
             send_after_transcription: false,
             debug_openai,
-            diagnostics,
             config,
             registry,
             clipboard: arboard::Clipboard::new().ok(),
@@ -2065,19 +2063,13 @@ impl App {
             self.model_catalog.clone(),
         );
         self.conversation = if let Some(existing) = self.conversations.get(id) {
+            self.model_catalogs
+                .entry(id)
+                .or_insert_with(|| existing.snapshot().model_catalog);
             existing
         } else {
             let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
-            let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
-            provider.set_debug_openai(self.debug_openai.clone());
-            let mut agent = Agent::new(
-                provider,
-                ToolBox::with_shell(root.clone(), self.config.shell.clone()),
-                SkillRegistry::discover(&root),
-                session,
-                default_instructions_path(&root)?,
-                self.diagnostics.clone(),
-            )?;
+            let mut agent = self.coordinator.build_agent(&root, session)?;
             let catalog = match agent.fetch_models().await {
                 Ok(catalog) => {
                     agent.resolve_auto_model(&catalog);
@@ -2194,16 +2186,7 @@ impl App {
                 store.create_for_provider(active_snapshot.session.provider, self.model.clone())?;
             session.reasoning_effort.clone_from(&self.reasoning_effort);
             session.service_tier.clone_from(&self.service_tier);
-            let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
-            provider.set_debug_openai(self.debug_openai.clone());
-            let agent = Agent::new(
-                provider,
-                ToolBox::with_shell(root.clone(), self.config.shell.clone()),
-                SkillRegistry::discover(&root),
-                session,
-                default_instructions_path(&root)?,
-                self.diagnostics.clone(),
-            )?;
+            let agent = self.coordinator.build_agent(&root, session)?;
             self.conversation = self.conversations.install(agent)?;
             self.model_catalogs.insert(
                 self.conversation.snapshot().session.id,
@@ -2936,6 +2919,7 @@ impl App {
                 persisted.active_provider = (*name).into();
                 store.save(&persisted)?;
                 self.config = persisted.clone();
+                self.coordinator.update_config(persisted);
                 self.error = Some(format!(
                     "Provider {name:?} selected for new sessions. The current session keeps provider {:?}.",
                     self.conversation.snapshot().session.provider
@@ -2949,6 +2933,7 @@ impl App {
                 persisted.providers.remove(*name);
                 store.save(&persisted)?;
                 self.config = persisted.clone();
+                self.coordinator.update_config(persisted);
                 self.error = Some(format!("Provider {name:?} removed."));
             }
             [
@@ -2972,6 +2957,7 @@ impl App {
                 persisted.providers.insert((*name).into(), provider);
                 store.save(&persisted)?;
                 self.config = persisted.clone();
+                self.coordinator.update_config(persisted);
                 self.error = Some(format!("Provider {name:?} saved."));
             }
             _ => {
@@ -3257,6 +3243,7 @@ pub(crate) async fn interactive(
     diagnostics: DiagnosticLog,
     config: Config,
     new_session: bool,
+    coordinator: SessionCoordinator,
 ) -> Result<()> {
     let (model_catalog, catalog_error) = match agent.fetch_models().await {
         Ok(catalog) => {
@@ -3296,9 +3283,9 @@ pub(crate) async fn interactive(
             model_catalog,
             catalog_error,
             debug_openai,
-            diagnostics.clone(),
             config,
             registry.clone(),
+            coordinator,
         )?,
     )
     .await;
@@ -3330,16 +3317,6 @@ Use `--error-log <path>` to choose a different location.",
         eprintln!("CodeCrab could not write its TUI error log: {error}");
     }
     result.map(|_| ())
-}
-
-#[cfg(not(test))]
-fn default_instructions_path(_root: &Path) -> Result<PathBuf> {
-    Config::instructions_path()
-}
-
-#[cfg(test)]
-fn default_instructions_path(root: &Path) -> Result<PathBuf> {
-    Ok(root.join(".test-global-config").join("AGENTS.md"))
 }
 
 async fn run_tui(
@@ -5446,12 +5423,19 @@ mod tests {
     }
 
     fn test_app_with_session(root: &std::path::Path, config: Config, session: Session) -> App {
+        let registry = test_registry(root);
+        let coordinator = SessionCoordinator::new(
+            config.clone(),
+            registry.clone(),
+            DebugOutput::default(),
+            DiagnosticLog::default(),
+            root.join(".test-global-config").join("AGENTS.md"),
+        );
         let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
-        let tools = ToolBox::new(root.to_path_buf());
         App::new(
             Agent::new(
                 provider,
-                tools,
+                ToolBox::new(root.to_path_buf()),
                 SkillRegistry::default(),
                 session,
                 root.join(".test-global-config").join("AGENTS.md"),
@@ -5461,9 +5445,9 @@ mod tests {
             Vec::new(),
             None,
             DebugOutput::default(),
-            DiagnosticLog::default(),
             config,
-            test_registry(root),
+            registry,
+            coordinator,
         )
         .unwrap()
     }
@@ -6420,6 +6404,7 @@ mod tests {
             message_index: 0,
             started_at,
             completed_at: completed.then_some(started_at + chrono::Duration::seconds(7)),
+            outcome: completed.then_some(crate::session::TurnOutcome::Completed),
         });
         TurnKey {
             session_id: app.session_id,
