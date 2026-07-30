@@ -3021,7 +3021,11 @@ onBeforeUnmount(() => {
                     />
                     <span>{{ workerLifecycle(item.id) || shortId(item.id) }}</span>
                   </span>
-                  <span>{{ formatTime(item.updated_at) }}</span>
+                  <span
+                    :title="`Created ${formatEventTimestamp(item.created_at)} · Updated ${formatEventTimestamp(item.updated_at)}`"
+                  >
+                    C {{ formatTime(item.created_at) }} · U {{ formatTime(item.updated_at) }}
+                  </span>
                 </span>
               </button>
               <button

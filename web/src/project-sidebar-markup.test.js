@@ -10,6 +10,8 @@ test("sidebar renders every project with nested sessions and exact project actio
   assert.match(appSource, /v-for="item in project\.sessions"/);
   assert.match(appSource, /newSession\(project\.root\)/);
   assert.match(appSource, /resumeSession\(project\.root, item\.id\)/);
+  assert.match(appSource, /C \{\{ formatTime\(item\.created_at\) \}\}/);
+  assert.match(appSource, /U \{\{ formatTime\(item\.updated_at\) \}\}/);
 });
 
 test("server project picker remains usable in compact and wide viewports", () => {

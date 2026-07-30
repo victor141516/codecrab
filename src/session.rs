@@ -414,6 +414,7 @@ pub(crate) struct Session {
     pub id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default = "default_provider")]
     pub provider: String,
@@ -696,6 +697,7 @@ impl Session {
 #[derive(Clone, Serialize)]
 pub(crate) struct SessionSummary {
     pub id: Uuid,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub title: String,
     pub model: String,
@@ -730,6 +732,7 @@ impl SessionStore {
         Ok(Session {
             id: Uuid::new_v4(),
             parent_session_id: None,
+            created_at: now,
             updated_at: now,
             provider,
             model,
@@ -751,14 +754,18 @@ impl SessionStore {
 
     pub(crate) fn save(&self, session: &Session) -> Result<()> {
         let path = self.dir.join(format!("{}.json", session.id));
-        let temp = self.dir.join(format!("{}.json.tmp", session.id));
+        Self::write(&path, session)
+    }
+
+    fn write(path: &Path, session: &Session) -> Result<()> {
+        let temp = path.with_extension("json.tmp");
         fs::write(&temp, serde_json::to_vec_pretty(session)?)
             .with_context(|| format!("cannot write {}", temp.display()))?;
         // Windows does not replace an existing destination with rename.
         if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("cannot replace {}", path.display()))?;
+            fs::remove_file(path).with_context(|| format!("cannot replace {}", path.display()))?;
         }
-        fs::rename(&temp, &path).with_context(|| format!("cannot save {}", path.display()))?;
+        fs::rename(&temp, path).with_context(|| format!("cannot save {}", path.display()))?;
         Ok(())
     }
 
@@ -772,12 +779,13 @@ impl SessionStore {
             let session = self.read(&path)?;
             sessions.push(SessionSummary {
                 id: session.id,
+                created_at: session.created_at,
                 updated_at: session.updated_at,
                 title: session.title,
                 model: session.model,
             });
         }
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        sessions.sort_by_key(|session| std::cmp::Reverse((session.created_at, session.id)));
         Ok(sessions)
     }
 
@@ -796,7 +804,13 @@ impl SessionStore {
     fn resolve_id(&self, query: Option<&str>) -> Result<Uuid> {
         let sessions = self.list()?;
         Ok(match query {
-            None => sessions.first().context("there are no saved sessions")?.id,
+            None => {
+                sessions
+                    .iter()
+                    .max_by_key(|session| (session.updated_at, session.id))
+                    .context("there are no saved sessions")?
+                    .id
+            }
             Some(prefix) => {
                 let matches: Vec<_> = sessions
                     .iter()
@@ -813,9 +827,26 @@ impl SessionStore {
 
     fn read(&self, path: &Path) -> Result<Session> {
         let bytes = fs::read(path)?;
-        let mut session: Session = serde_json::from_slice(&bytes)
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid session {}", path.display()))?;
+        let missing_created_at = value.get("created_at").is_none();
+        if missing_created_at {
+            let updated_at = value
+                .get("updated_at")
+                .cloned()
+                .context("session is missing updated_at")?;
+            value
+                .as_object_mut()
+                .context("session JSON is not an object")?
+                .insert("created_at".into(), updated_at);
+        }
+        let mut session: Session = serde_json::from_value(value)
             .with_context(|| format!("invalid session {}", path.display()))?;
         session.refresh_active_indexes();
+        if missing_created_at {
+            Self::write(path, &session)
+                .with_context(|| format!("cannot add created_at to {}", path.display()))?;
+        }
         Ok(session)
     }
 }
@@ -858,7 +889,7 @@ pub(crate) fn resolve_global_session(
                 .map(move |session| (&project.root, session))
         })
         .collect::<Vec<_>>();
-    sessions.sort_by_key(|(_, session)| std::cmp::Reverse(session.updated_at));
+    sessions.sort_by_key(|(_, session)| std::cmp::Reverse((session.updated_at, session.id)));
     match query {
         None => sessions
             .first()
@@ -1187,6 +1218,69 @@ mod tests {
         let loaded = store.load(Some(&session.id.to_string())).unwrap();
         assert_eq!(loaded.provider, "example");
         assert_eq!(loaded.model, "example-model");
+    }
+
+    #[test]
+    fn created_at_is_persisted_and_does_not_follow_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let created_at = session.created_at;
+        session.updated_at = created_at + chrono::Duration::hours(1);
+        store.save(&session).unwrap();
+
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.created_at, created_at);
+        assert_eq!(loaded.updated_at, session.updated_at);
+    }
+
+    #[test]
+    fn loading_a_legacy_session_persists_updated_at_as_created_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        session.updated_at += chrono::Duration::hours(2);
+        store.save(&session).unwrap();
+        let path = store.dir.join(format!("{}.json", session.id));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("created_at");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.created_at, session.updated_at);
+        let migrated: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(migrated["created_at"], migrated["updated_at"]);
+    }
+
+    #[test]
+    fn lists_by_creation_but_default_resume_uses_latest_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let now = Utc::now();
+        let mut older = store.create("older".into()).unwrap();
+        older.created_at = now - chrono::Duration::hours(2);
+        older.updated_at = now;
+        let mut newer = store.create("newer".into()).unwrap();
+        newer.created_at = now - chrono::Duration::hours(1);
+        newer.updated_at = now - chrono::Duration::minutes(30);
+        store.save(&older).unwrap();
+        store.save(&newer).unwrap();
+
+        let sessions = store.list().unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![newer.id, older.id]
+        );
+        assert_eq!(store.load(None).unwrap().id, older.id);
+        let projects = vec![SessionProject {
+            root: temp.path().to_path_buf(),
+            sessions,
+        }];
+        assert_eq!(resolve_global_session(&projects, None).unwrap().1, older.id);
     }
 
     #[test]

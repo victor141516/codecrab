@@ -2958,8 +2958,15 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let config = Config::test("auto", "http://127.0.0.1:1/v1");
         let store = SessionStore::new(&root).unwrap();
+        let now = chrono::Utc::now();
+        let mut newest = store.create("newest-model".into()).unwrap();
+        newest.created_at = now;
+        newest.updated_at = now - chrono::Duration::minutes(1);
+        let newest_id = newest.id;
+        store.save(&newest).unwrap();
         let mut next = store.create("next-model".into()).unwrap();
-        next.updated_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        next.created_at = now - chrono::Duration::minutes(2);
+        next.updated_at = now - chrono::Duration::minutes(3);
         next.title = "Next saved session".into();
         next.messages.push(crate::provider::Message::text(
             crate::provider::Role::User,
@@ -2968,7 +2975,8 @@ mod tests {
         let next_id = next.id;
         store.save(&next).unwrap();
         let mut active = store.create("selected-model".into()).unwrap();
-        active.updated_at = chrono::Utc::now();
+        active.created_at = now - chrono::Duration::minutes(1);
+        active.updated_at = now;
         active.reasoning_effort = Some("high".into());
         active.service_tier = Some("priority".into());
         active.messages.push(crate::provider::Message::text(
@@ -3011,6 +3019,19 @@ mod tests {
             Json(SessionRequest {
                 project: Some(root.clone()),
                 id: next_id.to_string(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert_eq!(response.session.as_ref().unwrap().id, newest_id);
+
+        let response = delete_session(
+            State(state.clone()),
+            Json(SessionRequest {
+                project: Some(root.clone()),
+                id: newest_id.to_string(),
             }),
         )
         .await
