@@ -1457,10 +1457,7 @@ fn compact_error(body: &str) -> String {
 mod tests {
     use std::time::Duration;
 
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use super::*;
 
@@ -1657,8 +1654,8 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 16_384];
-            let read = socket.read(&mut request).await.unwrap();
+            let request = crate::test_support::read_http_request(&mut socket).await;
+            let read = request.len();
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -1723,8 +1720,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 16_384];
-            let _ = socket.read(&mut request).await.unwrap();
+            let _request = crate::test_support::read_http_request(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -1767,8 +1763,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 16_384];
-            let _ = socket.read(&mut request).await.unwrap();
+            let _request = crate::test_support::read_http_request(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -2033,8 +2028,8 @@ mod tests {
         .to_string();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 16_384];
-            let read = socket.read(&mut request).await.unwrap();
+            let request = crate::test_support::read_http_request(&mut socket).await;
+            let read = request.len();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),

@@ -421,7 +421,7 @@ fn build_agent(
 ) -> Result<Agent> {
     let mut provider = OpenAiCompatible::new(config, &session.provider)?;
     provider.set_debug_openai(debug_openai);
-    let tools = ToolBox::new(root.to_path_buf());
+    let tools = ToolBox::with_shell(root.to_path_buf(), config.shell.clone());
     Agent::new(provider, tools, SkillRegistry::discover(root), session)
 }
 
@@ -1514,7 +1514,7 @@ mod tests {
         events::{ActivityKind, ActivityStatus},
     };
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::AsyncWriteExt,
         net::{TcpListener, TcpStream},
         sync::{Barrier, Notify},
     };
@@ -1945,8 +1945,7 @@ mod tests {
         let provider_server = tokio::spawn(async move {
             for body in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0; 16_384];
-                let _ = socket.read(&mut request).await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -2041,8 +2040,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let provider_server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 16_384];
-            let _ = socket.read(&mut request).await.unwrap();
+            let _request = crate::test_support::read_http_request(&mut socket).await;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -2156,8 +2154,7 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let barrier = provider_barrier.clone();
                 handlers.push(tokio::spawn(async move {
-                    let mut request = vec![0; 16_384];
-                    let _ = socket.read(&mut request).await.unwrap();
+                    let _request = crate::test_support::read_http_request(&mut socket).await;
                     barrier.wait().await;
                     let body = json!({
                         "choices": [{

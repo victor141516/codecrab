@@ -489,8 +489,13 @@ async fn run_worker(
                 false
             }
             ConversationCommand::Clear { reply } => {
-                agent.clear();
-                reply_snapshot(&agent, &registry, &snapshots, reply);
+                let result = agent
+                    .clear()
+                    .and_then(|()| persist(&agent, &registry).map(|()| snapshot(&agent)));
+                if let Ok(current) = &result {
+                    let _ = snapshots.send(current.clone());
+                }
+                let _ = reply.send(result);
                 false
             }
             ConversationCommand::SelectBranch { node_id, reply } => {
@@ -541,7 +546,13 @@ async fn run_worker(
                 false
             }
             ConversationCommand::Shutdown { reply } => {
-                reply_snapshot(&agent, &registry, &snapshots, reply);
+                let result = agent
+                    .shutdown()
+                    .and_then(|()| persist(&agent, &registry).map(|()| snapshot(&agent)));
+                if let Ok(current) = &result {
+                    let _ = snapshots.send(current.clone());
+                }
+                let _ = reply.send(result);
                 explicitly_stopped = true;
                 true
             }

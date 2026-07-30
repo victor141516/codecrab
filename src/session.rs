@@ -14,6 +14,7 @@ use crate::{
     config::{SessionRegistry, normalized_root, paths_equal},
     events::AgentActivity,
     provider::{Message, Role, TokenUsage},
+    terminal::TerminalRecord,
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -416,10 +417,18 @@ pub(crate) struct Session {
     pub compaction_checkpoints: Vec<CompactionCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_request_usage: Option<RequestUsage>,
+    #[serde(default = "default_next_terminal_id")]
+    pub next_terminal_id: u64,
+    #[serde(default)]
+    pub terminals: Vec<TerminalRecord>,
 }
 
 fn default_provider() -> String {
     crate::config::DEFAULT_PROVIDER.into()
+}
+
+fn default_next_terminal_id() -> u64 {
+    1
 }
 
 impl Session {
@@ -705,6 +714,8 @@ impl SessionStore {
             visible_goal_id: None,
             compaction_checkpoints: Vec::new(),
             latest_request_usage: None,
+            next_terminal_id: 1,
+            terminals: Vec::new(),
         })
     }
 
@@ -1146,6 +1157,43 @@ mod tests {
         let loaded = store.load(Some(&session.id.to_string())).unwrap();
         assert_eq!(loaded.provider, "example");
         assert_eq!(loaded.model, "example-model");
+    }
+
+    #[test]
+    fn terminal_records_and_monotonic_counter_are_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let now = Utc::now();
+        session.next_terminal_id = 4;
+        session.terminals.push(TerminalRecord {
+            id: "terminal_3".into(),
+            command: "interactive-command".into(),
+            shell: "/bin/sh".into(),
+            working_directory: temp.path().to_path_buf(),
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            columns: 120,
+            rows: 40,
+            state: crate::terminal::TerminalProcessState::Running,
+            exit_code: None,
+            latest_snapshot: None,
+            latest_observation: crate::terminal::ObservationClassification::Unchanged,
+            recent_transcript: "prompt".into(),
+        });
+
+        store.save(&session).unwrap();
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+
+        assert_eq!(loaded.next_terminal_id, 4);
+        assert_eq!(loaded.terminals.len(), 1);
+        assert_eq!(loaded.terminals[0].id, "terminal_3");
+        assert_eq!(
+            loaded.terminals[0].state,
+            crate::terminal::TerminalProcessState::Running
+        );
+        assert_eq!(loaded.terminals[0].recent_transcript, "prompt");
     }
 
     #[test]

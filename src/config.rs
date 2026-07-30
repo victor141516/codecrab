@@ -100,6 +100,8 @@ pub(crate) struct Config {
     pub active_provider: String,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub request_timeout_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
     pub session_directories: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chatgpt_oauth: Option<ChatGptOAuthConfig>,
@@ -111,6 +113,7 @@ impl Default for Config {
             active_provider: DEFAULT_PROVIDER.into(),
             providers: BTreeMap::from([(DEFAULT_PROVIDER.into(), ProviderConfig::default())]),
             request_timeout_seconds: 180,
+            shell: None,
             session_directories: Vec::new(),
             chatgpt_oauth: None,
         }
@@ -122,6 +125,8 @@ pub(crate) struct PublicConfig<'a> {
     pub active_provider: &'a str,
     pub providers: BTreeMap<&'a str, PublicProvider<'a>>,
     pub request_timeout_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<&'a str>,
     pub session_directories: &'a [PathBuf],
 }
 
@@ -186,6 +191,9 @@ impl Config {
         if let Ok(value) = env::var("CODECRAB_PROVIDER") {
             config.active_provider = value;
         }
+        if let Ok(value) = env::var("CODECRAB_SHELL") {
+            config.shell = Some(value);
+        }
         let active = config.active_provider.clone();
         if let Some(provider) = config.providers.get_mut(&active) {
             if let Ok(value) = env::var("CODECRAB_MODEL") {
@@ -236,6 +244,13 @@ impl Config {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.request_timeout_seconds == 0 {
             anyhow::bail!("request_timeout_seconds must be greater than zero");
+        }
+        if self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.trim().is_empty())
+        {
+            anyhow::bail!("shell cannot be empty");
         }
         validate_provider_name(&self.active_provider)?;
         self.provider(&self.active_provider)?;
@@ -289,6 +304,7 @@ impl Config {
                 })
                 .collect(),
             request_timeout_seconds: self.request_timeout_seconds,
+            shell: self.shell.as_deref(),
             session_directories: &self.session_directories,
         }
     }
@@ -679,6 +695,29 @@ mod tests {
         assert!(!public.contains("access-secret"));
         assert!(!public.contains("refresh-secret"));
         assert!(!public.contains("chatgpt_oauth"));
+    }
+
+    #[test]
+    fn configured_shell_round_trips_and_rejects_blank_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let mut config = Config {
+            shell: Some("/usr/bin/fish".into()),
+            ..Config::default()
+        };
+
+        config.validate().unwrap();
+        store.save(&config).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded.shell.as_deref(), Some("/usr/bin/fish"));
+        assert_eq!(loaded.public_view().shell, Some("/usr/bin/fish"));
+
+        config.shell = Some(" \t".into());
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "shell cannot be empty"
+        );
     }
 
     #[test]

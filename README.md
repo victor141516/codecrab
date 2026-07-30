@@ -52,10 +52,11 @@ terminal interface and an optional embedded web application.
   web composers; transcripts are inserted for review instead of auto-sent.
 - OAuth PKCE, automatic token refresh, and global TOML persistence under
   `~/.config/codecrab/`.
-- Model tools for listing, reading, searching, writing, exact editing, and shell
-  commands.
+- Model tools for listing, reading, searching, writing, exact editing,
+  non-interactive commands, and persistent interactive terminal sessions.
 - Relative, parent, and absolute paths across the filesystem.
-- Autonomous file mutations and shell commands in every execution mode.
+- Autonomous file mutations, shell commands, and managed PTY interaction in
+  every execution mode.
 - Unlimited model/tool rounds per turn, continuing until the model returns a
   final answer or an actual provider/tool error occurs.
 - Persistent, session-scoped goals with automatic cross-turn continuation,
@@ -685,6 +686,36 @@ retry. A terminal failure is persisted in the session and logged to `stderr`
 outside the TUI, or to the TUI's lazy error log during an interactive terminal
 session.
 
+### Managed terminal sessions
+
+The `shell` model tool always starts the detected user shell inside a PTY
+(ConPTY on Windows). Commands that finish within five seconds return their exit
+status and normalized combined terminal text. A command still running after
+five seconds returns a conversation-scoped terminal ID; the model can then use
+semantic text, paste, key, mouse, resize, read, list, and close operations. The
+terminal emulator supplies the final rendered screen and style spans instead
+of raw ANSI or transient spinner frames.
+
+Use the separate `shell_noninteractive` tool when distinct stdout/stderr is
+more useful than terminal behavior. Its timeout is 120 seconds by default and
+accepts values up to 300 seconds; a timeout kills the process tree and returns
+the partial captured streams.
+
+Set a global `shell` executable in `config.toml`, or temporarily set
+`CODECRAB_SHELL`, for deterministic selection. Otherwise Unix uses `$SHELL`
+then the account shell, while Windows checks the parent shell and then `pwsh`,
+Windows PowerShell, and `%ComSpec%`. Shell profiles are loaded. Managed
+terminals use `TERM=xterm-256color`, true color, and UTF-8 where the selected
+shell supports it.
+
+Terminal metadata, the latest structured screen, and bounded transcript tail
+are saved with the conversation. Live terminals remain available when
+switching sessions within one CodeCrab process. They are killed and reaped on
+session deletion or normal shutdown; a terminal that was live when CodeCrab
+stopped is marked `interrupted` after resume because PTYs cannot be reattached
+across process restarts. Graphics protocols and direct user-takeover views are
+not supported.
+
 ### ChatGPT Plus/Pro authentication
 
 ```console
@@ -746,8 +777,8 @@ profile's saved key for one process.
 
 Relative file-tool paths resolve from the selected working directory, while
 parent paths, absolute paths, other drives, and symbolic links are allowed.
-Reads, writes, edits, and shell commands run immediately without confirmation
-in terminal, one-shot, resume, and web modes.
+Reads, writes, edits, shell commands, and managed terminal interactions run
+immediately without confirmation in terminal, one-shot, resume, and web modes.
 
 OAuth tokens and provider API keys are stored as plain text in the
 `~/.config/codecrab/config.toml`. `codecrab auth logout` removes the
@@ -851,7 +882,9 @@ The code is intentionally split by responsibility:
 - `audio.rs`: native microphone capture and WAV encoding for the terminal.
 - `transcription.rs`: subscription-backed ChatGPT voice transcription.
 - `auth.rs`: OAuth PKCE, token refresh, and global TOML persistence.
-- `tools.rs`: project-scoped file and shell capabilities.
+- `tools.rs`: project-scoped file capabilities and non-interactive commands.
+- `terminal/`: shared PTY lifecycle, terminal emulation, semantic input,
+  snapshots, observation, and cleanup.
 - `session.rs`: persistence and resume.
 - `skills.rs`: Agent Skills discovery, validation, activation, and resources.
 - `ui.rs`: responsive terminal UI and composer.

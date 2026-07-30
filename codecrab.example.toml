@@ -10,6 +10,9 @@
 active_provider = "openai"
 # Maximum time without receiving new model response data. Each chunk resets the timer.
 request_timeout_seconds = 180
+# Optional deterministic shell executable for managed PTYs. When omitted,
+# CodeCrab detects the user's shell and falls back to platform defaults.
+# shell = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
 # Managed automatically as projects acquire or lose saved sessions.
 # Paths may also be added manually.
 session_directories = []
