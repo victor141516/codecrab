@@ -200,7 +200,20 @@ The initial API surface is:
 | `POST` | `/api/goals/pause` | Pause a goal |
 | `POST` | `/api/goals/delete` | Delete a goal |
 
-### Raw OpenAI HTTP debugging
+### Diagnostics and raw OpenAI HTTP debugging
+
+During an interactive terminal session, model request and compaction errors are
+written to an execution-specific log under the operating system's temporary
+directory instead of `stderr`, so they cannot corrupt the TUI. The file is
+created only after the first error. After the TUI restores the terminal,
+CodeCrab prints its path and explains how to select another location:
+
+```console
+codecrab --error-log ./codecrab-errors.log
+```
+
+The explicit path is appended to and is also created lazily. Non-interactive
+commands and the web server continue to report these diagnostics on `stderr`.
 
 Pass `--debug-openai` in any mode to write every OpenAI model/catalog request,
 OAuth token request, and corresponding response to `stderr`:
@@ -209,6 +222,17 @@ OAuth token request, and corresponding response to `stderr`:
 codecrab --debug-openai serve
 codecrab --debug-openai run "Say hello"
 ```
+
+To keep that output away from the TUI, attach an output path to the flag with
+`=`:
+
+```console
+codecrab --debug-openai=./openai-debug.log
+```
+
+The `=` is required so the optional path cannot consume a subcommand or prompt.
+The selected file is opened lazily and appended to. An explicit debug file
+error is surfaced and never falls back silently to `stderr`.
 
 This output is intentionally unredacted. It can contain access and refresh
 tokens, authorization codes, prompts, tool arguments, repository content, and
@@ -655,7 +679,9 @@ or generation workflow to CodeCrab. See
 new response data. Every streamed chunk resets the timer, so a response may run
 for longer than this value while it remains active. CodeCrab retries model
 timeouts and other request errors up to five times, showing and persisting each
-retry; a terminal failure is persisted in the session and logged to `stderr`.
+retry. A terminal failure is persisted in the session and logged to `stderr`
+outside the TUI, or to the TUI's lazy error log during an interactive terminal
+session.
 
 ### ChatGPT Plus/Pro authentication
 

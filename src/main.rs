@@ -7,6 +7,7 @@ mod compaction;
 mod completion;
 mod config;
 mod conversation;
+mod diagnostics;
 mod events;
 mod http_debug;
 mod project_fs;
@@ -28,6 +29,7 @@ use crate::{
     auth::OAuthStore,
     config::{Config, ConfigStore, ProviderConfig, SessionRegistry, validate_provider_name},
     conversation::{ConversationHandle, ConversationManager},
+    diagnostics::DebugOutput,
     provider::OpenAiCompatible,
     session::{SessionStore, list_session_projects, resolve_global_session},
     skills::SkillRegistry,
@@ -53,9 +55,19 @@ struct Cli {
     #[arg(long, global = true)]
     base_url: Option<String>,
 
-    /// Print complete OpenAI HTTP requests and responses to stderr, including credentials.
-    #[arg(long, global = true)]
-    debug_openai: bool,
+    /// Print complete unredacted OpenAI HTTP traffic to stderr or an optional file.
+    #[arg(
+        long,
+        global = true,
+        num_args = 0..=1,
+        require_equals = true,
+        value_name = "PATH"
+    )]
+    debug_openai: Option<Option<PathBuf>>,
+
+    /// Write interactive TUI error diagnostics to this file instead of a temporary file.
+    #[arg(long, global = true, value_name = "PATH")]
+    error_log: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -148,6 +160,11 @@ enum ProviderCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let debug_openai = match cli.debug_openai {
+        None => DebugOutput::default(),
+        Some(None) => DebugOutput::stderr(),
+        Some(Some(path)) => DebugOutput::file(path),
+    };
     let root = cli
         .cwd
         .canonicalize()
@@ -158,7 +175,7 @@ async fn main() -> Result<()> {
 
     if let Some(Command::Auth { command }) = &cli.command {
         let mut auth = OAuthStore::new()?;
-        auth.set_debug_openai(cli.debug_openai);
+        auth.set_debug_openai(debug_openai.clone());
         match command {
             AuthCommand::Login => {
                 let identity = auth.login().await?;
@@ -229,7 +246,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Serve { host, port }) => {
-            server::serve(root, config, host, port, cli.debug_openai).await?;
+            server::serve(root, config, host, port, debug_openai).await?;
             return Ok(());
         }
         Some(Command::Auth { .. } | Command::Provider { .. }) => {
@@ -240,7 +257,7 @@ async fn main() -> Result<()> {
             if prompt.trim().is_empty() {
                 anyhow::bail!("prompt is empty");
             }
-            let provider = new_provider(&config, &config.active_provider, cli.debug_openai)?;
+            let provider = new_provider(&config, &config.active_provider, debug_openai)?;
             let tools = ToolBox::new(root.clone());
             let active = config.provider(&config.active_provider)?;
             let session =
@@ -277,7 +294,7 @@ async fn main() -> Result<()> {
             let (session_root, session_id) = resolve_global_session(&projects, id.as_deref())?;
             let session_store = SessionStore::new(&session_root)?;
             let session = session_store.load(Some(&session_id.to_string()))?;
-            let provider = new_provider(&config, &session.provider, cli.debug_openai)?;
+            let provider = new_provider(&config, &session.provider, debug_openai.clone())?;
             let tools = ToolBox::new(session_root.clone());
             let agent = Agent::new(
                 provider,
@@ -285,16 +302,32 @@ async fn main() -> Result<()> {
                 SkillRegistry::discover(&session_root),
                 session,
             )?;
-            ui::interactive(agent, &registry, cli.debug_openai, config.clone(), false).await?;
+            ui::interactive(
+                agent,
+                &registry,
+                debug_openai,
+                cli.error_log,
+                config.clone(),
+                false,
+            )
+            .await?;
         }
         None => {
-            let provider = new_provider(&config, &config.active_provider, cli.debug_openai)?;
+            let provider = new_provider(&config, &config.active_provider, debug_openai.clone())?;
             let tools = ToolBox::new(root);
             let active = config.provider(&config.active_provider)?;
             let session =
                 store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
             let agent = Agent::new(provider, tools, skills, session)?;
-            ui::interactive(agent, &registry, cli.debug_openai, config.clone(), true).await?;
+            ui::interactive(
+                agent,
+                &registry,
+                debug_openai,
+                cli.error_log,
+                config.clone(),
+                true,
+            )
+            .await?;
         }
     }
 
@@ -399,7 +432,7 @@ fn manage_provider(command: &ProviderCommand) -> Result<()> {
 fn new_provider(
     config: &Config,
     provider_name: &str,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
 ) -> Result<OpenAiCompatible> {
     let mut provider = OpenAiCompatible::new(config, provider_name)?;
     provider.set_debug_openai(debug_openai);
@@ -451,5 +484,35 @@ mod tests {
 
         assert!(output.starts_with("Configuration file path:\n/config/codecrab/config.toml\n\n"));
         assert!(output.contains("Effective configuration content:\nmodel = \"auto\""));
+    }
+
+    #[test]
+    fn debug_openai_accepts_no_output_path() {
+        let cli = Cli::try_parse_from(["codecrab", "--debug-openai"]).unwrap();
+
+        assert_eq!(cli.debug_openai, Some(None));
+    }
+
+    #[test]
+    fn debug_openai_accepts_an_equals_separated_output_path() {
+        let cli = Cli::try_parse_from(["codecrab", "--debug-openai=debug/openai.log"]).unwrap();
+
+        assert_eq!(
+            cli.debug_openai,
+            Some(Some(PathBuf::from("debug/openai.log")))
+        );
+    }
+
+    #[test]
+    fn debug_openai_does_not_consume_a_subcommand() {
+        let cli = Cli::try_parse_from(["codecrab", "--debug-openai", "run", "hello"]).unwrap();
+
+        assert_eq!(cli.debug_openai, Some(None));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run {
+                prompt: Some(ref prompt)
+            }) if prompt == "hello"
+        ));
     }
 }

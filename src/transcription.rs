@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::{
     auth::OAuthStore,
     config::{Config, ProviderConfig},
+    diagnostics::DebugOutput,
     http_debug,
 };
 
@@ -16,7 +17,7 @@ const WHISPER_MODEL: &str = "whisper-1";
 pub(crate) struct Transcriber {
     client: Client,
     backend: TranscriptionBackend,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
 }
 
 enum TranscriptionBackend {
@@ -35,11 +36,16 @@ struct TranscriptionResponse {
 }
 
 impl Transcriber {
-    pub(crate) fn new(config: &Config, provider_name: &str, debug_openai: bool) -> Result<Self> {
+    pub(crate) fn new(
+        config: &Config,
+        provider_name: &str,
+        debug_openai: impl Into<DebugOutput>,
+    ) -> Result<Self> {
+        let debug_openai = debug_openai.into();
         let provider = config.provider(provider_name)?;
         let auth_mode = provider.auth.trim().to_ascii_lowercase();
         let mut oauth = OAuthStore::new()?;
-        oauth.set_debug_openai(debug_openai);
+        oauth.set_debug_openai(debug_openai.clone());
         let use_oauth = match auth_mode.as_str() {
             "auto" => provider.is_official_openai() && oauth.is_logged_in(),
             "oauth" => {
@@ -122,8 +128,8 @@ impl Transcriber {
                     .send_subscription(&credentials, audio.clone(), content_type)
                     .await?;
                 if response.status() == StatusCode::UNAUTHORIZED {
-                    if self.debug_openai {
-                        log_response(response, true).await?;
+                    if self.debug_openai.is_enabled() {
+                        log_response(response, &self.debug_openai).await?;
                     }
                     let credentials = auth.refresh_credentials().await?;
                     response = self
@@ -142,7 +148,7 @@ impl Transcriber {
         let version = response.version();
         let headers = response.headers().clone();
         let body = response.text().await?;
-        http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+        http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
         if !status.is_success() {
             anyhow::bail!(
                 "voice transcription returned {status} from {url}: {}",
@@ -197,7 +203,7 @@ impl Transcriber {
     }
 
     async fn execute(&self, request: reqwest::Request, context: &str) -> Result<Response> {
-        http_debug::request(self.debug_openai, &request);
+        http_debug::request(&self.debug_openai, &request)?;
         self.client
             .execute(request)
             .await
@@ -221,14 +227,13 @@ fn audio_form(audio: Vec<u8>, content_type: &str) -> Result<multipart::Form> {
     Ok(multipart::Form::new().part("file", part))
 }
 
-async fn log_response(response: Response, debug: bool) -> Result<()> {
+async fn log_response(response: Response, debug: &DebugOutput) -> Result<()> {
     let status = response.status();
     let url = response.url().clone();
     let version = response.version();
     let headers = response.headers().clone();
     let body = response.text().await?;
-    http_debug::response(debug, &url, version, status, &headers, &body);
-    Ok(())
+    http_debug::response(debug, &url, version, status, &headers, &body)
 }
 
 fn audio_extension(content_type: &str) -> &'static str {

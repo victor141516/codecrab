@@ -21,7 +21,9 @@ needed.
 - `request_timeout_seconds` is a model-response inactivity timeout, not a total
   request deadline. Reset it for every received response chunk. Retry model
   timeouts and errors at most five times, emitting and persisting each retry;
-  persist the terminal error and write it to stderr when all retries fail.
+  persist the terminal error and write it to the active diagnostic destination
+  when all retries fail. Non-TUI modes use stderr. The TUI lazily writes errors
+  to its execution log and reports that path only after restoring the terminal.
 - CodeCrab does not provide a sandbox or filesystem boundary. Relative paths
   resolve from the selected working directory, but parent paths, absolute
   paths, other drives, and symbolic links are valid. The operating-system
@@ -68,8 +70,9 @@ needed.
   project and includes OS, CPU architecture, and the full working directory;
   do not add the account username without a concrete agent need.
 - `--debug-openai` intentionally logs complete, unredacted OpenAI and OAuth
-  requests and responses to stderr. Do not silently redact or weaken this
-  explicit debugging mode.
+  requests and responses to stderr. `--debug-openai=<path>` writes the same
+  unredacted traffic to that file instead. Do not silently redact, weaken, or
+  fall back from the explicitly selected destination in this debugging mode.
 
 ## Repository layout
 
@@ -96,6 +99,7 @@ needed.
   file autocomplete.
 - `src/server.rs`: Axum API and embedded static asset serving.
 - `src/http_debug.rs`: raw HTTP debug rendering.
+- `src/diagnostics.rs`: stderr, lazy TUI error logs, and raw HTTP debug destinations.
 - `src/config.rs`: defaults plus config, environment, and CLI overrides.
 - `web/`: Vue 3 and Tailwind frontend source.
 - `build.rs`: builds the frontend and embeds exactly three generated assets.

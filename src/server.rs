@@ -41,6 +41,7 @@ use crate::{
         validate_provider_name,
     },
     conversation::{ConversationHandle, ConversationManager, ConversationStatus},
+    diagnostics::DebugOutput,
     events::{AgentActivity, AgentEvent},
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible},
@@ -73,7 +74,7 @@ struct ServerState {
 struct ServerInner {
     config: RwLock<Config>,
     registry: SessionRegistry,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
     oauth_logged_in: bool,
     workspace_transition: Mutex<()>,
     workspace: Mutex<ServerWorkspace>,
@@ -298,7 +299,7 @@ pub(crate) async fn serve(
     config: Config,
     host: String,
     port: u16,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
 ) -> Result<()> {
     let store = SessionStore::new(&root)?;
     let registry = SessionRegistry::global();
@@ -306,7 +307,7 @@ pub(crate) async fn serve(
     let active = config.provider(&config.active_provider)?;
     let session =
         store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
-    let mut agent = build_agent(&root, &config, debug_openai, session)?;
+    let mut agent = build_agent(&root, &config, debug_openai.clone(), session)?;
     let (models, catalog_error) = match agent.fetch_models().await {
         Ok(models) => {
             agent.resolve_new_session_model(&models);
@@ -415,7 +416,7 @@ pub(crate) async fn serve(
 fn build_agent(
     root: &std::path::Path,
     config: &Config,
-    debug_openai: bool,
+    debug_openai: impl Into<DebugOutput>,
     session: Session,
 ) -> Result<Agent> {
     let mut provider = OpenAiCompatible::new(config, &session.provider)?;
@@ -734,7 +735,7 @@ async fn transcribe(
         .and_then(|value| value.to_str().ok())
         .filter(|value| value.starts_with("audio/"))
         .unwrap_or("audio/webm");
-    let text = Transcriber::new(&config, &provider, state.inner.debug_openai)?
+    let text = Transcriber::new(&config, &provider, state.inner.debug_openai.clone())?
         .transcribe(body.to_vec(), content_type)
         .await?;
     Ok(Json(TranscriptResponse { text }))
@@ -1090,7 +1091,7 @@ async fn new_session(
     let mut agent = build_agent(
         &root,
         &state.inner.config.read().unwrap(),
-        state.inner.debug_openai,
+        state.inner.debug_openai.clone(),
         session,
     )?;
     let catalog = load_catalog(&mut agent, true).await;
@@ -1134,7 +1135,7 @@ async fn resume_session(
     let mut agent = build_agent(
         &root,
         &state.inner.config.read().unwrap(),
-        state.inner.debug_openai,
+        state.inner.debug_openai.clone(),
         session,
     )?;
     let catalog = load_catalog(&mut agent, false).await;
@@ -1192,7 +1193,7 @@ async fn delete_session(
                 let mut agent = build_agent(
                     &root,
                     &state.inner.config.read().unwrap(),
-                    state.inner.debug_openai,
+                    state.inner.debug_openai.clone(),
                     session,
                 )?;
                 let catalog = load_catalog(&mut agent, false).await;
@@ -1568,7 +1569,7 @@ mod tests {
             inner: Arc::new(ServerInner {
                 config: RwLock::new(config),
                 registry: registry.clone(),
-                debug_openai: false,
+                debug_openai: DebugOutput::default(),
                 oauth_logged_in,
                 workspace_transition: Mutex::new(()),
                 workspace: Mutex::new(ServerWorkspace {

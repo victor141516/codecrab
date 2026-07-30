@@ -19,6 +19,7 @@ use crate::{
         reduce_compaction_end, select_compaction_end, select_tail_start, summarizer_messages,
         tuning::CompactionTuning,
     },
+    diagnostics::DiagnosticLog,
     events::{AgentActivity, AgentEvent},
     provider::{
         Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role, ToolCall,
@@ -40,6 +41,7 @@ pub(crate) struct Agent {
     project_instructions: Option<ProjectInstructions>,
     model_catalog: Vec<ModelCatalogEntry>,
     compaction_tuning: CompactionTuning,
+    diagnostics: DiagnosticLog,
     reported_missing_context_metadata: bool,
     compaction_debounce_tokens: Option<u64>,
 }
@@ -101,6 +103,7 @@ impl Agent {
             project_instructions,
             model_catalog: Vec::new(),
             compaction_tuning: CompactionTuning::default(),
+            diagnostics: DiagnosticLog::default(),
             reported_missing_context_metadata: false,
             compaction_debounce_tokens: None,
         })
@@ -112,6 +115,10 @@ impl Agent {
 
     pub(crate) fn project_root(&self) -> &Path {
         self.tools.root()
+    }
+
+    pub(crate) fn set_diagnostics(&mut self, diagnostics: DiagnosticLog) {
+        self.diagnostics = diagnostics;
     }
 
     pub(crate) async fn fetch_models(&mut self) -> Result<Vec<ModelCatalogEntry>> {
@@ -459,9 +466,10 @@ impl Agent {
                     Err(error) if retry < MAX_MODEL_RETRIES => {
                         retry += 1;
                         let error_text = format!("{error:#}");
-                        eprintln!(
-                            "CodeCrab model request failed; retrying ({retry}/{MAX_MODEL_RETRIES}): {error_text}"
-                        );
+                        self.diagnostics.error(format!(
+                            "CodeCrab model request failed; retrying \
+({retry}/{MAX_MODEL_RETRIES}): {error_text}"
+                        ));
                         if !streamed_text
                             .lock()
                             .expect("streamed text mutex poisoned")
@@ -486,9 +494,10 @@ impl Agent {
                     }
                     Err(error) => {
                         let error_text = format!("{error:#}");
-                        eprintln!(
-                            "CodeCrab model request failed after {MAX_MODEL_RETRIES} retries: {error_text}"
-                        );
+                        self.diagnostics.error(format!(
+                            "CodeCrab model request failed after {MAX_MODEL_RETRIES} retries: \
+{error_text}"
+                        ));
                         preserve_partial_assistant(
                             &mut self.session.messages,
                             &streamed_text,
@@ -723,11 +732,11 @@ impl Agent {
             return Ok(false);
         }
         if !metadata_available && !self.reported_missing_context_metadata {
-            eprintln!(
+            self.diagnostics.warning(format!(
                 "CodeCrab context compaction is using the conservative fallback context window \
 because model {:?} publishes no context-window metadata",
                 self.session.model
-            );
+            ));
             self.reported_missing_context_metadata = true;
         }
         if !force
@@ -837,8 +846,9 @@ because model {:?} publishes no context-window metadata",
                     attempts += 1;
                     if attempts > self.compaction_tuning.maximum_summary_retries {
                         self.compaction_debounce_tokens = Some(before_tokens);
-                        eprintln!(
-                            "CodeCrab context compaction failed: the model returned no usable summary"
+                        self.diagnostics.error(
+                            "CodeCrab context compaction failed: the model returned no usable \
+summary",
                         );
                         activity.finish_compaction(
                             false,
@@ -850,10 +860,10 @@ because model {:?} publishes no context-window metadata",
                         return Ok(false);
                     }
                     let error = "the model returned no usable summary".to_owned();
-                    eprintln!(
+                    self.diagnostics.error(format!(
                         "CodeCrab context compaction failed; retrying ({attempts}/{}): {error}",
                         self.compaction_tuning.maximum_summary_retries
-                    );
+                    ));
                     let retry_sequence = self.session.reserve_event_sequence();
                     self.record_activity(
                         AgentActivity::compaction_retry(
@@ -891,18 +901,18 @@ because model {:?} publishes no context-window metadata",
                     };
                     if attempts > self.compaction_tuning.maximum_summary_retries {
                         self.compaction_debounce_tokens = Some(before_tokens);
-                        eprintln!(
+                        self.diagnostics.error(format!(
                             "CodeCrab context compaction failed after {} retries: {error_text}",
                             self.compaction_tuning.maximum_summary_retries
-                        );
+                        ));
                         activity.finish_compaction(false, before_tokens, None, Some(&error_text));
                         self.record_activity(activity, events);
                         return Ok(false);
                     }
-                    eprintln!(
+                    self.diagnostics.error(format!(
                         "CodeCrab context compaction failed; retrying ({attempts}/{}): {error_text}",
                         self.compaction_tuning.maximum_summary_retries
-                    );
+                    ));
                     let retry_sequence = self.session.reserve_event_sequence();
                     self.record_activity(
                         AgentActivity::compaction_retry(
@@ -1511,6 +1521,9 @@ mod tests {
         let store = SessionStore::new(&root).unwrap();
         let session = store.create("mock-model".into()).unwrap();
         let mut agent = Agent::new(provider, tools, SkillRegistry::default(), session).unwrap();
+        let log_path = root.join("errors.log");
+        let diagnostics = DiagnosticLog::tui(Some(log_path.clone()));
+        agent.set_diagnostics(diagnostics.clone());
         let (events, mut received) = mpsc::unbounded_channel();
         let (_cancel_tx, cancellation) = watch::channel(false);
 
@@ -1541,6 +1554,15 @@ mod tests {
         assert!(
             agent.session().activities[0]
                 .detail
+                .contains("temporary failure")
+        );
+        assert_eq!(
+            diagnostics.report().path.as_deref(),
+            Some(log_path.as_path())
+        );
+        assert!(
+            std::fs::read_to_string(log_path)
+                .unwrap()
                 .contains("temporary failure")
         );
         server.await.unwrap();

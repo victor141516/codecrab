@@ -48,6 +48,7 @@ use crate::{
         ConversationHandle, ConversationLifecycle, ConversationManager, ConversationSnapshot,
         ConversationTurn,
     },
+    diagnostics::{DebugOutput, DiagnosticLog},
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role},
     session::{
@@ -795,7 +796,8 @@ struct App {
     recording: Option<AudioRecording>,
     transcription: Option<JoinHandle<Result<String>>>,
     send_after_transcription: bool,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
+    diagnostics: DiagnosticLog,
     config: Config,
     registry: SessionRegistry,
     clipboard: Option<arboard::Clipboard>,
@@ -868,7 +870,8 @@ impl App {
         agent: Agent,
         model_catalog: Vec<ModelCatalogEntry>,
         catalog_error: Option<String>,
-        debug_openai: bool,
+        debug_openai: DebugOutput,
+        diagnostics: DiagnosticLog,
         config: Config,
         registry: SessionRegistry,
     ) -> Result<Self> {
@@ -915,6 +918,7 @@ impl App {
             transcription: None,
             send_after_transcription: false,
             debug_openai,
+            diagnostics,
             config,
             registry,
             clipboard: arboard::Clipboard::new().ok(),
@@ -1099,7 +1103,7 @@ impl App {
         self.send_after_transcription = false;
         let audio = recording.finish()?;
         self.send_after_transcription = send_after_transcription;
-        let debug_openai = self.debug_openai;
+        let debug_openai = self.debug_openai.clone();
         let config = self.config.clone();
         let provider = self.session_provider();
         self.transcription = Some(tokio::spawn(async move {
@@ -2033,13 +2037,14 @@ impl App {
         } else {
             let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
             let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
-            provider.set_debug_openai(self.debug_openai);
+            provider.set_debug_openai(self.debug_openai.clone());
             let mut agent = Agent::new(
                 provider,
                 ToolBox::new(root.clone()),
                 SkillRegistry::discover(&root),
                 session,
             )?;
+            agent.set_diagnostics(self.diagnostics.clone());
             let catalog = match agent.fetch_models().await {
                 Ok(catalog) => {
                     agent.resolve_auto_model(&catalog);
@@ -2157,13 +2162,14 @@ impl App {
             session.reasoning_effort.clone_from(&self.reasoning_effort);
             session.service_tier.clone_from(&self.service_tier);
             let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
-            provider.set_debug_openai(self.debug_openai);
-            let agent = Agent::new(
+            provider.set_debug_openai(self.debug_openai.clone());
+            let mut agent = Agent::new(
                 provider,
                 ToolBox::new(root.clone()),
                 SkillRegistry::discover(&root),
                 session,
             )?;
+            agent.set_diagnostics(self.diagnostics.clone());
             self.conversation = self.conversations.install(agent)?;
             self.model_catalogs.insert(
                 self.conversation.snapshot().session.id,
@@ -3213,10 +3219,13 @@ impl App {
 pub(crate) async fn interactive(
     mut agent: Agent,
     registry: &SessionRegistry,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
+    error_log: Option<PathBuf>,
     config: Config,
     new_session: bool,
 ) -> Result<()> {
+    let diagnostics = DiagnosticLog::tui(error_log);
+    agent.set_diagnostics(diagnostics.clone());
     let (model_catalog, catalog_error) = match agent.fetch_models().await {
         Ok(catalog) => {
             if new_session {
@@ -3255,6 +3264,7 @@ pub(crate) async fn interactive(
             model_catalog,
             catalog_error,
             debug_openai,
+            diagnostics.clone(),
             config,
             registry.clone(),
         )?,
@@ -3273,9 +3283,21 @@ pub(crate) async fn interactive(
     )?;
     terminal.show_cursor()?;
 
-    let session_id = result?;
-    println!("\x1b[2mSession saved as {session_id}\x1b[0m");
-    Ok(())
+    if let Ok(session_id) = &result {
+        println!("\x1b[2mSession saved as {session_id}\x1b[0m");
+    }
+    let report = diagnostics.report();
+    if let Some(path) = report.path {
+        println!(
+            "CodeCrab wrote error diagnostics to {}.\n\
+Use `--error-log <path>` to choose a different location.",
+            path.display()
+        );
+    }
+    if let Some(error) = report.failure {
+        eprintln!("CodeCrab could not write its TUI error log: {error}");
+    }
+    result.map(|_| ())
 }
 
 async fn run_tui(
@@ -5388,7 +5410,8 @@ mod tests {
             Agent::new(provider, tools, SkillRegistry::default(), session).unwrap(),
             Vec::new(),
             None,
-            false,
+            DebugOutput::default(),
+            DiagnosticLog::default(),
             config,
             test_registry(root),
         )

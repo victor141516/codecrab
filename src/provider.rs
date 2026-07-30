@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{
     auth::{OAuthCredentials, OAuthStore},
     config::{CatalogOptionConfig, Config, ModelCapabilitiesConfig},
+    diagnostics::DebugOutput,
     http_debug,
 };
 
@@ -345,7 +346,7 @@ pub(crate) struct OpenAiCompatible {
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
     session_id: Uuid,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
     fetch_models: bool,
     allowed_models: Option<Vec<String>>,
     model_capabilities: BTreeMap<String, ModelCapabilitiesConfig>,
@@ -407,17 +408,17 @@ impl OpenAiCompatible {
             reasoning_effort: None,
             service_tier: None,
             session_id: Uuid::new_v4(),
-            debug_openai: false,
+            debug_openai: DebugOutput::default(),
             fetch_models: provider.fetch_models,
             allowed_models: provider.allowed_models.clone(),
             model_capabilities: provider.model_capabilities.clone(),
         })
     }
 
-    pub(crate) fn set_debug_openai(&mut self, enabled: bool) {
-        self.debug_openai = enabled;
+    pub(crate) fn set_debug_openai(&mut self, output: impl Into<DebugOutput>) {
+        self.debug_openai = output.into();
         if let Backend::ChatGptSubscription { auth } = &mut self.backend {
-            auth.set_debug_openai(enabled);
+            auth.set_debug_openai(self.debug_openai.clone());
         }
     }
 
@@ -453,7 +454,7 @@ impl OpenAiCompatible {
                     let response = self
                         .send_models_request(&url, api_key.as_deref(), None)
                         .await?;
-                    parse_models_response(response, false, self.debug_openai).await?
+                    parse_models_response(response, false, &self.debug_openai).await?
                 }
                 Backend::ChatGptSubscription { auth } => {
                     let url = format!("{CHATGPT_CODEX_BASE}/models");
@@ -466,8 +467,13 @@ impl OpenAiCompatible {
                         )
                         .await?;
                     if response.status() == StatusCode::UNAUTHORIZED {
-                        if self.debug_openai {
-                            log_discarded_response(response, Duration::from_secs(8)).await?;
+                        if self.debug_openai.is_enabled() {
+                            log_discarded_response(
+                                response,
+                                Duration::from_secs(8),
+                                &self.debug_openai,
+                            )
+                            .await?;
                         }
                         let credentials = auth.refresh_credentials().await?;
                         response = self
@@ -478,7 +484,7 @@ impl OpenAiCompatible {
                             )
                             .await?;
                     }
-                    parse_models_response(response, true, self.debug_openai).await?
+                    parse_models_response(response, true, &self.debug_openai).await?
                 }
             }
         };
@@ -519,7 +525,7 @@ impl OpenAiCompatible {
         let request = request
             .build()
             .context("cannot build model catalog request")?;
-        http_debug::request(self.debug_openai, &request);
+        http_debug::request(&self.debug_openai, &request)?;
         self.client
             .execute(request)
             .await
@@ -599,7 +605,7 @@ impl OpenAiCompatible {
             request = request.bearer_auth(api_key);
         }
         let request = request.build().context("cannot build model request")?;
-        http_debug::request(self.debug_openai, &request);
+        http_debug::request(&self.debug_openai, &request)?;
         let response = self.execute_model_request(request, "model request").await?;
         let status = response.status();
         let version = response.version();
@@ -607,12 +613,12 @@ impl OpenAiCompatible {
         let headers = response.headers().clone();
         if !status.is_success() {
             let body = read_response_body(response, self.stream_idle_timeout).await?;
-            http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+            http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
             anyhow::bail!("model returned {status}: {}", compact_error(&body));
         }
         if !is_event_stream(&headers) {
             let body = read_response_body(response, self.stream_idle_timeout).await?;
-            http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+            http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
             let parsed: ChatResponse =
                 serde_json::from_str(&body).context("model returned an invalid response")?;
             let message = parsed
@@ -635,7 +641,7 @@ impl OpenAiCompatible {
             stream.push(data, on_text_delta)
         })
         .await?;
-        http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+        http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
         stream.finish()
     }
 
@@ -659,8 +665,9 @@ impl OpenAiCompatible {
         let credentials = auth.credentials().await?;
         let mut response = self.send_subscription(&credentials, &payload).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            if self.debug_openai {
-                log_discarded_response(response, self.stream_idle_timeout).await?;
+            if self.debug_openai.is_enabled() {
+                log_discarded_response(response, self.stream_idle_timeout, &self.debug_openai)
+                    .await?;
             }
             let credentials = auth.refresh_credentials().await?;
             response = self.send_subscription(&credentials, &payload).await?;
@@ -671,7 +678,7 @@ impl OpenAiCompatible {
         let headers = response.headers().clone();
         if !status.is_success() {
             let body = read_response_body(response, self.stream_idle_timeout).await?;
-            http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+            http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
             anyhow::bail!(
                 "ChatGPT subscription returned {status}: {}",
                 compact_error(&body)
@@ -682,7 +689,7 @@ impl OpenAiCompatible {
             stream.push(data, on_text_delta)
         })
         .await?;
-        http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+        http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
         stream.finish()
     }
 
@@ -711,7 +718,7 @@ impl OpenAiCompatible {
             .json(payload)
             .build()
             .context("cannot build ChatGPT subscription request")?;
-        http_debug::request(self.debug_openai, &request);
+        http_debug::request(&self.debug_openai, &request)?;
         self.execute_model_request(request, "ChatGPT subscription request")
             .await
     }
@@ -731,14 +738,17 @@ impl OpenAiCompatible {
     }
 }
 
-async fn log_discarded_response(response: Response, idle_timeout: Duration) -> Result<()> {
+async fn log_discarded_response(
+    response: Response,
+    idle_timeout: Duration,
+    debug_output: &DebugOutput,
+) -> Result<()> {
     let status = response.status();
     let version = response.version();
     let url = response.url().clone();
     let headers = response.headers().clone();
     let body = read_response_body(response, idle_timeout).await?;
-    http_debug::response(true, &url, version, status, &headers, &body);
-    Ok(())
+    http_debug::response(debug_output, &url, version, status, &headers, &body)
 }
 
 fn responses_payload(
@@ -1020,14 +1030,14 @@ fn validate_configured_defaults(
 async fn parse_models_response(
     response: Response,
     chatgpt_mode: bool,
-    debug_openai: bool,
+    debug_openai: &DebugOutput,
 ) -> Result<Vec<ModelCatalogEntry>> {
     let status = response.status();
     let version = response.version();
     let url = response.url().clone();
     let headers = response.headers().clone();
     let body = response.text().await?;
-    http_debug::response(debug_openai, &url, version, status, &headers, &body);
+    http_debug::response(debug_openai, &url, version, status, &headers, &body)?;
     if !status.is_success() {
         anyhow::bail!("model catalog returned {status}: {}", compact_error(&body));
     }

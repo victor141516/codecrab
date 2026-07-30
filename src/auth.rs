@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::{
     config::{ChatGptOAuthConfig, ConfigStore},
+    diagnostics::DebugOutput,
     http_debug,
 };
 
@@ -54,7 +55,7 @@ struct TokenClaims {
 
 pub(crate) struct OAuthStore {
     client: Client,
-    debug_openai: bool,
+    debug_openai: DebugOutput,
     store: ConfigStore,
 }
 
@@ -66,13 +67,13 @@ impl OAuthStore {
     fn with_store(store: ConfigStore) -> Result<Self> {
         Ok(Self {
             client: Client::builder().timeout(Duration::from_secs(60)).build()?,
-            debug_openai: false,
+            debug_openai: DebugOutput::default(),
             store,
         })
     }
 
-    pub(crate) fn set_debug_openai(&mut self, enabled: bool) {
-        self.debug_openai = enabled;
+    pub(crate) fn set_debug_openai(&mut self, output: impl Into<DebugOutput>) {
+        self.debug_openai = output.into();
     }
 
     pub(crate) fn is_logged_in(&self) -> bool {
@@ -161,7 +162,7 @@ impl OAuthStore {
             ])
             .build()
             .context("cannot build ChatGPT refresh request")?;
-        http_debug::request(self.debug_openai, &request);
+        http_debug::request(&self.debug_openai, &request)?;
         let response = self
             .client
             .execute(request)
@@ -172,7 +173,7 @@ impl OAuthStore {
         let url = response.url().clone();
         let headers = response.headers().clone();
         let body = response.text().await?;
-        http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+        http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
         if !status.is_success() {
             anyhow::bail!(
                 "ChatGPT login refresh failed ({status}); run `codecrab auth login` again"
@@ -208,7 +209,7 @@ impl OAuthStore {
             ])
             .build()
             .context("cannot build ChatGPT token exchange request")?;
-        http_debug::request(self.debug_openai, &request);
+        http_debug::request(&self.debug_openai, &request)?;
         let response = self
             .client
             .execute(request)
@@ -219,7 +220,7 @@ impl OAuthStore {
         let url = response.url().clone();
         let headers = response.headers().clone();
         let body = response.text().await?;
-        http_debug::response(self.debug_openai, &url, version, status, &headers, &body);
+        http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
         if !status.is_success() {
             anyhow::bail!("ChatGPT token exchange failed ({status})");
         }
