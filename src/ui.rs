@@ -2075,8 +2075,9 @@ impl App {
                 ToolBox::with_shell(root.clone(), self.config.shell.clone()),
                 SkillRegistry::discover(&root),
                 session,
+                default_instructions_path(&root)?,
+                self.diagnostics.clone(),
             )?;
-            agent.set_diagnostics(self.diagnostics.clone());
             let catalog = match agent.fetch_models().await {
                 Ok(catalog) => {
                     agent.resolve_auto_model(&catalog);
@@ -2195,13 +2196,14 @@ impl App {
             session.service_tier.clone_from(&self.service_tier);
             let mut provider = OpenAiCompatible::new(&self.config, &session.provider)?;
             provider.set_debug_openai(self.debug_openai.clone());
-            let mut agent = Agent::new(
+            let agent = Agent::new(
                 provider,
                 ToolBox::with_shell(root.clone(), self.config.shell.clone()),
                 SkillRegistry::discover(&root),
                 session,
+                default_instructions_path(&root)?,
+                self.diagnostics.clone(),
             )?;
-            agent.set_diagnostics(self.diagnostics.clone());
             self.conversation = self.conversations.install(agent)?;
             self.model_catalogs.insert(
                 self.conversation.snapshot().session.id,
@@ -3252,12 +3254,10 @@ pub(crate) async fn interactive(
     mut agent: Agent,
     registry: &SessionRegistry,
     debug_openai: DebugOutput,
-    error_log: Option<PathBuf>,
+    diagnostics: DiagnosticLog,
     config: Config,
     new_session: bool,
 ) -> Result<()> {
-    let diagnostics = DiagnosticLog::tui(error_log);
-    agent.set_diagnostics(diagnostics.clone());
     let (model_catalog, catalog_error) = match agent.fetch_models().await {
         Ok(catalog) => {
             if new_session {
@@ -3330,6 +3330,16 @@ Use `--error-log <path>` to choose a different location.",
         eprintln!("CodeCrab could not write its TUI error log: {error}");
     }
     result.map(|_| ())
+}
+
+#[cfg(not(test))]
+fn default_instructions_path(_root: &Path) -> Result<PathBuf> {
+    Config::instructions_path()
+}
+
+#[cfg(test)]
+fn default_instructions_path(root: &Path) -> Result<PathBuf> {
+    Ok(root.join(".test-global-config").join("AGENTS.md"))
 }
 
 async fn run_tui(
@@ -5439,7 +5449,15 @@ mod tests {
         let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.to_path_buf());
         App::new(
-            Agent::new(provider, tools, SkillRegistry::default(), session).unwrap(),
+            Agent::new(
+                provider,
+                tools,
+                SkillRegistry::default(),
+                session,
+                root.join(".test-global-config").join("AGENTS.md"),
+                DiagnosticLog::default(),
+            )
+            .unwrap(),
             Vec::new(),
             None,
             DebugOutput::default(),

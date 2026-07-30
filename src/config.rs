@@ -180,6 +180,10 @@ impl Config {
         Ok(global_data_dir()?.join("config.toml"))
     }
 
+    pub(crate) fn instructions_path() -> Result<PathBuf> {
+        Ok(global_data_dir()?.join("AGENTS.md"))
+    }
+
     pub(crate) fn load() -> Result<Self> {
         let path = Self::file_path()?;
         let mut config = if path.exists() {
@@ -647,6 +651,17 @@ mod tests {
         assert_eq!(
             global_data_dir_from_home(Some(home)).unwrap(),
             home.join(".config").join("codecrab")
+        );
+    }
+
+    #[test]
+    fn global_instructions_live_beside_the_config_file() {
+        let data_dir = global_data_dir().unwrap();
+
+        assert_eq!(Config::file_path().unwrap(), data_dir.join("config.toml"));
+        assert_eq!(
+            Config::instructions_path().unwrap(),
+            data_dir.join("AGENTS.md")
         );
     }
 

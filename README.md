@@ -43,7 +43,8 @@ terminal interface and an optional embedded web application.
   filesystem root.
 - Agent Skills support with `SKILL.md`, explicit `/skill-name` invocation, and
   description-based model selection.
-- Complete project instructions from `AGENTS.md` in the selected project root.
+- Personal instructions from `~/.config/codecrab/AGENTS.md` plus complete
+  project instructions from `AGENTS.md` in the selected project root.
 - One-shot/pipe-friendly operation with `codecrab run`.
 - OpenAI-compatible Chat Completions providers.
 - Browser login with a ChatGPT Plus/Pro subscription—no API key or separate API
@@ -463,10 +464,25 @@ visually distinct.
 
 ## Agent Skills
 
-When a conversation starts, CodeCrab reads `AGENTS.md` from the selected
-project root and includes its complete contents in the system prompt. If the
-file does not exist, startup continues without project-specific instructions.
-Read errors are reported instead of silently ignoring the file.
+When a conversation starts, CodeCrab reads personal instructions from
+`~/.config/codecrab/AGENTS.md` and project instructions from `AGENTS.md` in
+the selected project root. The personal file is optional: missing,
+non-regular, and whitespace-only candidates are ignored, while read errors are
+reported without preventing the project instructions or conversation from
+loading. Project-file read errors remain startup errors.
+
+When both files exist, CodeCrab sends them as one contextual user message,
+with the trimmed personal contents first, then
+`--- project-doc ---`, then the complete project file. If both paths resolve
+to the same file, it is included only once. This contextual message precedes
+the visible conversation but is never rendered or persisted as a
+user-authored message; the stable CodeCrab policy remains the provider system
+instruction. Normal requests, token estimation, and compaction all use this
+same projection.
+
+Instructions are snapshotted when an agent is constructed. Editing either
+file affects new conversations, cold-resumed sessions, and project switches,
+but does not change an already-running agent.
 
 The stable system policy asks the model to answer in the language of the
 latest user message and to provide brief progress updates around meaningful
