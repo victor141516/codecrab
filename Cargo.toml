@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -17,6 +18,7 @@ cpal = "0.16"
 crossterm = "0.29"
 directories = "6"
 rand = "0.9"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 rpassword = "7"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }

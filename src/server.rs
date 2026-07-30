@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
-    future::{Future, IntoFuture},
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     ops::Deref,
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -20,11 +21,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
+use axum_server::{Handle, tls_rustls::RustlsConfig};
+use rcgen::{CertificateParams, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -57,13 +60,26 @@ const INDEX_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/index.ht
 const APP_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/app.js"));
 const APP_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/app.css"));
 const SHUTDOWN_WARNING_DELAY: Duration = Duration::from_millis(100);
-const SHUTDOWN_WAITING_MESSAGE: &str = "CodeCrab is still shutting down because active HTTP \
+const SHUTDOWN_WAITING_MESSAGE: &str = "CodeCrab is still shutting down because active HTTP/HTTPS \
 requests or open connections have not finished. Press Ctrl+C again to force exit.";
 
 #[derive(Debug, Eq, PartialEq)]
 enum ShutdownOutcome {
     Graceful,
     Forced,
+}
+
+struct TlsMaterial {
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct BoundListeners {
+    http: StdTcpListener,
+    https: StdTcpListener,
+    http_address: SocketAddr,
+    https_address: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -300,6 +316,7 @@ pub(crate) async fn serve(
     config: Config,
     host: String,
     port: u16,
+    https_port: u16,
     debug_openai: DebugOutput,
 ) -> Result<()> {
     let store = SessionStore::new(&root)?;
@@ -351,7 +368,45 @@ pub(crate) async fn serve(
             )])),
         }),
     };
-    let app = Router::new()
+    let app = server_app(state.clone());
+
+    let tls_config = tls_config(generate_tls_material(&host)?).await?;
+    let listeners = bind_listeners(&host, port, https_port).await?;
+    let http_origin = display_origin("http", listeners.http_address);
+    let https_origin = display_origin("https", listeners.https_address);
+    println!("HTTP API: {http_origin}/api");
+    println!("HTTP Web: {http_origin}/");
+    println!("HTTPS API: {https_origin}/api");
+    println!("HTTPS Web: {https_origin}/");
+
+    let outcome = serve_until_shutdown(
+        listeners,
+        tls_config,
+        app,
+        shutdown_signal(),
+        shutdown_signal(),
+    )
+    .await?;
+    if outcome == ShutdownOutcome::Forced {
+        eprintln!("Forcing CodeCrab to exit immediately.");
+        std::process::exit(130);
+    }
+    state.inner.conversations.cancel_all();
+    while state
+        .inner
+        .conversations
+        .statuses()
+        .iter()
+        .any(|status| status.lifecycle == crate::conversation::ConversationLifecycle::Running)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    state.inner.conversations.shutdown_all().await?;
+    Ok(())
+}
+
+fn server_app(state: ServerState) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/app.js", get(javascript))
         .route("/app.css", get(stylesheet))
@@ -389,37 +444,85 @@ pub(crate) async fn serve(
                 .fallback(api_not_found),
         )
         .fallback(index)
-        .with_state(state.clone());
+        .with_state(state)
+}
 
-    let listener = TcpListener::bind((host.as_str(), port))
-        .await
-        .with_context(|| format!("cannot bind web server to {host}:{port}"))?;
-    let address = listener.local_addr()?;
-    let display_host = match address.ip() {
-        ip if ip.is_unspecified() => "127.0.0.1".to_owned(),
-        ip => ip.to_string(),
+fn tls_certificate_params(host: &str) -> Result<CertificateParams> {
+    CertificateParams::new(tls_subject_alt_names(host))
+        .context("cannot configure self-signed HTTPS certificate")
+}
+
+fn tls_subject_alt_names(host: &str) -> Vec<String> {
+    let mut names = vec![
+        "localhost".to_owned(),
+        Ipv4Addr::LOCALHOST.to_string(),
+        Ipv6Addr::LOCALHOST.to_string(),
+    ];
+    let configured = host
+        .trim()
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host.trim());
+    let meaningful = match configured.parse::<IpAddr>() {
+        Ok(ip) => !ip.is_unspecified(),
+        Err(_) => !configured.is_empty() && configured != "*",
     };
-    let origin = format!("http://{display_host}:{}", address.port());
-    println!("API: {origin}/api");
-    println!("Web: {origin}/");
+    if meaningful && !names.iter().any(|name| name == configured) {
+        names.push(configured.to_owned());
+    }
+    names
+}
 
-    let outcome = serve_until_shutdown(listener, app, shutdown_signal(), shutdown_signal()).await?;
-    if outcome == ShutdownOutcome::Forced {
-        eprintln!("Forcing CodeCrab to exit immediately.");
-        std::process::exit(130);
-    }
-    state.inner.conversations.cancel_all();
-    while state
-        .inner
-        .conversations
-        .statuses()
-        .iter()
-        .any(|status| status.lifecycle == crate::conversation::ConversationLifecycle::Running)
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    state.inner.conversations.shutdown_all().await?;
-    Ok(())
+fn generate_tls_material(host: &str) -> Result<TlsMaterial> {
+    let params = tls_certificate_params(host)?;
+    let key_pair = KeyPair::generate().context("cannot generate HTTPS private key")?;
+    let certificate = params
+        .self_signed(&key_pair)
+        .context("cannot generate self-signed HTTPS certificate")?;
+    Ok(TlsMaterial {
+        certificate_der: certificate.der().to_vec(),
+        private_key_der: key_pair.serialize_der(),
+    })
+}
+
+async fn tls_config(material: TlsMaterial) -> Result<RustlsConfig> {
+    RustlsConfig::from_der(vec![material.certificate_der], material.private_key_der)
+        .await
+        .context("cannot configure HTTPS TLS")
+}
+
+async fn bind_listeners(host: &str, port: u16, https_port: u16) -> Result<BoundListeners> {
+    let http = TcpListener::bind((host, port))
+        .await
+        .with_context(|| format!("cannot bind HTTP web server to {host}:{port}"))?;
+    let http_address = http
+        .local_addr()
+        .context("cannot read bound HTTP web server address")?;
+    let https = TcpListener::bind((host, https_port))
+        .await
+        .with_context(|| format!("cannot bind HTTPS web server to {host}:{https_port}"))?;
+    let https_address = https
+        .local_addr()
+        .context("cannot read bound HTTPS web server address")?;
+    Ok(BoundListeners {
+        http: http
+            .into_std()
+            .context("cannot prepare HTTP web server listener")?,
+        https: https
+            .into_std()
+            .context("cannot prepare HTTPS web server listener")?,
+        http_address,
+        https_address,
+    })
+}
+
+fn display_origin(scheme: &str, address: SocketAddr) -> String {
+    let ip = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("{scheme}://{}", SocketAddr::new(ip, address.port()))
 }
 
 #[cfg(test)]
@@ -1480,7 +1583,8 @@ impl IntoResponse for ApiError {
 }
 
 async fn serve_until_shutdown<F, S>(
-    listener: TcpListener,
+    listeners: BoundListeners,
+    tls_config: RustlsConfig,
     app: Router,
     shutdown: F,
     force_shutdown: S,
@@ -1489,33 +1593,47 @@ where
     F: Future<Output = Result<()>>,
     S: Future<Output = Result<()>>,
 {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .into_future();
-    tokio::pin!(server);
+    let http_handle = Handle::new();
+    let https_handle = Handle::new();
+    let http_server = axum_server::from_tcp(listeners.http)
+        .context("cannot configure HTTP web server")?
+        .handle(http_handle.clone())
+        .serve(app.clone().into_make_service());
+    let https_server = axum_server::from_tcp_rustls(listeners.https, tls_config)
+        .context("cannot configure HTTPS web server")?
+        .handle(https_handle.clone())
+        .serve(app.into_make_service());
+    let servers = async {
+        tokio::try_join!(
+            async { http_server.await.context("HTTP web server failed") },
+            async { https_server.await.context("HTTPS web server failed") },
+        )?;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::pin!(servers);
     tokio::pin!(force_shutdown);
 
     tokio::select! {
-        result = server.as_mut() => {
-            result.context("web server failed")?;
+        result = servers.as_mut() => {
+            result?;
             return Ok(ShutdownOutcome::Graceful);
         },
         signal = shutdown => signal?,
     }
 
-    let _ = shutdown_tx.send(());
+    http_handle.graceful_shutdown(None);
+    https_handle.graceful_shutdown(None);
     let warning_delay = tokio::time::sleep(SHUTDOWN_WARNING_DELAY);
     tokio::pin!(warning_delay);
     tokio::select! {
-        result = server.as_mut() => {
-            result.context("web server failed")?;
+        result = servers.as_mut() => {
+            result?;
             return Ok(ShutdownOutcome::Graceful);
         },
         signal = force_shutdown.as_mut() => {
             signal?;
+            http_handle.shutdown();
+            https_handle.shutdown();
             return Ok(ShutdownOutcome::Forced);
         },
         () = warning_delay.as_mut() => {}
@@ -1523,12 +1641,14 @@ where
 
     eprintln!("{SHUTDOWN_WAITING_MESSAGE}");
     tokio::select! {
-        result = server.as_mut() => {
-            result.context("web server failed")?;
+        result = servers.as_mut() => {
+            result?;
             Ok(ShutdownOutcome::Graceful)
         },
         signal = force_shutdown.as_mut() => {
             signal?;
+            http_handle.shutdown();
+            https_handle.shutdown();
             Ok(ShutdownOutcome::Forced)
         },
     }
@@ -1547,10 +1667,11 @@ mod tests {
         config::paths_equal,
         events::{ActivityKind, ActivityStatus},
     };
+    use rcgen::SanType;
     use tokio::{
         io::AsyncWriteExt,
         net::{TcpListener, TcpStream},
-        sync::{Barrier, Notify},
+        sync::{Barrier, Notify, oneshot},
     };
 
     fn test_conversation(agent: Agent) -> ConversationHandle {
@@ -1630,6 +1751,207 @@ mod tests {
         assert!(INDEX_HTML.starts_with(b"<!doctype html>"));
         assert!(APP_JS.len() > 1_000);
         assert!(APP_CSS.len() > 1_000);
+    }
+
+    #[test]
+    fn https_certificate_parameters_include_local_and_configured_sans() {
+        let params = tls_certificate_params("codecrab.local").unwrap();
+        assert!(
+            params
+                .subject_alt_names
+                .iter()
+                .any(|san| matches!(san, SanType::DnsName(name) if name.as_str() == "localhost"))
+        );
+        assert!(
+            params.subject_alt_names.iter().any(
+                |san| matches!(san, SanType::DnsName(name) if name.as_str() == "codecrab.local")
+            )
+        );
+        assert!(params.subject_alt_names.iter().any(
+            |san| matches!(san, SanType::IpAddress(ip) if *ip == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        ));
+        assert!(params.subject_alt_names.iter().any(
+            |san| matches!(san, SanType::IpAddress(ip) if *ip == IpAddr::V6(Ipv6Addr::LOCALHOST))
+        ));
+
+        let concrete_ip = "192.0.2.10".parse::<IpAddr>().unwrap();
+        let params = tls_certificate_params(&concrete_ip.to_string()).unwrap();
+        assert!(
+            params
+                .subject_alt_names
+                .contains(&SanType::IpAddress(concrete_ip))
+        );
+        assert!(!tls_subject_alt_names("0.0.0.0").contains(&"0.0.0.0".to_owned()));
+        assert!(!tls_subject_alt_names("::").contains(&"::".to_owned()));
+    }
+
+    #[test]
+    fn https_certificate_and_key_are_regenerated_ephemerally() {
+        let first = generate_tls_material("127.0.0.1").unwrap();
+        let second = generate_tls_material("127.0.0.1").unwrap();
+
+        assert!(!first.certificate_der.is_empty());
+        assert!(!first.private_key_der.is_empty());
+        assert_ne!(first.certificate_der, second.certificate_der);
+        assert_ne!(first.private_key_der, second.private_key_der);
+    }
+
+    #[tokio::test]
+    async fn invalid_tls_material_reports_a_contextual_setup_error() {
+        let error = tls_config(TlsMaterial {
+            certificate_der: vec![0],
+            private_key_der: vec![0],
+        })
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("cannot configure HTTPS TLS"));
+    }
+
+    #[tokio::test]
+    async fn https_bind_failure_drops_the_already_bound_http_listener() {
+        let unavailable_https = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let https_port = unavailable_https.local_addr().unwrap().port();
+        let available_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = available_http.local_addr().unwrap().port();
+        drop(available_http);
+
+        let error = bind_listeners("127.0.0.1", http_port, https_port)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(&format!(
+            "cannot bind HTTPS web server to 127.0.0.1:{https_port}"
+        )));
+
+        TcpListener::bind(("127.0.0.1", http_port))
+            .await
+            .expect("the HTTP listener must be dropped when HTTPS binding fails");
+    }
+
+    #[tokio::test]
+    async fn http_and_https_serve_the_same_frontend_api_and_state() {
+        let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider_address = provider_listener.local_addr().unwrap();
+        let provider_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = provider_listener.accept().await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
+                let body = json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Finished over both schemes."
+                        }
+                    }]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("model", format!("http://{provider_address}/v1"));
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "model".into())
+            .unwrap();
+        let session_id = session.id;
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = test_state(config, root, test_conversation(agent), false);
+        let app = server_app(state);
+        let listeners = bind_listeners("127.0.0.1", 0, 0).await.unwrap();
+        let http_origin = display_origin("http", listeners.http_address);
+        let https_origin = display_origin("https", listeners.https_address);
+        let config = tls_config(generate_tls_material("127.0.0.1").unwrap())
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (_force_tx, force_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until_shutdown(
+            listeners,
+            config,
+            app,
+            async move {
+                shutdown_rx.await.unwrap();
+                Ok(())
+            },
+            async move {
+                force_rx.await.unwrap();
+                Ok(())
+            },
+        ));
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .build()
+            .unwrap();
+
+        for origin in [&http_origin, &https_origin] {
+            let frontend = client.get(format!("{origin}/")).send().await.unwrap();
+            assert!(frontend.status().is_success());
+            assert!(
+                frontend
+                    .text()
+                    .await
+                    .unwrap()
+                    .starts_with("<!doctype html>")
+            );
+
+            let health = client
+                .get(format!("{origin}/api/health"))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap();
+            assert_eq!(health["ok"], true);
+
+            let state = client
+                .get(format!("{origin}/api/state"))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap();
+            assert_eq!(state["session"]["id"], json!(session_id));
+
+            let chat = client
+                .post(format!("{origin}/api/chat"))
+                .json(&json!({
+                    "session_id": session_id,
+                    "prompt": format!("Reply through {origin}"),
+                    "continuation": false,
+                    "edit_node_id": null
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                chat.headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/x-ndjson; charset=utf-8")
+            );
+            let stream = chat.text().await.unwrap();
+            assert!(stream.contains("Finished over both schemes."));
+            assert!(stream.contains("\"type\":\"done\""));
+        }
+
+        shutdown_tx.send(()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("both listeners did not stop gracefully")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, ShutdownOutcome::Graceful);
+        provider_server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1854,12 +2176,16 @@ mod tests {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let listeners = bind_listeners("127.0.0.1", 0, 0).await.unwrap();
+        let address = listeners.http_address;
+        let config = tls_config(generate_tls_material("127.0.0.1").unwrap())
+            .await
+            .unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (force_tx, force_rx) = oneshot::channel();
         let mut server = tokio::spawn(serve_until_shutdown(
-            listener,
+            listeners,
+            config,
             app,
             async move {
                 shutdown_rx.await.unwrap();
@@ -1891,7 +2217,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome, ShutdownOutcome::Forced);
-        assert!(SHUTDOWN_WAITING_MESSAGE.contains("active HTTP requests"));
+        assert!(SHUTDOWN_WAITING_MESSAGE.contains("active HTTP/HTTPS requests"));
         assert!(SHUTDOWN_WAITING_MESSAGE.contains("Ctrl+C again"));
     }
 
