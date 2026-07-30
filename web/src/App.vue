@@ -2535,7 +2535,7 @@ onBeforeUnmount(() => {
           <Settings class="size-4 text-cyan-300" aria-hidden="true" />
           <div class="flex-1">
             <h2 class="text-sm font-semibold text-zinc-100">Providers</h2>
-            <p class="mt-0.5 text-[10px] text-zinc-600">API keys are saved in the platform configuration file.</p>
+            <p class="mt-0.5 text-[10px] text-zinc-600">API keys are saved in ~/.config/codecrab/config.toml.</p>
           </div>
           <button class="rounded-md px-3 py-1.5 text-xs text-cyan-300 hover:bg-cyan-400/10" @click="editProvider()">Add</button>
           <button class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-white/5 hover:text-zinc-200" @click="providersOpen = false"><X class="size-4" /></button>

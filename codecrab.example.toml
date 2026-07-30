@@ -1,7 +1,4 @@
-# Copy to the platform config directory:
-#   Windows: %APPDATA%\codecrab\config\config.toml
-#   Linux:   ~/.config/codecrab/config.toml
-#   macOS:   ~/Library/Application Support/codecrab/config.toml
+# Copy to ~/.config/codecrab/config.toml on every supported platform.
 #
 # API keys and ChatGPT OAuth tokens are stored as plain text in this file.
 # Protect it with the normal permissions of your operating-system account.

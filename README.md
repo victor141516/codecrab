@@ -50,7 +50,8 @@ terminal interface and an optional embedded web application.
   billing required.
 - Voice dictation through the signed-in ChatGPT subscription in terminal and
   web composers; transcripts are inserted for review instead of auto-sent.
-- OAuth PKCE, automatic token refresh, and platform-global TOML persistence.
+- OAuth PKCE, automatic token refresh, and global TOML persistence under
+  `~/.config/codecrab/`.
 - Model tools for listing, reading, searching, writing, exact editing, and shell
   commands.
 - Relative, parent, and absolute paths across the filesystem.
@@ -517,8 +518,9 @@ skipped and reported by `codecrab skills`.
 
 ## Configuration
 
-See [`codecrab.example.toml`](codecrab.example.toml). The config directory is
-platform-specific and can be located from the comment at the top of that file.
+See [`codecrab.example.toml`](codecrab.example.toml). On every supported
+platform, the global configuration file is
+`~/.config/codecrab/config.toml`, resolved from the user's home directory.
 
 Environment variables override the file:
 
@@ -532,7 +534,7 @@ Environment variables override the file:
 | `CODECRAB_SKILLS_DIR` | Extra skill directories, separated like `PATH` |
 
 CLI `--model` and `--base-url` flags have the highest priority. Run
-`codecrab config` to print two clearly labelled sections: the platform-global
+`codecrab config` to print two clearly labelled sections: the global
 configuration file path and the effective non-secret configuration content.
 
 ### Manual model catalogs and capabilities
@@ -693,7 +695,7 @@ codecrab auth logout
 
 `auth login` opens OpenAI's browser authorization flow. CodeCrab uses OAuth
 PKCE and stores the access token, refresh token, and metadata as plain text
-under `[chatgpt_oauth]` in the platform-global `config.toml`. Protect that file
+under `[chatgpt_oauth]` in `~/.config/codecrab/config.toml`. Protect that file
 with the normal permissions of your operating-system account. Tokens are never
 written inside the project.
 
@@ -710,7 +712,7 @@ is selected.
 
 Provider profiles keep their model, OpenAI-compatible base URL, authentication
 mode, and API key together. API keys are deliberately stored as plain text in
-the platform-global `config.toml`; protect that file using the normal
+`~/.config/codecrab/config.toml`; protect that file using the normal
 permissions of your operating-system account. Keys are never copied into
 sessions or returned by `codecrab config`, provider listings, or the web API.
 
@@ -748,7 +750,7 @@ Reads, writes, edits, and shell commands run immediately without confirmation
 in terminal, one-shot, resume, and web modes.
 
 OAuth tokens and provider API keys are stored as plain text in the
-platform-global `config.toml`. `codecrab auth logout` removes the
+`~/.config/codecrab/config.toml`. `codecrab auth logout` removes the
 `[chatgpt_oauth]` section only; it does not sign the official Codex CLI out.
 
 CodeCrab does not sandbox or impose a filesystem boundary on the agent. Its
@@ -768,10 +770,10 @@ so a non-OpenAI profile can never send audio or credentials to OpenAI.
 
 Sessions live under `.codecrab/sessions/` in each project and are ignored by
 the included `.gitignore`. CodeCrab maintains `session_directories` in the
-platform-global `config.toml`, which lets terminal commands, `/sessions`, and
-the web sidebar discover every opened project, including empty ones. Projects
-are registered when opened or when a session is saved and remain registered
-until the field is edited manually.
+global `~/.config/codecrab/config.toml`, which lets terminal commands,
+`/sessions`, and the web sidebar discover every opened project, including empty
+ones. Projects are registered when opened or when a session is saved and
+remain registered until the field is edited manually.
 
 Each session persists one conversation tree with stable node and parent IDs,
 plus the selected leaf. The ordinary `messages` field returned by the web API
