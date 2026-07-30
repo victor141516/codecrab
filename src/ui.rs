@@ -72,6 +72,7 @@ const MARKDOWN_CODE: Color = Color::Rgb(126, 216, 160);
 const MARKDOWN_LIST: Color = Color::Rgb(244, 99, 86);
 const MARKDOWN_LINK: Color = Color::Rgb(100, 180, 255);
 const MARKDOWN_FENCE: Color = Color::Rgb(105, 115, 130);
+const USER_MESSAGE_BG: Color = Color::Rgb(13, 31, 49);
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const WAVEFORM: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 struct SkillView {
@@ -176,6 +177,7 @@ struct TurnToggleTarget {
 
 struct ConversationSource {
     lines: Vec<Line<'static>>,
+    user_lines: HashSet<usize>,
     copy_targets: Vec<CopyTarget>,
     turn_toggles: Vec<TurnToggleTarget>,
     node_lines: Vec<(Uuid, usize)>,
@@ -195,6 +197,7 @@ struct VisualUnit {
 struct VisualRow {
     source_line: usize,
     units: Vec<VisualUnit>,
+    user_message: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2169,9 +2172,6 @@ impl App {
             self.sync_active_session();
         }
 
-        if store.list()?.is_empty() {
-            self.registry.unregister(&root)?;
-        }
         let projects = list_session_projects(&self.project_root, &self.registry)?;
         let expanded = self
             .session_picker
@@ -3669,7 +3669,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     });
 
     let source = conversation_source(app);
-    let rows = wrap_conversation_lines(&source.lines, inner.width.max(1));
+    let rows = wrap_conversation_lines(&source.lines, &source.user_lines, inner.width.max(1));
     if let Some(anchor) = app.pending_turn_anchor.take()
         && let Some(summary_line) = source
             .turn_toggles
@@ -3700,11 +3700,22 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         app.scroll = app.scroll.min(app.max_scroll);
     }
-    let visible = rows
+    let visible_rows = rows
         .iter()
         .enumerate()
         .skip(app.scroll as usize)
         .take(inner.height as usize)
+        .collect::<Vec<_>>();
+    for (viewport_row, (_, row)) in visible_rows.iter().enumerate() {
+        if row.user_message {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(USER_MESSAGE_BG)),
+                Rect::new(inner.x, inner.y + viewport_row as u16, inner.width, 1),
+            );
+        }
+    }
+    let visible = visible_rows
+        .into_iter()
         .map(|(row_index, row)| visual_row_line(app, row_index, row))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(visible), inner);
@@ -3725,6 +3736,7 @@ fn conversation_lines(app: &App) -> Vec<Line<'static>> {
 fn conversation_source(app: &App) -> ConversationSource {
     let mut source = ConversationSource {
         lines: Vec::new(),
+        user_lines: HashSet::new(),
         copy_targets: Vec::new(),
         turn_toggles: Vec::new(),
         node_lines: Vec::new(),
@@ -3748,8 +3760,7 @@ fn conversation_source(app: &App) -> ConversationSource {
             if let Some(node_id) = app.transcript_node_ids.get(message_index).copied() {
                 source.node_lines.push((node_id, source.lines.len()));
             }
-            push_actor_label(&mut source, "USER", AQUA);
-            push_message_lines(&mut source, content, true, None);
+            push_user_message(&mut source, content);
             source.lines.push(Line::default());
         }
 
@@ -3768,8 +3779,7 @@ fn conversation_source(app: &App) -> ConversationSource {
     }
 
     if let Some(content) = &app.pending_user {
-        push_actor_label(&mut source, "USER", AQUA);
-        push_message_lines(&mut source, content, true, None);
+        push_user_message(&mut source, content);
         source.lines.push(Line::default());
         let turn_message_index = app.transcript.len();
         if turn_has_visible_content(app, turn_message_index, &app.live_messages) {
@@ -3981,6 +3991,19 @@ fn push_actor_label(source: &mut ConversationSource, label: &str, color: Color) 
             .bg(color)
             .add_modifier(Modifier::BOLD),
     )));
+}
+
+fn push_user_message(source: &mut ConversationSource, content: &str) {
+    let first_line = source.lines.len();
+    source.lines.push(Line::from(Span::styled(
+        " USER ",
+        Style::default()
+            .fg(AQUA)
+            .bg(USER_MESSAGE_BG)
+            .add_modifier(Modifier::BOLD),
+    )));
+    push_message_lines(source, content, true, None);
+    source.user_lines.extend(first_line..source.lines.len());
 }
 
 fn push_message_lines(
@@ -4228,12 +4251,17 @@ fn push_activity_line(source: &mut ConversationSource, app: &App, activity: &Age
     }
 }
 
-fn wrap_conversation_lines(lines: &[Line<'static>], width: u16) -> Vec<VisualRow> {
+fn wrap_conversation_lines(
+    lines: &[Line<'static>],
+    user_lines: &HashSet<usize>,
+    width: u16,
+) -> Vec<VisualRow> {
     let mut rows = Vec::new();
     for (source_line, line) in lines.iter().enumerate() {
         let mut row = VisualRow {
             source_line,
             units: Vec::new(),
+            user_message: user_lines.contains(&source_line),
         };
         let mut row_width = 0;
         let mut source_offset = 0;
@@ -4259,6 +4287,7 @@ fn wrap_conversation_lines(lines: &[Line<'static>], width: u16) -> Vec<VisualRow
                 if !row.units.is_empty() && row_width + character_width > width {
                     rows.push(std::mem::take(&mut row));
                     row.source_line = source_line;
+                    row.user_message = user_lines.contains(&source_line);
                     row_width = 0;
                 }
                 row.units.push(VisualUnit {
@@ -6249,7 +6278,7 @@ mod tests {
         let mut completed = test_app(root.path());
         let key = add_terminal_turn(&mut completed, true);
         let source = conversation_source(&completed);
-        let rows = wrap_conversation_lines(&source.lines, 80);
+        let rows = wrap_conversation_lines(&source.lines, &source.user_lines, 80);
         let summary_line = source.turn_toggles[0].line;
         let summary_row = rows
             .iter()
@@ -6300,7 +6329,7 @@ mod tests {
     #[test]
     fn dragged_selection_copies_visual_text_without_newlines_at_soft_wraps() {
         let lines = vec![Line::from("abcdef"), Line::from("🦀x")];
-        let rows = wrap_conversation_lines(&lines, 3);
+        let rows = wrap_conversation_lines(&lines, &HashSet::new(), 3);
         let view = ConversationView {
             area: Rect::new(0, 0, 3, 3),
             rows,
@@ -6342,6 +6371,7 @@ mod tests {
                 source_start: 0,
                 source_end: 4,
             }],
+            user_message: false,
         };
 
         let line = visual_row_line(&app, 0, &row);
@@ -6482,6 +6512,7 @@ mod tests {
                         source_start: 0,
                         source_end: 1,
                     }],
+                    user_message: false,
                 })
                 .collect(),
             scroll: 5,
@@ -6852,6 +6883,81 @@ mod tests {
             activity_detail_for_display(root.path(), &activity),
             "src/main.rs"
         );
+    }
+
+    #[test]
+    fn user_message_background_spans_compact_and_wide_rows_only() {
+        for width in [24, 80] {
+            let root = tempfile::tempdir().unwrap();
+            let mut app = test_app(root.path());
+            app.transcript
+                .push(Message::text(Role::User, "A visible user message"));
+            app.transcript
+                .push(Message::text(Role::Assistant, "Assistant answer"));
+            let backend = TestBackend::new(width, 12);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_chat(frame, &mut app, frame.area()))
+                .unwrap();
+
+            let view = app.conversation_view.as_ref().unwrap();
+            let buffer = terminal.backend().buffer();
+            for (row_index, row) in view.rows.iter().enumerate() {
+                let viewport_row = row_index.checked_sub(view.scroll);
+                let Some(y) = viewport_row.map(|row| row as u16 + 1) else {
+                    continue;
+                };
+                if y >= 11 {
+                    continue;
+                }
+                for x in 0..width {
+                    if row.user_message {
+                        assert_eq!(
+                            buffer[(x, y)].bg,
+                            USER_MESSAGE_BG,
+                            "incomplete user background at width {width}, row {row_index}, x {x}"
+                        );
+                    } else {
+                        assert_ne!(
+                            buffer[(x, y)].bg,
+                            USER_MESSAGE_BG,
+                            "user background leaked at width {width}, row {row_index}, x {x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_and_multiline_user_messages_keep_a_continuous_full_width_background() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.transcript.push(Message::text(
+            Role::User,
+            "This first logical line wraps across several compact terminal rows.\nSecond line.",
+        ));
+        let width = 20;
+        let backend = TestBackend::new(width, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_chat(frame, &mut app, frame.area()))
+            .unwrap();
+
+        let view = app.conversation_view.as_ref().unwrap();
+        let user_rows = view
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.user_message)
+            .collect::<Vec<_>>();
+        assert!(user_rows.len() >= 5);
+        assert!(user_rows.windows(2).all(|rows| rows[1].0 == rows[0].0 + 1));
+        let buffer = terminal.backend().buffer();
+        for (row_index, _) in user_rows {
+            let y = (row_index - view.scroll) as u16 + 1;
+            assert!((0..width).all(|x| buffer[(x, y)].bg == USER_MESSAGE_BG));
+        }
     }
 
     #[test]

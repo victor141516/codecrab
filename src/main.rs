@@ -9,6 +9,7 @@ mod config;
 mod conversation;
 mod events;
 mod http_debug;
+mod project_fs;
 mod provider;
 mod server;
 mod session;

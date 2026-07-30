@@ -555,24 +555,6 @@ impl SessionRegistry {
         self.write_directories(&directories)
     }
 
-    pub(crate) fn unregister(&self, root: &Path) -> Result<()> {
-        let _guard = self
-            .mutation_lock
-            .lock()
-            .expect("session registry mutation lock poisoned");
-        let _global_guard = global_config_mutation_lock()
-            .lock()
-            .expect("global configuration mutation lock poisoned");
-        let root = normalized_root(root);
-        let mut directories = self.directories()?;
-        let original_len = directories.len();
-        directories.retain(|existing| !paths_equal(existing, &root));
-        if directories.len() == original_len {
-            return Ok(());
-        }
-        self.write_directories(&directories)
-    }
-
     fn write_directories(&self, directories: &[PathBuf]) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -769,9 +751,6 @@ service_tiers = [{ id = "priority" }]
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep this comment"));
         assert_eq!(registry.directories().unwrap().len(), 1);
-
-        registry.unregister(&project).unwrap();
-        assert!(registry.directories().unwrap().is_empty());
     }
 
     #[test]

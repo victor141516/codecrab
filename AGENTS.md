@@ -174,9 +174,9 @@ current draft and all later turns until changed.
   next saved session in that project, or leaves the project with no active
   session until the user creates one.
 - `session_directories` in the platform-global config is CodeCrab's persistent
-  project registry. Register a project whenever a session is saved and remove
-  it when its last session is deleted. CLI, TUI, API, and web session lists
-  must all consume the shared catalog from `src/session.rs`.
+  project registry. Register a project whenever it is opened or a session is
+  saved, and keep empty projects registered. CLI, TUI, API, and web session
+  lists must all consume the shared catalog from `src/session.rs`.
 - Web session navigation is URL-addressable. `/sessions/<id>` must resolve the
   session across every registered project, switch the complete agent root, and
   restore that session on a clean reload without `localStorage` or prior
@@ -188,11 +188,12 @@ current draft and all later turns until changed.
   navigation or send failure, and delete stored drafts after a successful send
   or session deletion. Storage failures must not block navigation, and draft
   storage must never participate in URL/session resolution.
-- The web sidebar is a two-level navigator rather than a fully expanded tree:
-  show one project's sessions under its directory name, use a back control to
-  show all projects, and open a project's session list when selected. Keep the
-  project back control above `New session`; when a project is empty, explain
-  that the user must create a session instead of creating one implicitly.
+- The web sidebar is a persistent two-level project/session hierarchy. Show all
+  projects as independently collapsible rows with nested sessions and a compact
+  per-project new-session action. Its top-level project picker browses and
+  creates directories on the backend host, never through the browser filesystem;
+  creating a directory does not open it, and opening an empty project persists
+  it without creating a session.
 - Fast speed is derived exclusively from the selected provider service tier.
   The terminal header may show a lightning bolt for Fast; the web client must
   not add a bolt to the model name because its speed selector is always
@@ -413,8 +414,16 @@ real credentials, network access, or a user's saved sessions.
   the effective non-secret configuration content.
 - Avoid logging secrets except inside the explicitly unredacted
   `--debug-openai` path.
-- Do not commit, push, publish, or create a pull request unless the user
-  explicitly asks.
+- Treat a user request to implement or fix a GitHub issue as explicit
+  authorization to commit and push the completed issue work. Include
+  `Fixes #<issue-number>` in the completing commit for every addressed issue,
+  get that commit onto the repository's default branch (directly or through a
+  merged pull request), and verify that GitHub closed each issue. A closing
+  keyword on another branch does not close the issue until that branch is
+  merged. Do not manually close the issue as a substitute for this Git-based
+  workflow.
+- Otherwise, do not commit, push, publish, or create a pull request unless the
+  user explicitly asks.
 
 ## Tests and review expectations
 

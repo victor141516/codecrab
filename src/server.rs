@@ -42,6 +42,7 @@ use crate::{
     },
     conversation::{ConversationHandle, ConversationManager, ConversationStatus},
     events::{AgentActivity, AgentEvent},
+    project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible},
     session::{
         Session, SessionProject, SessionStore, list_session_projects, resolve_global_session,
@@ -183,6 +184,32 @@ struct ModelRequest {
 struct SessionRequest {
     project: Option<PathBuf>,
     id: String,
+}
+
+#[derive(Deserialize)]
+struct NewSessionRequest {
+    project: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct DirectoryQuery {
+    path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct CreateDirectoryRequest {
+    parent: PathBuf,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct OpenProjectRequest {
+    path: PathBuf,
+}
+
+#[derive(Serialize)]
+struct CreatedDirectoryResponse {
+    path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -340,6 +367,9 @@ pub(crate) async fn serve(
                 .route("/branches/select", post(select_branch))
                 .route("/sessions", post(new_session))
                 .route("/sessions/delete", post(delete_session))
+                .route("/directories", get(list_directories))
+                .route("/directories", post(make_directory))
+                .route("/projects/open", post(open_project))
                 .route("/sessions/resume", post(resume_session))
                 .route("/goals/create", post(create_goal))
                 .route("/goals/edit", put(edit_goal))
@@ -1043,12 +1073,16 @@ async fn select_branch(
     ))
 }
 
-async fn new_session(State(state): State<ServerState>) -> ApiResult<StateResponse> {
+async fn new_session(
+    State(state): State<ServerState>,
+    Json(request): Json<NewSessionRequest>,
+) -> ApiResult<StateResponse> {
     let _transition = state.inner.workspace_transition.lock().await;
-    let (root, current) = {
+    let (workspace_root, current) = {
         let workspace = state.inner.workspace.lock().await;
         (workspace.root.clone(), workspace.conversation.clone())
     };
+    let root = existing_directory(&workspace_root, &request.project)?;
     if let Some(current) = current {
         current.persist_if_idle().await?;
     }
@@ -1172,9 +1206,45 @@ async fn delete_session(
             workspace.conversation = None;
         }
     }
-    if remaining.is_empty() {
-        state.inner.registry.unregister(&root)?;
+    Ok(Json(snapshot(&state).await?))
+}
+
+async fn list_directories(
+    State(state): State<ServerState>,
+    Query(query): Query<DirectoryQuery>,
+) -> ApiResult<DirectoryListing> {
+    let root = state.inner.workspace.lock().await.root.clone();
+    Ok(Json(browse_directories(&root, query.path.as_deref())?))
+}
+
+async fn make_directory(
+    State(state): State<ServerState>,
+    Json(request): Json<CreateDirectoryRequest>,
+) -> ApiResult<CreatedDirectoryResponse> {
+    let root = state.inner.workspace.lock().await.root.clone();
+    let path = create_directory(&root, &request.parent, &request.name)?;
+    Ok(Json(CreatedDirectoryResponse { path }))
+}
+
+async fn open_project(
+    State(state): State<ServerState>,
+    Json(request): Json<OpenProjectRequest>,
+) -> ApiResult<StateResponse> {
+    let _transition = state.inner.workspace_transition.lock().await;
+    let (current_root, current) = {
+        let workspace = state.inner.workspace.lock().await;
+        (workspace.root.clone(), workspace.conversation.clone())
+    };
+    if let Some(current) = current {
+        current.persist_if_idle().await?;
     }
+    let root = existing_directory(&current_root, &request.path)?;
+    state.inner.registry.register(&root)?;
+    let mut workspace = state.inner.workspace.lock().await;
+    workspace.root = root;
+    workspace.selected_session = None;
+    workspace.conversation = None;
+    drop(workspace);
     Ok(Json(snapshot(&state).await?))
 }
 
@@ -2356,6 +2426,163 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.name == "only-in-other.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_an_empty_project_persists_it_without_creating_a_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current");
+        let empty = temp.path().join("empty");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&current)
+            .unwrap()
+            .create("model".into())
+            .unwrap();
+        let agent = build_agent(&current, &config, false, session).unwrap();
+        let registry = SessionRegistry::at(temp.path().join("config.toml"));
+        let state = test_state_with_registry(
+            config,
+            current.clone(),
+            test_conversation(agent),
+            false,
+            registry.clone(),
+        );
+
+        let response = open_project(
+            State(state.clone()),
+            Json(OpenProjectRequest {
+                path: empty.clone(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+
+        assert!(response.session.is_none());
+        assert!(paths_equal(
+            &state.inner.workspace.lock().await.root,
+            &empty
+        ));
+        assert!(
+            response
+                .projects
+                .iter()
+                .any(|project| paths_equal(&project.root, &empty) && project.sessions.is_empty())
+        );
+        assert!(
+            registry
+                .directories()
+                .unwrap()
+                .iter()
+                .any(|root| paths_equal(root, &empty))
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_api_creates_without_opening_and_reports_browse_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current");
+        std::fs::create_dir(&current).unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&current)
+            .unwrap()
+            .create("model".into())
+            .unwrap();
+        let agent = build_agent(&current, &config, false, session).unwrap();
+        let state = test_state(config, current.clone(), test_conversation(agent), false);
+
+        let created = make_directory(
+            State(state.clone()),
+            Json(CreateDirectoryRequest {
+                parent: current.clone(),
+                name: "created".into(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert!(created.path.is_dir());
+        assert!(paths_equal(
+            &state.inner.workspace.lock().await.root,
+            &current
+        ));
+
+        let listing = list_directories(
+            State(state.clone()),
+            Query(DirectoryQuery {
+                path: Some(current.join("..")),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert!(
+            listing
+                .directories
+                .iter()
+                .any(|entry| entry.name == "current")
+        );
+
+        let error = match list_directories(
+            State(state),
+            Query(DirectoryQuery {
+                path: Some(current.join("missing")),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("missing directory unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(format!("{:#}", error.error).contains("cannot open directory"));
+    }
+
+    #[tokio::test]
+    async fn new_web_session_targets_the_requested_project_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&current)
+            .unwrap()
+            .create("model".into())
+            .unwrap();
+        let agent = build_agent(&current, &config, false, session).unwrap();
+        let state = test_state(config, current.clone(), test_conversation(agent), false);
+
+        let response = new_session(
+            State(state.clone()),
+            Json(NewSessionRequest {
+                project: target.clone(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+
+        let created = response.session.unwrap();
+        assert!(paths_equal(
+            &state.inner.workspace.lock().await.root,
+            &target
+        ));
+        assert_eq!(
+            SessionStore::new(&target).unwrap().list().unwrap()[0].id,
+            created.id
+        );
+        assert!(
+            response
+                .projects
+                .iter()
+                .any(|project| paths_equal(&project.root, &target))
         );
     }
 

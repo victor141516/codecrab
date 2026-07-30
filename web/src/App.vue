@@ -16,6 +16,8 @@ import {
   ChevronUp,
   Copy,
   Folder,
+  FolderOpen,
+  FolderPlus,
   GitBranch,
   ListTodo,
   LoaderCircle,
@@ -64,6 +66,11 @@ import {
   takeNextQueuedPrompt,
   updateQueuedPrompt
 } from "./prompt-queue.js";
+import {
+  expandKnownProject,
+  newSessionPayload,
+  toggleProjectExpansion
+} from "./project-sidebar.js";
 
 const state = ref(null);
 const draft = ref("");
@@ -78,8 +85,13 @@ const autoScroll = ref(true);
 const waveformCanvas = ref(null);
 const autocomplete = ref(null);
 const autocompleteSelection = ref(0);
-const sidebarView = ref("sessions");
-const selectedProjectRoot = ref("");
+const expandedProjects = ref(new Set());
+const projectPickerOpen = ref(false);
+const directoryListing = ref(null);
+const directoryPathDraft = ref("");
+const newDirectoryName = ref("");
+const projectPickerLoading = ref(false);
+const projectPickerError = ref("");
 const copiedMessageKey = ref("");
 const expandedActivityKeys = ref(new Set());
 const overflowingActivityKeys = ref(new Set());
@@ -190,14 +202,6 @@ const cancelling = computed({
 });
 const queuedPrompts = computed(() => selectedRuntime.value.promptQueue.items);
 const projects = computed(() => state.value?.projects ?? []);
-const selectedProject = computed(
-  () =>
-    projects.value.find(
-      (project) => project.root === selectedProjectRoot.value
-    ) ??
-    projects.value[0] ??
-    null
-);
 const models = computed(() => state.value?.models ?? []);
 const dictationAvailable = computed(
   () => state.value?.dictation_available ?? false
@@ -563,11 +567,15 @@ async function runAction(
   }
 }
 
-async function newSession() {
+async function newSession(project) {
   closeAutocomplete();
   const source = await composerDrafts.beginNavigation();
   const nextState = await runAction(
-    () => api("/api/sessions", { method: "POST", body: "{}" }),
+    () =>
+      api("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify(newSessionPayload(project))
+      }),
     {
       selectActiveProject: true,
       closeSidebar: true,
@@ -636,12 +644,6 @@ async function deleteSession(project, id) {
     if (deletingActive) {
       updateSessionUrl(nextState.session?.id, "replace");
       await composerDrafts.activate(nextState.project, nextState.session?.id);
-    } else if (
-      !nextState.projects.some(
-        (candidate) => candidate.root === selectedProjectRoot.value
-      )
-    ) {
-      sidebarView.value = "projects";
     }
   } catch (cause) {
     if (source) await composerDrafts.rollbackNavigation(source);
@@ -658,10 +660,11 @@ function applyServerState(nextState, { selectActiveProject = false } = {}) {
       : nextState;
   state.value = effective;
   if (id) sessionStates.set(id, effective);
-  if (selectActiveProject || !selectedProjectRoot.value) {
-    selectedProjectRoot.value = effective.project;
-    sidebarView.value = "sessions";
-  }
+  expandedProjects.value = expandKnownProject(
+    expandedProjects.value,
+    effective.projects ?? [],
+    selectActiveProject ? effective.project : null
+  );
 }
 
 function targetState(sessionId) {
@@ -683,13 +686,72 @@ function setTargetState(sessionId, nextState) {
   }
 }
 
-function selectProject(root) {
-  selectedProjectRoot.value = root;
-  sidebarView.value = "sessions";
+function projectExpanded(root) {
+  return expandedProjects.value.has(root);
 }
 
-function showProjects() {
-  sidebarView.value = "projects";
+function toggleProject(root) {
+  expandedProjects.value = toggleProjectExpansion(expandedProjects.value, root);
+}
+
+async function browseDirectory(path = directoryPathDraft.value) {
+  projectPickerLoading.value = true;
+  projectPickerError.value = "";
+  try {
+    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    directoryListing.value = await api(`/api/directories${query}`);
+    directoryPathDraft.value = directoryListing.value.path;
+  } catch (cause) {
+    projectPickerError.value = cause.message;
+  } finally {
+    projectPickerLoading.value = false;
+  }
+}
+
+function showProjectPicker() {
+  projectPickerOpen.value = true;
+  directoryListing.value = null;
+  directoryPathDraft.value = state.value?.project ?? "";
+  newDirectoryName.value = "";
+  void browseDirectory(directoryPathDraft.value);
+}
+
+async function createDirectory() {
+  const name = newDirectoryName.value.trim();
+  if (!name || !directoryListing.value) return;
+  projectPickerLoading.value = true;
+  projectPickerError.value = "";
+  try {
+    await api("/api/directories", {
+      method: "POST",
+      body: JSON.stringify({ parent: directoryListing.value.path, name })
+    });
+    newDirectoryName.value = "";
+    await browseDirectory(directoryListing.value.path);
+  } catch (cause) {
+    projectPickerError.value = cause.message;
+  } finally {
+    projectPickerLoading.value = false;
+  }
+}
+
+async function openProject(path = directoryListing.value?.path) {
+  if (!path) return;
+  const source = await composerDrafts.beginNavigation();
+  const nextState = await runAction(
+    () =>
+      api("/api/projects/open", {
+        method: "POST",
+        body: JSON.stringify({ path })
+      }),
+    { selectActiveProject: true, historyMode: "replace" }
+  );
+  if (!nextState) {
+    await composerDrafts.rollbackNavigation(source);
+    return;
+  }
+  projectPickerOpen.value = false;
+  await composerDrafts.activate(nextState.project, nextState.session?.id);
 }
 
 function sessionIdFromLocation() {
@@ -2662,6 +2724,117 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
+    <div
+      v-if="projectPickerOpen"
+      class="fixed inset-0 z-[80] grid place-items-center bg-black/75 p-3 backdrop-blur-sm sm:p-6"
+      @click.self="projectPickerOpen = false"
+    >
+      <section class="flex max-h-[90dvh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-cyan-400/20 bg-[#15171a] shadow-2xl shadow-black/60">
+        <header class="flex shrink-0 items-center gap-3 border-b border-white/7 px-4 py-3">
+          <FolderOpen class="size-4 text-cyan-300" aria-hidden="true" />
+          <div class="min-w-0 flex-1">
+            <h2 class="text-sm font-semibold text-zinc-100">Open project on server</h2>
+            <p class="mt-0.5 text-[10px] text-zinc-600">Browse directories on the machine running CodeCrab.</p>
+          </div>
+          <button
+            class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-white/5 hover:text-zinc-200"
+            aria-label="Close project picker"
+            @click="projectPickerOpen = false"
+          >
+            <X class="size-4" aria-hidden="true" />
+          </button>
+        </header>
+
+        <form class="flex shrink-0 gap-2 border-b border-white/6 p-3" @submit.prevent="browseDirectory()">
+          <input
+            v-model="directoryPathDraft"
+            class="min-w-0 flex-1 rounded-md border border-white/8 bg-black/20 px-3 py-2 font-mono text-xs text-zinc-300 outline-none focus:border-cyan-400/30"
+            aria-label="Server directory path"
+            autocomplete="off"
+          />
+          <button
+            class="rounded-md border border-white/8 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-40"
+            :disabled="projectPickerLoading"
+          >
+            Go
+          </button>
+        </form>
+
+        <div v-if="projectPickerError" class="mx-3 mt-3 rounded-md border border-red-500/20 bg-red-500/8 px-3 py-2 text-xs text-red-300">
+          {{ projectPickerError }}
+        </div>
+
+        <div class="min-h-0 flex-1 overflow-y-auto p-2">
+          <div v-if="projectPickerLoading && !directoryListing" class="grid min-h-40 place-items-center text-xs text-zinc-600">
+            <LoaderCircle class="size-4 animate-spin" aria-hidden="true" />
+          </div>
+          <template v-else-if="directoryListing">
+            <div v-if="directoryListing.roots.length > 1" class="mb-2 flex flex-wrap gap-1 px-1">
+              <button
+                v-for="root in directoryListing.roots"
+                :key="root"
+                class="rounded border border-white/8 px-2 py-1 font-mono text-[10px] text-zinc-500 hover:bg-white/5 hover:text-zinc-200"
+                @click="browseDirectory(root)"
+              >
+                {{ root }}
+              </button>
+            </div>
+            <button
+              v-if="directoryListing.parent"
+              class="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-zinc-500 hover:bg-white/5 hover:text-zinc-200"
+              @click="browseDirectory(directoryListing.parent)"
+            >
+              <ChevronLeft class="size-3.5" aria-hidden="true" />
+              Parent directory
+            </button>
+            <button
+              v-for="entry in directoryListing.directories"
+              :key="entry.path"
+              class="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left hover:bg-white/5"
+              :title="entry.path"
+              @click="browseDirectory(entry.path)"
+            >
+              <Folder class="size-3.5 shrink-0 text-cyan-400" aria-hidden="true" />
+              <span class="min-w-0 flex-1 truncate text-xs text-zinc-300">{{ entry.name }}</span>
+              <ChevronLeft class="size-3 rotate-180 text-zinc-700" aria-hidden="true" />
+            </button>
+            <p v-if="!directoryListing.directories.length" class="px-3 py-8 text-center text-xs text-zinc-600">
+              This directory has no child directories.
+            </p>
+          </template>
+        </div>
+
+        <footer class="shrink-0 border-t border-white/7 p-3">
+          <form class="mb-3 flex gap-2" @submit.prevent="createDirectory">
+            <input
+              v-model="newDirectoryName"
+              class="min-w-0 flex-1 rounded-md border border-white/8 bg-black/20 px-3 py-2 text-xs text-zinc-300 outline-none focus:border-cyan-400/30"
+              placeholder="New directory name"
+              aria-label="New directory name"
+            />
+            <button
+              class="rounded-md border border-white/8 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-40"
+              :disabled="projectPickerLoading || !newDirectoryName.trim() || !directoryListing"
+            >
+              Create
+            </button>
+          </form>
+          <div class="flex flex-col-reverse gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <p class="min-w-0 truncate font-mono text-[9px] text-zinc-600" :title="directoryListing?.path">
+              {{ directoryListing?.path }}
+            </p>
+            <button
+              class="shrink-0 rounded-md bg-cyan-300 px-4 py-2 text-xs font-semibold text-cyan-950 hover:bg-cyan-200 disabled:opacity-40"
+              :disabled="projectPickerLoading || !directoryListing"
+              @click="openProject()"
+            >
+              Open this project
+            </button>
+          </div>
+        </footer>
+      </section>
+    </div>
+
     <aside
       class="fixed inset-y-0 left-0 z-40 flex w-72 -translate-x-full flex-col border-r border-white/6 bg-panel transition-transform duration-200 lg:translate-x-0"
       :class="{ 'translate-x-0': sidebarOpen }"
@@ -2673,121 +2846,122 @@ onBeforeUnmount(() => {
         <span class="text-sm font-semibold tracking-tight text-white">CodeCrab</span>
       </div>
 
-      <div class="space-y-2 p-3">
+      <div class="p-3">
         <button
-          v-if="sidebarView === 'sessions' && selectedProject"
-          class="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-cyan-300 transition hover:bg-white/4 hover:text-cyan-200"
-          :title="selectedProject.root"
-          aria-label="Show projects"
-          @click="showProjects"
+          class="flex w-full items-center justify-center gap-2 rounded-md border border-cyan-400/15 bg-cyan-400/7 px-3 py-2 text-xs font-semibold text-cyan-200 transition hover:border-cyan-400/25 hover:bg-cyan-400/12"
+          @click="showProjectPicker"
         >
-          <ChevronLeft class="size-4 shrink-0" aria-hidden="true" />
-          <Folder class="size-3.5 shrink-0" aria-hidden="true" />
-          <span class="min-w-0 flex-1 truncate text-xs font-semibold">
-            {{ projectName(selectedProject.root) }}
-          </span>
-          <span class="font-mono text-[9px] text-zinc-700">
-            {{ selectedProject.sessions.length }}
-          </span>
-        </button>
-        <button
-          class="flex w-full items-center justify-center gap-2 rounded-md border border-white/8 bg-white/4 px-3 py-2 text-xs font-medium text-zinc-200 transition hover:border-white/15 hover:bg-white/7"
-          @click="newSession"
-        >
-          <Plus class="size-3.5 text-coral" aria-hidden="true" />
-          New session
+          <FolderPlus class="size-4" aria-hidden="true" />
+          Add or create project
         </button>
       </div>
 
-      <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
-        <template v-if="sidebarView === 'sessions' && selectedProject">
-          <p class="px-2 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-600">
-            Sessions
-          </p>
-          <p
-            v-if="!selectedProject.sessions.length"
-            class="px-2 py-3 text-xs leading-5 text-zinc-600"
-          >
-            No sessions yet. Use <span class="text-zinc-400">New session</span>
-            to start one.
-          </p>
+      <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4" aria-label="Projects and sessions">
+        <p
+          v-if="!projects.length"
+          class="px-2 py-3 text-xs leading-5 text-zinc-600"
+        >
+          No projects are open. Add a directory from the backend host to begin.
+        </p>
+        <section
+          v-for="project in projects"
+          :key="project.root"
+          class="mb-1"
+          :data-project-root="project.root"
+        >
           <div
-            v-for="item in selectedProject.sessions"
-            :key="item.id"
-            class="group mb-0.5 flex w-full items-center rounded-md transition hover:bg-white/4"
-            :class="{
-              'bg-white/5': isCurrentSession(selectedProject, item)
-            }"
+            class="group flex w-full items-center rounded-md transition hover:bg-white/4"
+            :class="{ 'bg-white/5': project.root === state?.project }"
           >
             <button
-              class="min-w-0 flex-1 px-2.5 py-2 text-left"
-              @click="resumeSession(selectedProject.root, item.id)"
+              class="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
+              :title="project.root"
+              :aria-expanded="projectExpanded(project.root)"
+              @click="toggleProject(project.root)"
             >
-              <span class="block truncate text-xs text-zinc-300 group-hover:text-white">
-                {{ item.title || "New session" }}
-              </span>
-              <span class="mt-1 flex items-center justify-between font-mono text-[9px] text-zinc-600">
-                <span class="flex items-center gap-1.5">
-                  <span
-                    v-if="workerLifecycle(item.id)"
-                    class="size-1.5 rounded-full"
-                    :class="{
-                      'animate-pulse bg-cyan-400': workerLifecycle(item.id) === 'running',
-                      'bg-red-400': workerLifecycle(item.id) === 'failed',
-                      'bg-zinc-600': workerLifecycle(item.id) === 'idle'
-                    }"
-                  ></span>
-                  <span>{{ workerLifecycle(item.id) || shortId(item.id) }}</span>
+              <FolderOpen
+                v-if="projectExpanded(project.root)"
+                class="size-3.5 shrink-0 text-cyan-400"
+                aria-hidden="true"
+              />
+              <Folder
+                v-else
+                class="size-3.5 shrink-0 text-zinc-500"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1">
+                <span class="block truncate text-xs font-semibold text-zinc-300 group-hover:text-white">
+                  {{ projectName(project.root) }}
                 </span>
-                <span>{{ formatTime(item.updated_at) }}</span>
+                <span class="mt-0.5 block truncate font-mono text-[8px] text-zinc-700">
+                  {{ project.root }}
+                </span>
+              </span>
+              <span class="font-mono text-[9px] text-zinc-700">
+                {{ project.sessions.length }}
               </span>
             </button>
             <button
-              class="mr-1 grid size-8 shrink-0 place-items-center rounded text-sm text-zinc-700 transition hover:bg-red-500/10 hover:text-red-400 disabled:pointer-events-none disabled:opacity-30"
-              :disabled="runtimeFor(item.id).sending"
-              :aria-label="`Delete session ${item.title || shortId(item.id)}`"
-              title="Delete session"
-              @click.stop="deleteSession(selectedProject.root, item.id)"
+              class="mr-1 grid size-7 shrink-0 place-items-center rounded text-zinc-600 transition hover:bg-coral/10 hover:text-coral"
+              :aria-label="`New session in ${projectName(project.root)}`"
+              title="New session in this project"
+              @click.stop="newSession(project.root)"
             >
-              <Trash2 class="size-3.5" aria-hidden="true" />
+              <Plus class="size-3.5" aria-hidden="true" />
             </button>
           </div>
-        </template>
 
-        <template v-else>
-          <p class="px-2 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-600">
-            Projects
-          </p>
-          <button
-            v-for="project in projects"
-            :key="project.root"
-            class="mb-0.5 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left transition hover:bg-white/4"
-            :class="{
-              'bg-white/5': project.root === selectedProjectRoot
-            }"
-            :title="project.root"
-            @click="selectProject(project.root)"
+          <div
+            v-if="projectExpanded(project.root)"
+            class="ml-3 border-l border-white/6 pl-2"
           >
-            <Folder class="size-3.5 shrink-0 text-cyan-400" aria-hidden="true" />
-            <span class="min-w-0 flex-1">
-              <span class="block truncate text-xs font-semibold text-cyan-300">
-                {{ projectName(project.root) }}
-              </span>
-              <span class="mt-1 block truncate font-mono text-[9px] text-zinc-700">
-                {{ project.root }}
-              </span>
-            </span>
-            <span
-              v-if="project.root === state?.project"
-              class="rounded bg-cyan-400/8 px-1.5 py-0.5 font-mono text-[8px] uppercase tracking-wider text-cyan-400"
+            <p
+              v-if="!project.sessions.length"
+              class="px-2 py-2 text-[10px] leading-4 text-zinc-600"
             >
-              current
-            </span>
-            <span class="font-mono text-[9px] text-zinc-700">
-              {{ project.sessions.length }}
-            </span>
-          </button>
-        </template>
+              No sessions yet. Use + on this project to create one.
+            </p>
+            <div
+              v-for="item in project.sessions"
+              :key="item.id"
+              class="group/session mb-0.5 flex w-full items-center rounded-md transition hover:bg-white/4"
+              :class="{ 'bg-white/5': isCurrentSession(project, item) }"
+            >
+              <button
+                class="min-w-0 flex-1 px-2 py-2 text-left"
+                @click="resumeSession(project.root, item.id)"
+              >
+                <span class="block truncate text-xs text-zinc-400 group-hover/session:text-white">
+                  {{ item.title || "New session" }}
+                </span>
+                <span class="mt-1 flex items-center justify-between font-mono text-[9px] text-zinc-700">
+                  <span class="flex items-center gap-1.5">
+                    <span
+                      v-if="workerLifecycle(item.id)"
+                      class="size-1.5 rounded-full"
+                      :class="{
+                        'animate-pulse bg-cyan-400': workerLifecycle(item.id) === 'running',
+                        'bg-red-400': workerLifecycle(item.id) === 'failed',
+                        'bg-zinc-600': workerLifecycle(item.id) === 'idle'
+                      }"
+                    />
+                    <span>{{ workerLifecycle(item.id) || shortId(item.id) }}</span>
+                  </span>
+                  <span>{{ formatTime(item.updated_at) }}</span>
+                </span>
+              </button>
+              <button
+                class="mr-1 grid size-7 shrink-0 place-items-center rounded text-zinc-700 transition hover:bg-red-500/10 hover:text-red-400 disabled:pointer-events-none disabled:opacity-30"
+                :disabled="runtimeFor(item.id).sending"
+                :aria-label="`Delete session ${item.title || shortId(item.id)}`"
+                title="Delete session"
+                @click.stop="deleteSession(project.root, item.id)"
+              >
+                <Trash2 class="size-3.5" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        </section>
       </div>
     </aside>
 

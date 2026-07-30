@@ -188,9 +188,12 @@ The initial API surface is:
 | `POST` | `/api/session/clear` | Clear `session_id` |
 | `POST` | `/api/branches/preview` | Preview the oldest leaf descending from `{ session_id, node_id }` without persistence |
 | `POST` | `/api/branches/select` | Select and persist the oldest leaf descending from `{ session_id, node_id }` |
-| `POST` | `/api/sessions` | Create and select a session |
+| `POST` | `/api/sessions` | Create and select a session in `{ project }` |
 | `POST` | `/api/sessions/delete` | Delete `{ project?, id }`; select the next saved session when active |
 | `POST` | `/api/sessions/resume` | Resume `{ project?, id }`, resolving the project globally when omitted |
+| `GET` | `/api/directories` | Browse server directories from optional `path` |
+| `POST` | `/api/directories` | Create one server directory from `{ parent, name }` without opening it |
+| `POST` | `/api/projects/open` | Open and persist an existing server directory from `{ path }` |
 | `POST` | `/api/goals/create` | Create and activate a goal in `session_id`, pausing its previous active goal |
 | `PUT` | `/api/goals/edit` | Replace a goal objective |
 | `POST` | `/api/goals/activate` | Activate a saved goal and pause any other active goal |
@@ -385,15 +388,18 @@ completion to that session's project. `Delete` / `Backspace` removes a session.
 Switching sessions does not cancel a running turn. The session picker shows
 each live worker as running, idle, stopping, or failed; returning to a running
 session restores its live event stream and queued follow-up.
-In the web sidebar, the normal view shows the selected project's name and its
-sessions. Its back button opens the project list; choosing a project opens that
-project's sessions. Selecting a session updates the browser URL to
-`/sessions/<id>`. Opening or sharing that URL resolves the project globally and
-restores the session without relying on browser storage, even when the server
-was started from a different project. Deleting the active web session selects
-the next saved session in that project and replaces the URL accordingly. If
-none remain, no replacement is created: the URL returns to `/` and the sidebar
-invites the user to choose `New session`.
+The web sidebar keeps every registered project visible as an independently
+collapsible tree with its sessions nested below. Each project row creates a new
+session in that exact directory. The top action opens a server-side directory
+browser, so remote browsers and phones inspect the filesystem of the machine
+running CodeCrab rather than their own; it can create a directory without
+opening it, and opening an empty project persists it without creating a session.
+Selecting a session updates the browser URL to `/sessions/<id>`. Opening or
+sharing that URL resolves the project globally and restores the session without
+relying on browser storage, even when the server was started from a different
+project. Deleting the active web session selects the next saved session in that
+project and replaces the URL accordingly. If none remain, no replacement is
+created: the URL returns to `/` and the project remains visible and empty.
 
 Unsent web composer text is browser-local and scoped to the normalized project
 path plus session ID. Switching sessions restores each session's exact draft,
@@ -737,9 +743,9 @@ so a non-OpenAI profile can never send audio or credentials to OpenAI.
 Sessions live under `.codecrab/sessions/` in each project and are ignored by
 the included `.gitignore`. CodeCrab maintains `session_directories` in the
 platform-global `config.toml`, which lets terminal commands, `/sessions`, and
-the web sidebar discover every project that has saved sessions. Empty projects
-are removed from that registry. The field is managed automatically and can
-also be edited manually.
+the web sidebar discover every opened project, including empty ones. Projects
+are registered when opened or when a session is saved and remain registered
+until the field is edited manually.
 
 Each session persists one conversation tree with stable node and parent IDs,
 plus the selected leaf. The ordinary `messages` field returned by the web API

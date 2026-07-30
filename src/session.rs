@@ -794,15 +794,12 @@ pub(crate) fn list_session_projects(
 
     let mut projects = Vec::new();
     for root in roots {
-        let dir = root.join(".codecrab").join("sessions");
-        if !paths_equal(&root, &current_root) && !dir.is_dir() {
+        if !root.is_dir() {
             continue;
         }
         let store = SessionStore::new(&root)?;
         let sessions = store.list()?;
-        if paths_equal(&root, &current_root) || !sessions.is_empty() {
-            projects.push(SessionProject { root, sessions });
-        }
+        projects.push(SessionProject { root, sessions });
     }
     Ok(projects)
 }
