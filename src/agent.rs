@@ -28,7 +28,7 @@ use crate::{
     },
     session::{
         CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
-        Session,
+        Session, TurnOutcome,
     },
     skills::{Skill, SkillRegistry},
     tools::ToolBox,
@@ -169,6 +169,14 @@ impl Agent {
 
     pub(crate) fn skills(&self) -> &[Skill] {
         self.skills.skills()
+    }
+
+    pub(crate) fn model_catalog(&self) -> &[ModelCatalogEntry] {
+        &self.model_catalog
+    }
+
+    pub(crate) fn record_turn_outcome(&mut self, outcome: TurnOutcome) {
+        self.session.finish_latest_turn(outcome, Utc::now());
     }
 
     pub(crate) fn clear(&mut self) -> Result<()> {
@@ -1183,6 +1191,23 @@ fn preserve_partial_assistant(
 fn tool_batch_rejections(root: &Path, calls: &[ToolCall]) -> Vec<Option<String>> {
     let mut rejections = vec![None; calls.len()];
 
+    let wait_calls = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call.function.name == "session_wait")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if !wait_calls.is_empty() && (calls.len() != 1 || wait_calls.len() != 1) {
+        for rejection in &mut rejections {
+            *rejection = Some(
+                "deferred because session_wait is a response barrier; request exactly one wait \
+                 call and no unrelated tools in the same response"
+                    .into(),
+            );
+        }
+        return rejections;
+    }
+
     if let Some(shell_index) = calls
         .iter()
         .position(|call| is_terminal_barrier(&call.function.name))
@@ -1304,6 +1329,8 @@ Work autonomously toward the user's request:
 - Group independent list_files, read_file, search, load_skill, and read_skill_file calls in the same response whenever useful.
 - You may also group write_file and replace_in_file calls only when every call targets a different file. Never modify the same resolved path twice in one response.
 - Shell is a response barrier, as are all terminal operations: emit at most one shell, shell_noninteractive, terminal_input, terminal_read, terminal_close, or terminal_list call in a response and do not emit any other tool call with it. Wait for its result before deciding or requesting the next operation.
+- session_wait is also a response barrier: emit at most one wait call and no unrelated tool calls in the same response.
+- Other sessions are fresh, isolated agent contexts that share this process and filesystem. Use session_create, session_list, session_status, session_messages, session_send, session_stop, and session_wait when the user or loaded project instructions explicitly request delegation, another agent/session/conversation, parallel work, or independent validation. Do not create sessions aggressively for ordinary tasks. Put all required context in the delegated prompt because the child does not inherit this transcript. Delegate disjoint writes or coordinate them explicitly. Do not recursively fan out without user/project instructions or a concrete benefit.
 - Briefly explain the result when finished. Mention verification and any remaining limitation.
 
 Communication:
@@ -1856,6 +1883,27 @@ mod tests {
         assert!(rejections[0].is_none());
         assert!(rejections[1].is_some());
         assert!(rejections[2].is_some());
+    }
+
+    #[test]
+    fn session_wait_is_an_exclusive_response_barrier() {
+        let root = std::env::temp_dir();
+        let wait = tool_call(
+            "1",
+            "session_wait",
+            r#"{"targets":[{"session_id":"00000000-0000-0000-0000-000000000001","after_revision":0}]}"#,
+        );
+        assert_eq!(
+            tool_batch_rejections(&root, std::slice::from_ref(&wait)),
+            [None]
+        );
+
+        let calls = vec![
+            wait,
+            tool_call("2", "read_file", r#"{"path":"src/main.rs"}"#),
+        ];
+        let rejections = tool_batch_rejections(&root, &calls);
+        assert!(rejections.iter().all(Option::is_some));
     }
 
     #[tokio::test]

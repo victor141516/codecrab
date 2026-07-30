@@ -41,15 +41,15 @@ use crate::{
         validate_provider_name,
     },
     conversation::{ConversationHandle, ConversationManager, ConversationStatus},
+    coordination::SessionCoordinator,
     diagnostics::{DebugOutput, DiagnosticLog},
     events::{AgentActivity, AgentEvent},
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
-    provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible},
+    provider::{Message, ModelCatalogEntry, ModelSelection},
     session::{
         Session, SessionProject, SessionStore, list_session_projects, resolve_global_session,
     },
     skills::SkillRegistry,
-    tools::ToolBox,
     transcription::Transcriber,
 };
 
@@ -72,6 +72,7 @@ struct ServerState {
 }
 
 struct ServerInner {
+    coordinator: SessionCoordinator,
     config: RwLock<Config>,
     registry: SessionRegistry,
     debug_openai: DebugOutput,
@@ -307,7 +308,14 @@ pub(crate) async fn serve(
     let active = config.provider(&config.active_provider)?;
     let session =
         store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
-    let mut agent = build_agent(&root, &config, debug_openai.clone(), session)?;
+    let coordinator = SessionCoordinator::new(
+        config.clone(),
+        registry.clone(),
+        debug_openai.clone(),
+        DiagnosticLog::stderr(),
+        default_instructions_path(&root)?,
+    );
+    let mut agent = coordinator.build_agent(&root, session)?;
     let (models, catalog_error) = match agent.fetch_models().await {
         Ok(models) => {
             agent.resolve_new_session_model(&models);
@@ -317,11 +325,12 @@ pub(crate) async fn serve(
     };
     list_session_projects(&root, &registry)?;
 
-    let initial_handle = ConversationHandle::spawn(agent, registry.clone())?;
+    let initial_handle = coordinator.install(agent)?;
     let initial_id = initial_handle.snapshot().session.id;
-    let manager = ConversationManager::with_handle(registry.clone(), initial_handle.clone());
+    let manager = coordinator.manager();
     let state = ServerState {
         inner: Arc::new(ServerInner {
+            coordinator,
             config: RwLock::new(config),
             registry: registry.clone(),
             debug_openai,
@@ -413,6 +422,7 @@ pub(crate) async fn serve(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_agent(
     root: &std::path::Path,
     config: &Config,
@@ -428,6 +438,7 @@ fn build_agent(
     )
 }
 
+#[cfg(test)]
 fn build_agent_with_instructions_path(
     root: &std::path::Path,
     config: &Config,
@@ -435,9 +446,9 @@ fn build_agent_with_instructions_path(
     session: Session,
     global_instructions_path: PathBuf,
 ) -> Result<Agent> {
-    let mut provider = OpenAiCompatible::new(config, &session.provider)?;
+    let mut provider = crate::provider::OpenAiCompatible::new(config, &session.provider)?;
     provider.set_debug_openai(debug_openai);
-    let tools = ToolBox::with_shell(root.to_path_buf(), config.shell.clone());
+    let tools = crate::tools::ToolBox::with_shell(root.to_path_buf(), config.shell.clone());
     Agent::new(
         provider,
         tools,
@@ -586,6 +597,11 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         models: selected_id
             .and_then(|id| state.inner.catalogs.read().unwrap().get(&id).cloned())
             .map(|catalog| catalog.models)
+            .or_else(|| {
+                conversation_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.model_catalog.clone())
+            })
             .unwrap_or_default(),
         catalog_error: selected_id
             .and_then(|id| state.inner.catalogs.read().unwrap().get(&id).cloned())
@@ -1003,6 +1019,7 @@ async fn save_provider(
         provider.validate(&request.name)?;
         config.providers.insert(request.name, provider);
         store.save(&config)?;
+        state.inner.coordinator.update_config(config.clone());
         *state.inner.config.write().unwrap() = config;
     }
     Ok(Json(snapshot(&state).await?))
@@ -1018,6 +1035,7 @@ async fn use_provider(
         config.provider(&request.name)?;
         config.active_provider = request.name;
         store.save(&config)?;
+        state.inner.coordinator.update_config(config.clone());
         *state.inner.config.write().unwrap() = config;
     }
     Ok(Json(snapshot(&state).await?))
@@ -1039,6 +1057,7 @@ async fn delete_provider(
         }
         config.providers.remove(&request.name);
         store.save(&config)?;
+        state.inner.coordinator.update_config(config.clone());
         *state.inner.config.write().unwrap() = config;
     }
     Ok(Json(snapshot(&state).await?))
@@ -1121,12 +1140,7 @@ async fn new_session(
         current.persist_if_idle().await?;
     }
     let session = configured_new_session(&state, &root)?;
-    let mut agent = build_agent(
-        &root,
-        &state.inner.config.read().unwrap(),
-        state.inner.debug_openai.clone(),
-        session,
-    )?;
+    let mut agent = state.inner.coordinator.build_agent(&root, session)?;
     let catalog = load_catalog(&mut agent, true).await;
     let conversation = install_conversation(&state, root, agent).await?;
     let session_id = conversation.snapshot().session.id;
@@ -1136,10 +1150,7 @@ async fn new_session(
 }
 
 fn configured_new_session(state: &ServerState, root: &std::path::Path) -> Result<Session> {
-    let config = state.inner.config.read().unwrap();
-    let active = config.provider(&config.active_provider)?;
-    SessionStore::new(root)?
-        .create_for_provider(config.active_provider.clone(), active.model.clone())
+    state.inner.coordinator.create_session(root)
 }
 
 async fn resume_session(
@@ -1165,12 +1176,7 @@ async fn resume_session(
         drop(workspace);
         return Ok(Json(snapshot(&state).await?));
     }
-    let mut agent = build_agent(
-        &root,
-        &state.inner.config.read().unwrap(),
-        state.inner.debug_openai.clone(),
-        session,
-    )?;
+    let mut agent = state.inner.coordinator.build_agent(&root, session)?;
     let catalog = load_catalog(&mut agent, false).await;
     let conversation = install_conversation(&state, root, agent).await?;
     install_catalog(&state.inner, conversation.snapshot().session.id, catalog);
@@ -1223,12 +1229,7 @@ async fn delete_session(
                 workspace.selected_session = Some(session.id);
                 workspace.conversation = Some(existing);
             } else {
-                let mut agent = build_agent(
-                    &root,
-                    &state.inner.config.read().unwrap(),
-                    state.inner.debug_openai.clone(),
-                    session,
-                )?;
+                let mut agent = state.inner.coordinator.build_agent(&root, session)?;
                 let catalog = load_catalog(&mut agent, false).await;
                 let conversation = install_conversation(&state, root.clone(), agent).await?;
                 install_catalog(&state.inner, conversation.snapshot().session.id, catalog);
@@ -1598,8 +1599,16 @@ mod tests {
         registry: SessionRegistry,
     ) -> ServerState {
         let session_id = conversation.snapshot().session.id;
+        let coordinator = SessionCoordinator::new(
+            config.clone(),
+            registry.clone(),
+            DebugOutput::default(),
+            DiagnosticLog::stderr(),
+            root.join(".test-global-config").join("AGENTS.md"),
+        );
         ServerState {
             inner: Arc::new(ServerInner {
+                coordinator,
                 config: RwLock::new(config),
                 registry: registry.clone(),
                 debug_openai: DebugOutput::default(),

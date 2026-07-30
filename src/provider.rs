@@ -1484,6 +1484,60 @@ mod tests {
     }
 
     #[test]
+    fn both_provider_protocols_expose_all_session_control_tools() {
+        let definitions = crate::coordination::SessionControl::definitions();
+        let messages = [Message::text(Role::System, "system")];
+        let chat = serde_json::to_value(ChatRequest {
+            model: "gpt-test",
+            messages: messages.iter().map(ChatMessage::from).collect(),
+            tools: &definitions,
+            tool_choice: "auto",
+            parallel_tool_calls: true,
+            stream: true,
+            stream_options: ChatStreamOptions {
+                include_usage: true,
+            },
+            max_completion_tokens: None,
+            reasoning_effort: None,
+            service_tier: None,
+        })
+        .unwrap();
+        let responses = responses_payload(
+            "gpt-test",
+            None,
+            None,
+            &messages,
+            &definitions,
+            None,
+            Uuid::nil(),
+        );
+        for name in [
+            "session_create",
+            "session_list",
+            "session_status",
+            "session_messages",
+            "session_send",
+            "session_stop",
+            "session_wait",
+        ] {
+            assert!(
+                chat["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == name)
+            );
+            assert!(
+                responses["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == name)
+            );
+        }
+    }
+
+    #[test]
     fn parses_usage_from_both_streaming_protocol_shapes() {
         let responses = parse_token_usage(&json!({
             "input_tokens": 120,

@@ -268,6 +268,48 @@ fn activity_labels(tool: &str) -> (ActivityKind, &'static str, &'static str, &'s
             "Read skill file",
             "Failed to read skill file",
         ),
+        "session_create" => (
+            ActivityKind::Other,
+            "Creating delegated session",
+            "Created delegated session",
+            "Failed to create delegated session",
+        ),
+        "session_list" => (
+            ActivityKind::Read,
+            "Listing sessions",
+            "Listed sessions",
+            "Failed to list sessions",
+        ),
+        "session_status" => (
+            ActivityKind::Read,
+            "Checking session status",
+            "Checked session status",
+            "Failed to check session status",
+        ),
+        "session_messages" => (
+            ActivityKind::Read,
+            "Reading session messages",
+            "Read session messages",
+            "Failed to read session messages",
+        ),
+        "session_send" => (
+            ActivityKind::Other,
+            "Sending to session",
+            "Sent to session",
+            "Failed to send to session",
+        ),
+        "session_stop" => (
+            ActivityKind::Other,
+            "Stopping session turn",
+            "Stopped session turn",
+            "Failed to stop session turn",
+        ),
+        "session_wait" => (
+            ActivityKind::Read,
+            "Waiting for sessions",
+            "Observed session change",
+            "Failed while waiting for sessions",
+        ),
         _ => (
             ActivityKind::Other,
             "Using tool",
@@ -297,6 +339,23 @@ fn activity_detail(tool: &str, arguments: &str) -> String {
                 .to_owned()
         }
         "load_skill" => string_arg(&arguments, "name").unwrap_or(tool).to_owned(),
+        "session_create" => "fresh isolated context".into(),
+        "session_list" => "controllable sessions".into(),
+        "session_status" => arguments
+            .get("session_ids")
+            .and_then(Value::as_array)
+            .map(|ids| format!("{} session(s)", ids.len()))
+            .unwrap_or_else(|| tool.to_owned()),
+        "session_messages" | "session_send" | "session_stop" => {
+            string_arg(&arguments, "session_id")
+                .unwrap_or(tool)
+                .to_owned()
+        }
+        "session_wait" => arguments
+            .get("targets")
+            .and_then(Value::as_array)
+            .map(|targets| format!("{} session(s)", targets.len()))
+            .unwrap_or_else(|| tool.to_owned()),
         _ => ["path", "name", "query", "command"]
             .into_iter()
             .find_map(|key| string_arg(&arguments, key))

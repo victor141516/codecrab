@@ -10,11 +10,15 @@ use serde_json::{Value, json};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 use walkdir::WalkDir;
 
-use crate::terminal::{TerminalManager, TerminalRecord};
+use crate::{
+    coordination::SessionControl,
+    terminal::{TerminalManager, TerminalRecord},
+};
 
 pub(crate) struct ToolBox {
     root: PathBuf,
     terminals: TerminalManager,
+    session_control: Option<SessionControl>,
 }
 
 impl ToolBox {
@@ -23,10 +27,24 @@ impl ToolBox {
         Self::with_shell(root, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_shell(root: PathBuf, shell: Option<String>) -> Self {
         Self {
             terminals: TerminalManager::new(root.clone(), shell),
             root,
+            session_control: None,
+        }
+    }
+
+    pub(crate) fn with_session_control(
+        root: PathBuf,
+        shell: Option<String>,
+        session_control: SessionControl,
+    ) -> Self {
+        Self {
+            terminals: TerminalManager::new(root.clone(), shell),
+            root,
+            session_control: Some(session_control),
         }
     }
 
@@ -51,7 +69,7 @@ impl ToolBox {
     }
 
     pub(crate) fn definitions(&self) -> Vec<Value> {
-        vec![
+        let mut definitions = vec![
             tool(
                 "list_files",
                 "List files and directories. Relative paths start at the working directory; parent and absolute paths are allowed.",
@@ -179,7 +197,11 @@ impl ToolBox {
                 "List all managed terminals registered to this conversation.",
                 json!({"type": "object", "properties": {}}),
             ),
-        ]
+        ];
+        if self.session_control.is_some() {
+            definitions.extend(SessionControl::definitions());
+        }
+        definitions
     }
 
     pub(crate) async fn execute(&self, name: &str, args: &str) -> Value {
@@ -201,6 +223,10 @@ impl ToolBox {
             "terminal_read" => self.terminal_read(&parsed).await,
             "terminal_close" => self.terminal_close(&parsed),
             "terminal_list" => Ok(self.terminals.list()),
+            name if name.starts_with("session_") => match &self.session_control {
+                Some(control) => control.execute(name, &parsed).await,
+                None => Err(anyhow::anyhow!("session control is unavailable")),
+            },
             _ => Err(anyhow::anyhow!("unknown tool {name:?}")),
         };
         match result {
