@@ -37,6 +37,7 @@ import {
   createComposerDraftController,
   createComposerDraftStore
 } from "./composer-drafts.js";
+import { recalledMessageForComposer } from "./composer-recall.js";
 import {
   consumeCompletionNdjson,
   mergeCompletionUpdate
@@ -109,6 +110,7 @@ const hoveredBranchNode = ref(null);
 const branchSelecting = ref(false);
 const branchOriginalPath = ref(new Set());
 const editingMessageNode = ref(null);
+const recalledMessageNode = ref(null);
 const messageEditDraft = ref("");
 const messageEditor = ref(null);
 let autocompleteRequest = 0;
@@ -974,7 +976,8 @@ async function beginMessageEdit(item) {
     sending.value ||
     branchSelecting.value ||
     !item.nodeId ||
-    editingMessageNode.value
+    editingMessageNode.value ||
+    recalledMessageNode.value
   ) {
     return;
   }
@@ -993,6 +996,42 @@ async function beginMessageEdit(item) {
 function cancelMessageEdit() {
   editingMessageNode.value = null;
   messageEditDraft.value = "";
+}
+
+async function recallLatestUserMessage() {
+  if (
+    sending.value ||
+    recording.value ||
+    transcribing.value ||
+    branchesOpen.value ||
+    editingMessageNode.value
+  ) {
+    return false;
+  }
+  const recalled = recalledMessageForComposer(
+    session.value,
+    draft.value,
+    recalledMessageNode.value
+  );
+  if (!recalled) return false;
+  recalledMessageNode.value = recalled.nodeId;
+  draft.value = recalled.content;
+  closeAutocomplete();
+  error.value = "";
+  await nextTick();
+  resizeComposer();
+  composer.value?.focus();
+  composer.value?.setSelectionRange(draft.value.length, draft.value.length);
+  return true;
+}
+
+async function cancelRecalledMessageEdit() {
+  if (!recalledMessageNode.value) return false;
+  recalledMessageNode.value = null;
+  await clearComposer();
+  closeAutocomplete();
+  error.value = "";
+  return true;
 }
 
 function projectEditedMessage(nodeId, content) {
@@ -1041,7 +1080,13 @@ function handleMessageEditorKey(event) {
 }
 
 async function clearSession() {
-  if (branchesOpen.value || editingMessageNode.value) return;
+  if (
+    branchesOpen.value ||
+    editingMessageNode.value ||
+    recalledMessageNode.value
+  ) {
+    return;
+  }
   const sessionId = session.value?.id;
   if (!sessionId) return;
   error.value = "";
@@ -1642,6 +1687,25 @@ async function sendPrompt() {
     await finishQueuedPromptEdit(prompt);
     return;
   }
+  if (recalledMessageNode.value) {
+    const nodeId = recalledMessageNode.value;
+    if (!projectEditedMessage(nodeId, prompt)) {
+      error.value = "The recalled message is no longer on the visible branch.";
+      return;
+    }
+    const sent = composerDrafts.snapshot();
+    recalledMessageNode.value = null;
+    await clearComposer({ keepStored: true });
+    const completed = await runPrompt(prompt, { editNodeId: nodeId });
+    await composerDrafts.finishSend(sent, completed);
+    if (
+      !completed &&
+      session.value?.active_message_ids?.includes(nodeId)
+    ) {
+      recalledMessageNode.value = nodeId;
+    }
+    return;
+  }
   if (prompt === "/goals") {
     await clearComposer();
     closeAutocomplete();
@@ -1876,6 +1940,11 @@ function handleGlobalKeydown(event) {
     cancelMessageEdit();
     return;
   }
+  if (recalledMessageNode.value) {
+    event.preventDefault();
+    void cancelRecalledMessageEdit();
+    return;
+  }
   if (branchesOpen.value) {
     if (!sending.value) {
       event.preventDefault();
@@ -2099,6 +2168,11 @@ function handleComposerKey(event) {
       closeAutocomplete();
       return;
     }
+  }
+  if (event.key === "ArrowUp" && draft.value === "" && !sending.value) {
+    event.preventDefault();
+    void recallLatestUserMessage();
+    return;
   }
   if (event.key === "Enter" && !event.shiftKey && !event.altKey) {
     event.preventDefault();
@@ -2989,7 +3063,12 @@ onBeforeUnmount(() => {
             v-if="session"
             class="grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-30"
             :class="branchesOpen ? 'text-coral' : 'text-zinc-600'"
-            :disabled="sending || Boolean(editingMessageNode) || !branchNodes.length"
+            :disabled="
+              sending ||
+              Boolean(editingMessageNode) ||
+              Boolean(recalledMessageNode) ||
+              !branchNodes.length
+            "
             title="Browse conversation branches"
             aria-label="Browse conversation branches"
             :aria-pressed="branchesOpen"
