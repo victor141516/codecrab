@@ -4923,18 +4923,19 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ),
                     Span::styled(if active { "● " } else { "  " }, Style::default().fg(AQUA)),
                     Span::styled(
-                        format!("{:<28}", compact_text(&session.title, 27)),
+                        format!("{:<20}", compact_text(&session.title, 19)),
                         Style::default()
                             .fg(if selected { Color::White } else { AQUA })
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!(
-                            " {:<18}  {:<8}  {}  {}",
-                            compact_text(&session.model, 17),
+                            " {:<10}  {:<8}  {}  C {}  U {}",
+                            compact_text(&session.model, 9),
                             status,
                             &session.id.to_string()[..8],
-                            session.updated_at.format("%Y-%m-%d %H:%M")
+                            session.created_at.format("%m-%d %H:%M"),
+                            session.updated_at.format("%m-%d %H:%M")
                         ),
                         Style::default().fg(MUTED),
                     ),
@@ -5372,11 +5373,15 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
             continue;
         }
         println!("\n{}", project.root.display());
-        println!("  {:<10}  {:<20}  {:<18}  TITLE", "ID", "UPDATED", "MODEL");
+        println!(
+            "  {:<10}  {:<20}  {:<20}  {:<18}  TITLE",
+            "ID", "CREATED", "UPDATED", "MODEL"
+        );
         for session in &project.sessions {
             println!(
-                "  {:<10}  {:<20}  {:<18}  {}",
+                "  {:<10}  {:<20}  {:<20}  {:<18}  {}",
                 &session.id.to_string()[..8],
+                session.created_at.format("%Y-%m-%d %H:%M"),
                 session.updated_at.format("%Y-%m-%d %H:%M"),
                 session.model,
                 session.title
@@ -7720,6 +7725,8 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("other-project"));
         assert!(text.contains("Saved conversation"));
+        assert!(text.contains(" C "));
+        assert!(text.contains(" U "));
         assert!(text.contains("Del delete"));
 
         app.accept_session_selection().await.unwrap();

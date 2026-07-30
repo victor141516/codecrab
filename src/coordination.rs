@@ -231,6 +231,7 @@ impl SessionCoordinator {
                     "live": live.is_some(),
                     "lifecycle": lifecycle,
                     "observation_revision": revision,
+                    "created_at": session.created_at,
                     "updated_at": session.updated_at,
                     "current": session.id == caller_session_id,
                 }));

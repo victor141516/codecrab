@@ -72,7 +72,7 @@ codecrab -C path/to/project
 
 ## Choose your interface
 
-All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior.
+All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists are grouped by project and ordered by creation time, newest first; activity updates do not move an existing session. The terminal and web pickers show both creation (`C`) and last-update (`U`) times, and `codecrab sessions` prints `CREATED` and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
 
 ### Interactive terminal
 
