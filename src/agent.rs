@@ -87,8 +87,12 @@ impl Agent {
         mut provider: OpenAiCompatible,
         tools: ToolBox,
         skills: SkillRegistry,
-        session: Session,
+        mut session: Session,
     ) -> Result<Self> {
+        tools.restore_terminals(&session.terminals, session.next_terminal_id);
+        let (next_terminal_id, terminals) = tools.terminal_state();
+        session.next_terminal_id = next_terminal_id;
+        session.terminals = terminals;
         provider.set_selection(&ModelSelection {
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
@@ -160,7 +164,8 @@ impl Agent {
         self.skills.skills()
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) -> Result<()> {
+        self.tools.clear_terminals()?;
         self.session.pause_active_goal();
         self.session.messages.clear();
         self.session.activities.clear();
@@ -168,9 +173,18 @@ impl Agent {
         self.session.turns.clear();
         self.session.compaction_checkpoints.clear();
         self.session.latest_request_usage = None;
+        self.session.next_terminal_id = 1;
+        self.session.terminals.clear();
         self.compaction_debounce_tokens = None;
         self.session.title = "New session".into();
         self.session.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<()> {
+        self.tools.close_terminals()?;
+        self.sync_terminal_state();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -607,7 +621,7 @@ impl Agent {
                     self.skills
                         .execute(&call.function.name, &call.function.arguments)
                 } else {
-                    tokio::select! {
+                    let result = tokio::select! {
                         result = self.tools.execute(
                             &call.function.name,
                             &call.function.arguments,
@@ -623,11 +637,22 @@ impl Agent {
                                 );
                             }
                             self.session.updated_at = Utc::now();
+                            self.sync_terminal_state();
                             return Err(TurnCancelled.into());
                         }
+                    };
+                    if is_terminal_tool(&call.function.name) {
+                        self.sync_terminal_state();
                     }
+                    result
                 };
                 activity.finish(result["ok"].as_bool().unwrap_or(false));
+                if call.function.name == "shell"
+                    && result["result"]["state"] == "running"
+                    && result["ok"] == true
+                {
+                    activity.title = "Started terminal".into();
+                }
                 self.record_activity(activity, events.as_ref());
                 self.session.messages.push(Message {
                     role: Role::Tool,
@@ -985,6 +1010,13 @@ summary",
         });
     }
 
+    fn sync_terminal_state(&mut self) {
+        let (next_terminal_id, terminals) = self.tools.terminal_state();
+        self.session.next_terminal_id = next_terminal_id;
+        self.session.terminals = terminals;
+        self.session.updated_at = Utc::now();
+    }
+
     fn record_activity(
         &mut self,
         activity: AgentActivity,
@@ -1135,12 +1167,15 @@ fn preserve_partial_assistant(
 fn tool_batch_rejections(root: &Path, calls: &[ToolCall]) -> Vec<Option<String>> {
     let mut rejections = vec![None; calls.len()];
 
-    if let Some(shell_index) = calls.iter().position(|call| call.function.name == "shell") {
+    if let Some(shell_index) = calls
+        .iter()
+        .position(|call| is_terminal_barrier(&call.function.name))
+    {
         let rejected_from = if shell_index == 0 { 1 } else { shell_index };
         for rejection in rejections.iter_mut().skip(rejected_from) {
             *rejection = Some(
-                "deferred because shell execution is a response barrier; request this tool again \
-                 after observing the shell output"
+                "deferred because shell and terminal operations are response barriers; request \
+                 this tool again after observing the terminal result"
                     .into(),
             );
         }
@@ -1163,6 +1198,25 @@ fn tool_batch_rejections(root: &Path, calls: &[ToolCall]) -> Vec<Option<String>>
     }
 
     rejections
+}
+
+fn is_terminal_barrier(tool: &str) -> bool {
+    matches!(
+        tool,
+        "shell"
+            | "shell_noninteractive"
+            | "terminal_input"
+            | "terminal_read"
+            | "terminal_close"
+            | "terminal_list"
+    )
+}
+
+fn is_terminal_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "shell" | "terminal_input" | "terminal_read" | "terminal_close" | "terminal_list"
+    )
 }
 
 fn write_target_key(root: &Path, call: &ToolCall) -> Option<String> {
@@ -1233,7 +1287,7 @@ Work autonomously toward the user's request:
 - Relative paths start at the working directory. Parent paths and absolute paths are allowed.
 - Group independent list_files, read_file, search, load_skill, and read_skill_file calls in the same response whenever useful.
 - You may also group write_file and replace_in_file calls only when every call targets a different file. Never modify the same resolved path twice in one response.
-- Shell is a response barrier: emit at most one shell call in a response and do not emit any other tool call with it. Wait for its output before deciding or requesting the next operation.
+- Shell is a response barrier, as are all terminal operations: emit at most one shell, shell_noninteractive, terminal_input, terminal_read, terminal_close, or terminal_list call in a response and do not emit any other tool call with it. Wait for its result before deciding or requesting the next operation.
 - Briefly explain the result when finished. Mention verification and any remaining limitation.
 
 Communication:
@@ -1418,8 +1472,7 @@ mod tests {
         let server_started = request_started.clone();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 16_384];
-            let _ = socket.read(&mut request).await.unwrap();
+            let _request = crate::test_support::read_http_request(&mut socket).await;
             server_started.notify_one();
             std::future::pending::<()>().await;
         });
@@ -1482,8 +1535,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for attempt in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0; 16_384];
-                let _ = socket.read(&mut request).await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
                 let (status, body) = if attempt == 0 {
                     (
                         "500 Internal Server Error",
@@ -1576,8 +1628,7 @@ mod tests {
             let body = json!({"error": {"message": "still unavailable"}}).to_string();
             for _ in 0..=MAX_MODEL_RETRIES {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0; 16_384];
-                let _ = socket.read(&mut request).await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
                 let response = format!(
                     "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -1663,8 +1714,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for body in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0; 16_384];
-                let _ = socket.read(&mut request).await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -1953,8 +2003,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for body in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0; 16_384];
-                let _ = socket.read(&mut request).await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -2044,8 +2093,7 @@ mod tests {
         let server = tokio::spawn(async move {
             for body in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0; 16_384];
-                let _ = socket.read(&mut request).await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),

@@ -2040,7 +2040,7 @@ impl App {
             provider.set_debug_openai(self.debug_openai.clone());
             let mut agent = Agent::new(
                 provider,
-                ToolBox::new(root.clone()),
+                ToolBox::with_shell(root.clone(), self.config.shell.clone()),
                 SkillRegistry::discover(&root),
                 session,
             )?;
@@ -2165,7 +2165,7 @@ impl App {
             provider.set_debug_openai(self.debug_openai.clone());
             let mut agent = Agent::new(
                 provider,
-                ToolBox::new(root.clone()),
+                ToolBox::with_shell(root.clone(), self.config.shell.clone()),
                 SkillRegistry::discover(&root),
                 session,
             )?;

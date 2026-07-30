@@ -226,7 +226,36 @@ fn activity_labels(tool: &str) -> (ActivityKind, &'static str, &'static str, &'s
         ),
         "write_file" => (ActivityKind::Write, "Writing", "Wrote", "Failed to write"),
         "replace_in_file" => (ActivityKind::Write, "Editing", "Edited", "Failed to edit"),
-        "shell" => (ActivityKind::Shell, "Running", "Ran", "Command failed"),
+        "shell" | "shell_noninteractive" => (
+            ActivityKind::Shell,
+            "Running command",
+            "Ran command",
+            "Command failed",
+        ),
+        "terminal_input" => (
+            ActivityKind::Shell,
+            "Interacting with terminal",
+            "Interacted with terminal",
+            "Terminal interaction failed",
+        ),
+        "terminal_read" => (
+            ActivityKind::Shell,
+            "Observing terminal",
+            "Observed terminal",
+            "Terminal observation failed",
+        ),
+        "terminal_close" => (
+            ActivityKind::Shell,
+            "Closing terminal",
+            "Closed terminal",
+            "Failed to close terminal",
+        ),
+        "terminal_list" => (
+            ActivityKind::Shell,
+            "Listing terminals",
+            "Listed terminals",
+            "Failed to list terminals",
+        ),
         "load_skill" => (
             ActivityKind::Skill,
             "Loading skill",
@@ -259,7 +288,14 @@ fn activity_detail(tool: &str, arguments: &str) -> String {
             format!("{query:?} in {path}")
         }
         "list_files" => string_arg(&arguments, "path").unwrap_or(".").to_owned(),
-        "shell" => string_arg(&arguments, "command").unwrap_or(tool).to_owned(),
+        "shell" | "shell_noninteractive" => {
+            string_arg(&arguments, "command").unwrap_or(tool).to_owned()
+        }
+        "terminal_input" | "terminal_read" | "terminal_close" => {
+            string_arg(&arguments, "terminal_id")
+                .unwrap_or(tool)
+                .to_owned()
+        }
         "load_skill" => string_arg(&arguments, "name").unwrap_or(tool).to_owned(),
         _ => ["path", "name", "query", "command"]
             .into_iter()

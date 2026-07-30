@@ -15,6 +15,9 @@ mod provider;
 mod server;
 mod session;
 mod skills;
+mod terminal;
+#[cfg(test)]
+mod test_support;
 mod tools;
 mod transcription;
 mod ui;
@@ -255,7 +258,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("prompt is empty");
             }
             let provider = new_provider(&config, &config.active_provider, debug_openai)?;
-            let tools = ToolBox::new(root.clone());
+            let tools = ToolBox::with_shell(root.clone(), config.shell.clone());
             let active = config.provider(&config.active_provider)?;
             let session =
                 store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
@@ -292,7 +295,7 @@ async fn main() -> Result<()> {
             let session_store = SessionStore::new(&session_root)?;
             let session = session_store.load(Some(&session_id.to_string()))?;
             let provider = new_provider(&config, &session.provider, debug_openai.clone())?;
-            let tools = ToolBox::new(session_root.clone());
+            let tools = ToolBox::with_shell(session_root.clone(), config.shell.clone());
             let agent = Agent::new(
                 provider,
                 tools,
@@ -311,7 +314,7 @@ async fn main() -> Result<()> {
         }
         None => {
             let provider = new_provider(&config, &config.active_provider, debug_openai.clone())?;
-            let tools = ToolBox::new(root);
+            let tools = ToolBox::with_shell(root, config.shell.clone());
             let active = config.provider(&config.active_provider)?;
             let session =
                 store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
