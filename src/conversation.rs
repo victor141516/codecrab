@@ -796,6 +796,8 @@ mod tests {
             ToolBox::new(root.to_path_buf()),
             SkillRegistry::default(),
             session,
+            root.join(".test-global-config").join("AGENTS.md"),
+            crate::diagnostics::DiagnosticLog::default(),
         )
         .unwrap();
         ConversationHandle::spawn(

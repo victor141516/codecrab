@@ -32,7 +32,7 @@ use crate::{
     auth::OAuthStore,
     config::{Config, ConfigStore, ProviderConfig, SessionRegistry, validate_provider_name},
     conversation::{ConversationHandle, ConversationManager},
-    diagnostics::DebugOutput,
+    diagnostics::{DebugOutput, DiagnosticLog},
     provider::OpenAiCompatible,
     session::{SessionStore, list_session_projects, resolve_global_session},
     skills::SkillRegistry,
@@ -262,7 +262,14 @@ async fn main() -> Result<()> {
             let active = config.provider(&config.active_provider)?;
             let session =
                 store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
-            let mut agent = Agent::new(provider, tools, skills, session)?;
+            let mut agent = Agent::new(
+                provider,
+                tools,
+                skills,
+                session,
+                Config::instructions_path()?,
+                DiagnosticLog::stderr(),
+            )?;
             match agent.fetch_models().await {
                 Ok(catalog) => {
                     agent.resolve_new_session_model(&catalog);
@@ -296,17 +303,20 @@ async fn main() -> Result<()> {
             let session = session_store.load(Some(&session_id.to_string()))?;
             let provider = new_provider(&config, &session.provider, debug_openai.clone())?;
             let tools = ToolBox::with_shell(session_root.clone(), config.shell.clone());
+            let diagnostics = DiagnosticLog::tui(cli.error_log.clone());
             let agent = Agent::new(
                 provider,
                 tools,
                 SkillRegistry::discover(&session_root),
                 session,
+                Config::instructions_path()?,
+                diagnostics.clone(),
             )?;
             ui::interactive(
                 agent,
                 &registry,
                 debug_openai,
-                cli.error_log,
+                diagnostics,
                 config.clone(),
                 false,
             )
@@ -318,12 +328,20 @@ async fn main() -> Result<()> {
             let active = config.provider(&config.active_provider)?;
             let session =
                 store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
-            let agent = Agent::new(provider, tools, skills, session)?;
+            let diagnostics = DiagnosticLog::tui(cli.error_log.clone());
+            let agent = Agent::new(
+                provider,
+                tools,
+                skills,
+                session,
+                Config::instructions_path()?,
+                diagnostics.clone(),
+            )?;
             ui::interactive(
                 agent,
                 &registry,
                 debug_openai,
-                cli.error_log,
+                diagnostics,
                 config.clone(),
                 true,
             )

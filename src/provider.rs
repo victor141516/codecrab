@@ -1586,6 +1586,64 @@ mod tests {
     }
 
     #[test]
+    fn contextual_agent_instructions_keep_user_role_and_request_order_in_both_protocols() {
+        let messages = vec![
+            Message::text(Role::System, "stable system policy"),
+            Message::hidden_text(
+                Role::User,
+                "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nglobal rule\n</INSTRUCTIONS>",
+            ),
+            Message::text(Role::User, "visible request"),
+        ];
+
+        let responses =
+            responses_payload("gpt-test", None, None, &messages, &[], None, Uuid::nil());
+        assert_eq!(responses["instructions"], "stable system policy");
+        assert!(
+            !responses["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("global rule")
+        );
+        assert_eq!(responses["input"][0]["role"], "user");
+        assert!(
+            responses["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("global rule")
+        );
+        assert_eq!(
+            responses["input"][1]["content"][0]["text"],
+            "visible request"
+        );
+
+        let chat = serde_json::to_value(ChatRequest {
+            model: "gpt-test",
+            messages: messages.iter().map(ChatMessage::from).collect(),
+            tools: &[],
+            tool_choice: "auto",
+            parallel_tool_calls: true,
+            stream: true,
+            stream_options: ChatStreamOptions {
+                include_usage: true,
+            },
+            max_completion_tokens: None,
+            reasoning_effort: None,
+            service_tier: None,
+        })
+        .unwrap();
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][1]["role"], "user");
+        assert!(
+            chat["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("global rule")
+        );
+        assert_eq!(chat["messages"][2]["content"], "visible request");
+    }
+
+    #[test]
     fn parses_text_and_function_calls_from_sse() {
         let body = concat!(
             "event: response.output_text.delta\n",

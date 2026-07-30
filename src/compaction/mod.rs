@@ -157,6 +157,7 @@ pub(crate) fn summarizer_messages(
     messages: &[Message],
     previous: Option<&CompactionCheckpoint>,
     tail_start: usize,
+    instruction_context: Option<&Message>,
     tuning: &CompactionTuning,
 ) -> Vec<Message> {
     let source_start = previous
@@ -193,10 +194,10 @@ pub(crate) fn summarizer_messages(
             &tool_calls,
         );
     }
-    vec![
-        Message::text(Role::System, SUMMARY_SYSTEM_PROMPT),
-        Message::text(Role::User, input),
-    ]
+    let mut request = vec![Message::text(Role::System, SUMMARY_SYSTEM_PROMPT)];
+    request.extend(instruction_context.cloned());
+    request.push(Message::text(Role::User, input));
+    request
 }
 
 pub(crate) fn select_compaction_end(
@@ -204,6 +205,7 @@ pub(crate) fn select_compaction_end(
     previous: Option<&CompactionCheckpoint>,
     desired_tail_start: usize,
     input_budget: u64,
+    instruction_context: Option<&Message>,
     tuning: &CompactionTuning,
 ) -> usize {
     let source_start = previous
@@ -224,7 +226,8 @@ pub(crate) fn select_compaction_end(
     };
     let mut selected = first;
     for candidate in candidates {
-        let request = summarizer_messages(messages, previous, candidate, tuning);
+        let request =
+            summarizer_messages(messages, previous, candidate, instruction_context, tuning);
         if estimate_messages(&request, tuning) > input_budget {
             break;
         }
@@ -450,7 +453,7 @@ mod tests {
         let tail_start = select_tail_start(&messages, None, 1, &tiny_tuning()).unwrap();
         assert_eq!(tail_start, 4);
 
-        let summary = summarizer_messages(&messages, None, tail_start, &tiny_tuning());
+        let summary = summarizer_messages(&messages, None, tail_start, None, &tiny_tuning());
         let rendered = summary[1].content.as_deref().unwrap();
         for expected in ["read-a", "read-b", "contents a", "contents b"] {
             assert!(rendered.contains(expected));
@@ -478,6 +481,34 @@ mod tests {
     }
 
     #[test]
+    fn summarizer_projection_includes_instruction_context_before_its_source_input() {
+        let messages = vec![
+            Message::text(Role::User, "old request"),
+            Message::text(Role::Assistant, "old answer"),
+            Message::text(Role::User, "recent request"),
+        ];
+        let instructions = Message::hidden_text(Role::User, "global instruction context");
+
+        let projection =
+            summarizer_messages(&messages, None, 2, Some(&instructions), &tiny_tuning());
+
+        assert_eq!(projection.len(), 3);
+        assert!(matches!(projection[0].role, Role::System));
+        assert_eq!(
+            projection[1].content.as_deref(),
+            Some("global instruction context")
+        );
+        assert!(projection[1].hidden);
+        assert!(
+            projection[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("old request")
+        );
+    }
+
+    #[test]
     fn historical_tool_truncation_does_not_mutate_the_canonical_message() {
         let content = "x".repeat(100);
         let messages = vec![
@@ -495,7 +526,7 @@ mod tests {
         ];
         let mut tuning = tiny_tuning();
         tuning.summarizer_tool_output_characters = 20;
-        let summary_input = summarizer_messages(&messages, None, 2, &tuning);
+        let summary_input = summarizer_messages(&messages, None, 2, None, &tuning);
         assert!(
             summary_input[1]
                 .content
@@ -567,7 +598,7 @@ mod tests {
         tuning.summarizer_file_content_characters = 20;
         tuning.summarizer_tool_argument_characters = 20;
 
-        let summary_input = summarizer_messages(&messages, None, 4, &tuning);
+        let summary_input = summarizer_messages(&messages, None, 4, None, &tuning);
         let rendered = summary_input[1].content.as_deref().unwrap();
         assert!(!rendered.contains(&read_secret));
         assert!(!rendered.contains("WRITE_SECRET_"));
@@ -596,11 +627,13 @@ mod tests {
             Message::text(Role::User, "current turn"),
         ];
         let tuning = tiny_tuning();
-        let first_chunk =
-            estimate_messages(&summarizer_messages(&messages, None, 2, &tuning), &tuning);
+        let first_chunk = estimate_messages(
+            &summarizer_messages(&messages, None, 2, None, &tuning),
+            &tuning,
+        );
 
         assert_eq!(
-            select_compaction_end(&messages, None, 6, first_chunk, &tuning),
+            select_compaction_end(&messages, None, 6, first_chunk, None, &tuning),
             2
         );
         assert_eq!(reduce_compaction_end(&messages, None, 6), Some(4));
@@ -619,7 +652,7 @@ mod tests {
             Message::text(Role::User, "turn four"),
         ];
         let first = CompactionCheckpoint::test(2, "summary v1");
-        let second_input = summarizer_messages(&messages, Some(&first), 4, &tiny_tuning());
+        let second_input = summarizer_messages(&messages, Some(&first), 4, None, &tiny_tuning());
         let second_text = second_input[1].content.as_deref().unwrap();
         assert!(second_text.contains("summary v1"));
         assert!(second_text.contains("turn two"));
@@ -627,7 +660,7 @@ mod tests {
 
         let mut second = CompactionCheckpoint::test(4, "summary v2");
         second.previous_checkpoint_id = Some(first.id);
-        let third_input = summarizer_messages(&messages, Some(&second), 6, &tiny_tuning());
+        let third_input = summarizer_messages(&messages, Some(&second), 6, None, &tiny_tuning());
         let third_text = third_input[1].content.as_deref().unwrap();
         assert!(third_text.contains("summary v2"));
         assert!(third_text.contains("turn three"));

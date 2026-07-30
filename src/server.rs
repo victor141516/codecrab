@@ -41,7 +41,7 @@ use crate::{
         validate_provider_name,
     },
     conversation::{ConversationHandle, ConversationManager, ConversationStatus},
-    diagnostics::DebugOutput,
+    diagnostics::{DebugOutput, DiagnosticLog},
     events::{AgentActivity, AgentEvent},
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
     provider::{Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible},
@@ -419,10 +419,43 @@ fn build_agent(
     debug_openai: impl Into<DebugOutput>,
     session: Session,
 ) -> Result<Agent> {
+    build_agent_with_instructions_path(
+        root,
+        config,
+        debug_openai,
+        session,
+        default_instructions_path(root)?,
+    )
+}
+
+fn build_agent_with_instructions_path(
+    root: &std::path::Path,
+    config: &Config,
+    debug_openai: impl Into<DebugOutput>,
+    session: Session,
+    global_instructions_path: PathBuf,
+) -> Result<Agent> {
     let mut provider = OpenAiCompatible::new(config, &session.provider)?;
     provider.set_debug_openai(debug_openai);
     let tools = ToolBox::with_shell(root.to_path_buf(), config.shell.clone());
-    Agent::new(provider, tools, SkillRegistry::discover(root), session)
+    Agent::new(
+        provider,
+        tools,
+        SkillRegistry::discover(root),
+        session,
+        global_instructions_path,
+        DiagnosticLog::stderr(),
+    )
+}
+
+#[cfg(not(test))]
+fn default_instructions_path(_root: &std::path::Path) -> Result<PathBuf> {
+    Config::instructions_path()
+}
+
+#[cfg(test)]
+fn default_instructions_path(root: &std::path::Path) -> Result<PathBuf> {
+    Ok(root.join(".test-global-config").join("AGENTS.md"))
 }
 
 async fn load_catalog(
