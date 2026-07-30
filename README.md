@@ -261,7 +261,7 @@ Keyboard shortcuts:
 | `Tab` | Complete the selected menu item |
 | `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` | Insert a newline (`Alt+Enter` or `Ctrl+J` on macOS terminals that cannot report `Shift+Enter`) |
 | `Ctrl+Shift+S` | Start or stop voice dictation (`Ctrl+S` on macOS) |
-| `Up` / `Down` | Navigate an open menu, otherwise move between editor lines |
+| `Up` / `Down` | Navigate an open menu; otherwise move between editor rows. `Up` recalls the latest visible user message when the idle composer is empty |
 | `Ctrl`/`Alt` + `Left`/`Right` | Move by word |
 | `Ctrl`/`Alt` + `Backspace` | Delete the previous word |
 | `Home`/`End`, `Ctrl+A`/`Ctrl+E` | Move to the start or end of the logical line |
@@ -277,10 +277,14 @@ Printable input uses the character resolved by the terminal and active keyboard
 layout. This includes `AltGr` combinations on international keyboards; CodeCrab
 does not map physical keys such as `2` to layout-specific symbols.
 Long composer lines wrap visually to the terminal width without inserting
-newlines into the prompt. Up/down navigation uses those visual rows. Word and
-line editing consumes Crossterm's decoded terminal events and traditional
-Readline sequences rather than checking the operating system; terminal-level
-remappings that emit the same sequences therefore keep working.
+newlines into the prompt. Up/down navigation uses those visual rows and never
+scrolls the conversation. With an empty idle composer, `Up` recalls only the
+latest visible user message; `Esc` cancels that staged edit, while submitting
+creates and selects a conversation branch. The web composer provides the same
+recall behavior. Word and line editing consumes Crossterm's decoded terminal
+events and traditional Readline sequences rather than checking the operating
+system; terminal-level remappings that emit the same sequences therefore keep
+working.
 
 Mouse interaction inside the terminal conversation uses the operating-system
 clipboard on Windows, macOS, Linux/X11, and supported Wayland compositors.

@@ -1768,6 +1768,38 @@ impl App {
         self.error = None;
     }
 
+    fn recall_latest_user_message(&mut self) {
+        if self.is_busy() || !self.input.is_empty() || self.editing_message.is_some() {
+            return;
+        }
+        let Some((message_index, content)) =
+            self.transcript
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, message)| {
+                    matches!(message.role, Role::User)
+                        .then(|| visible_message_content(message).map(|content| (index, content)))
+                        .flatten()
+                })
+        else {
+            return;
+        };
+        let Some(node_id) = self.transcript_node_ids.get(message_index).copied() else {
+            return;
+        };
+        self.input = content.to_owned();
+        self.cursor = self.input.len();
+        self.preferred_column = None;
+        self.close_completion();
+        self.editing_message = Some(MessageEdit {
+            node_id,
+            previous_input: String::new(),
+            previous_cursor: 0,
+        });
+        self.error = None;
+    }
+
     fn visible_goal(&self) -> Option<&Goal> {
         self.visible_goal_id
             .and_then(|id| self.goals.iter().find(|goal| goal.id == id))
@@ -3191,14 +3223,14 @@ impl App {
             KeyCode::Left => self.move_left(),
             KeyCode::Right => self.move_right(),
             KeyCode::Up => {
-                if !self.move_vertical(-1) {
-                    self.scroll_up(2);
+                if self.input.is_empty() {
+                    self.recall_latest_user_message();
+                } else {
+                    self.move_vertical(-1);
                 }
             }
             KeyCode::Down => {
-                if !self.move_vertical(1) {
-                    self.scroll_down(2);
-                }
+                self.move_vertical(1);
             }
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
@@ -5702,6 +5734,128 @@ mod tests {
                 .active_node_ids()
                 .contains(&original_leaf)
         );
+    }
+
+    #[tokio::test]
+    async fn arrow_up_recalls_only_the_latest_visible_user_message_and_escape_cancels() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
+        session
+            .messages
+            .push(Message::text(Role::User, "older visible message"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "older answer"));
+        let latest_visible = session
+            .messages
+            .push(Message::text(Role::User, "latest visible message"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "latest answer"));
+        session
+            .messages
+            .push(Message::hidden_text(Role::User, "hidden goal continuation"));
+        let mut app = test_app_with_session(root.path(), config, session);
+        let original_path = app.transcript_node_ids.clone();
+        app.scroll = 7;
+        app.max_scroll = 20;
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.input, "latest visible message");
+        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(
+            app.editing_message.as_ref().map(|edit| edit.node_id),
+            Some(latest_visible)
+        );
+        assert_eq!(app.transcript_node_ids, original_path);
+        assert_eq!(app.scroll, 7);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.input, "latest visible message");
+        assert_eq!(
+            app.editing_message.as_ref().map(|edit| edit.node_id),
+            Some(latest_visible)
+        );
+        assert_eq!(app.scroll, 7);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.input.is_empty());
+        assert!(app.editing_message.is_none());
+        assert_eq!(app.transcript_node_ids, original_path);
+        assert_eq!(app.scroll, 7);
+    }
+
+    #[tokio::test]
+    async fn composer_arrows_never_scroll_at_empty_multiline_or_soft_wrap_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.scroll = 12;
+        app.max_scroll = 30;
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.scroll, 12);
+        assert!(app.input.is_empty());
+
+        app.input = "top\nbottom".into();
+        app.cursor = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.scroll, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let multiline_bottom = app.cursor;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.cursor, multiline_bottom);
+        assert_eq!(app.scroll, 12);
+
+        app.input = "abcdefgh".into();
+        app.cursor = 0;
+        app.composer_width = 4;
+        app.preferred_column = None;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.cursor, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.cursor > 0);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let wrapped_bottom = app.cursor;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.cursor, wrapped_bottom);
+        assert_eq!(app.scroll, 12);
     }
 
     #[test]
