@@ -414,18 +414,24 @@ real credentials, network access, or a user's saved sessions.
   hardcoded list.
 - Keep user-visible documentation synchronized with CLI flags, API endpoints,
   authentication behavior, and security/execution semantics.
+- When implementing a user-visible feature or behavior that users should know
+  about, update `README.md` in the same change unless the user explicitly asks
+  not to update the documentation.
 - `codecrab config` must clearly separate the platform-global file path from
   the effective non-secret configuration content.
 - Avoid logging secrets except inside the explicitly unredacted
   `--debug-openai` path.
-- Treat a user request to implement or fix a GitHub issue as explicit
-  authorization to commit and push the completed issue work. Include
-  `Fixes #<issue-number>` in the completing commit for every addressed issue,
-  get that commit onto the repository's default branch (directly or through a
-  merged pull request), and verify that GitHub closed each issue. A closing
-  keyword on another branch does not close the issue until that branch is
-  merged. Do not manually close the issue as a substitute for this Git-based
-  workflow.
+- Treat a user request to implement or fix a GitHub issue as authorization for
+  the complete issue workflow. Before editing, create and switch to a dedicated
+  issue branch from an up-to-date default branch. Implement the change, update
+  relevant documentation, run the appropriate focused and repository-wide
+  checks, inspect the final diff, commit with `Fixes #<issue-number>`, and push
+  the branch. Open a pull request, merge it into the default branch, and verify
+  that GitHub closed the issue through the merged commit; do not manually close
+  the issue as a substitute. Finally, switch the local checkout back to the
+  default branch, fast-forward it from the remote, and delete the issue branch
+  both remotely and locally. Preserve unrelated working-tree changes throughout
+  this workflow.
 - Otherwise, do not commit, push, publish, or create a pull request unless the
   user explicitly asks.
 
