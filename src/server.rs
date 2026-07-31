@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, broadcast, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -40,17 +40,21 @@ use crate::{
         recursive_file_completion_available, start_file_completion_search,
     },
     config::{
-        Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry,
+        Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry, paths_equal,
         validate_provider_name,
     },
-    conversation::{ConversationHandle, ConversationManager, ConversationStatus},
+    conversation::{
+        ConversationHandle, ConversationLifecycle, ConversationLiveEvent, ConversationLiveState,
+        ConversationManager, ConversationObservation, ConversationStatus,
+    },
     coordination::SessionCoordinator,
     diagnostics::{DebugOutput, DiagnosticLog},
     events::{AgentActivity, AgentEvent},
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
     provider::{Message, ModelCatalogEntry, ModelSelection},
     session::{
-        Session, SessionProject, SessionStore, list_session_projects, resolve_global_session,
+        Session, SessionProject, SessionStore, SessionSummary, list_session_projects,
+        resolve_global_session,
     },
     skills::SkillRegistry,
     transcription::Transcriber,
@@ -113,6 +117,7 @@ struct CatalogState {
 
 #[derive(Serialize)]
 struct StateResponse {
+    live_revision: u64,
     project: String,
     session: Option<WebSession>,
     projects: Vec<SessionProject>,
@@ -125,13 +130,32 @@ struct StateResponse {
 }
 
 #[derive(Clone)]
-struct WebSession(Session);
+struct WebSession {
+    session: Session,
+    observation: Option<ConversationObservation>,
+}
+
+impl WebSession {
+    fn persisted(session: Session) -> Self {
+        Self {
+            session,
+            observation: None,
+        }
+    }
+
+    fn live(session: Session, observation: ConversationObservation) -> Self {
+        Self {
+            session,
+            observation: Some(observation),
+        }
+    }
+}
 
 impl Deref for WebSession {
     type Target = Session;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.session
     }
 }
 
@@ -140,22 +164,42 @@ impl Serialize for WebSession {
     where
         S: serde::Serializer,
     {
-        let mut value = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        let mut value = serde_json::to_value(&self.session).map_err(serde::ser::Error::custom)?;
         let object = value
             .as_object_mut()
             .ok_or_else(|| serde::ser::Error::custom("session did not serialize as an object"))?;
-        object.insert(
-            "messages".into(),
-            serde_json::to_value(&*self.0.messages).map_err(serde::ser::Error::custom)?,
-        );
+        let live_observation = self.observation.as_ref().filter(|observation| {
+            matches!(
+                observation.lifecycle,
+                ConversationLifecycle::Running | ConversationLifecycle::Stopping
+            )
+        });
+        if let Some(observation) = live_observation {
+            object.insert("title".into(), json!(observation.title));
+            object.insert("updated_at".into(), json!(observation.latest_event_at));
+            object.insert(
+                "messages".into(),
+                serde_json::to_value(&observation.display_messages)
+                    .map_err(serde::ser::Error::custom)?,
+            );
+            object.insert(
+                "activities".into(),
+                serde_json::to_value(&observation.activities).map_err(serde::ser::Error::custom)?,
+            );
+        } else {
+            object.insert(
+                "messages".into(),
+                serde_json::to_value(&*self.session.messages).map_err(serde::ser::Error::custom)?,
+            );
+        }
         object.insert(
             "active_message_ids".into(),
-            serde_json::to_value(self.0.messages.active_node_ids())
+            serde_json::to_value(self.session.messages.active_node_ids())
                 .map_err(serde::ser::Error::custom)?,
         );
         object.insert(
             "branch_nodes".into(),
-            serde_json::to_value(self.0.messages.visible_user_nodes())
+            serde_json::to_value(self.session.messages.visible_user_nodes())
                 .map_err(serde::ser::Error::custom)?,
         );
         value.serialize(serializer)
@@ -311,6 +355,52 @@ enum ChatStreamMessage {
     },
 }
 
+#[derive(Serialize)]
+struct SessionLiveView {
+    project_root: PathBuf,
+    lifecycle: ConversationLifecycle,
+    observation_revision: u64,
+    session: WebSession,
+}
+
+impl From<ConversationLiveState> for SessionLiveView {
+    fn from(state: ConversationLiveState) -> Self {
+        Self {
+            project_root: state.snapshot.project_root,
+            lifecycle: state.lifecycle,
+            observation_revision: state.observation.revision,
+            session: WebSession::live(state.snapshot.session, state.observation),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SessionStreamMessage {
+    Sync {
+        revision: u64,
+        projects: Vec<SessionProject>,
+        workers: Vec<ConversationStatus>,
+        sessions: Vec<SessionLiveView>,
+    },
+    Catalog {
+        revision: u64,
+        projects: Vec<SessionProject>,
+        workers: Vec<ConversationStatus>,
+    },
+    Session {
+        revision: u64,
+        session: SessionLiveView,
+    },
+    Event {
+        revision: u64,
+        session_id: Uuid,
+        project_root: PathBuf,
+        observation_revision: u64,
+        event: ChatStreamMessage,
+    },
+}
+
 pub(crate) async fn serve(
     root: PathBuf,
     config: Config,
@@ -431,6 +521,7 @@ fn server_app(state: ServerState) -> Router {
                 .route("/branches/preview", post(preview_branch))
                 .route("/branches/select", post(select_branch))
                 .route("/sessions", post(new_session))
+                .route("/sessions/stream", get(session_stream))
                 .route("/sessions/delete", post(delete_session))
                 .route("/directories", get(list_directories))
                 .route("/directories", post(make_directory))
@@ -639,7 +730,48 @@ async fn selected_conversation(
     selected.and_then(|id| state.inner.conversations.get(id))
 }
 
+fn live_session_projects(
+    root: &std::path::Path,
+    inner: &ServerInner,
+) -> Result<Vec<SessionProject>> {
+    let mut projects = list_session_projects(root, &inner.registry)?;
+    for live in inner.conversations.live_states() {
+        let session = &live.snapshot.session;
+        let summary = SessionSummary {
+            id: session.id,
+            created_at: session.created_at,
+            updated_at: live.observation.latest_event_at,
+            title: live.observation.title,
+            model: session.model.clone(),
+        };
+        if let Some(project) = projects
+            .iter_mut()
+            .find(|project| paths_equal(&project.root, &live.snapshot.project_root))
+        {
+            if let Some(existing) = project
+                .sessions
+                .iter_mut()
+                .find(|existing| existing.id == session.id)
+            {
+                *existing = summary;
+            } else {
+                project.sessions.push(summary);
+            }
+            project
+                .sessions
+                .sort_by_key(|session| std::cmp::Reverse((session.created_at, session.id)));
+        } else {
+            projects.push(SessionProject {
+                root: live.snapshot.project_root,
+                sessions: vec![summary],
+            });
+        }
+    }
+    Ok(projects)
+}
+
 async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<StateResponse> {
+    let live_revision = state.inner.conversations.live_revision();
     let (workspace_root, selected_id) = {
         let workspace = state.inner.workspace.lock().await;
         (
@@ -648,14 +780,17 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         )
     };
     let conversation = selected_id.and_then(|id| state.inner.conversations.get(id));
-    let conversation_snapshot = conversation.as_ref().map(ConversationHandle::snapshot);
+    let conversation_state = conversation.as_ref().map(ConversationHandle::live_state);
+    let conversation_snapshot = conversation_state
+        .as_ref()
+        .map(|state| state.snapshot.clone());
     let root = conversation_snapshot
         .as_ref()
         .map(|snapshot| snapshot.project_root.clone())
         .unwrap_or(workspace_root);
-    let session = conversation_snapshot
+    let session = conversation_state
         .as_ref()
-        .map(|snapshot| WebSession(snapshot.session.clone()));
+        .map(|state| WebSession::live(state.snapshot.session.clone(), state.observation.clone()));
     let skills = if let Some(snapshot) = &conversation_snapshot {
         snapshot
             .skills
@@ -677,7 +812,7 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
             })
             .collect()
     };
-    let projects = list_session_projects(&root, &state.inner.registry)?;
+    let projects = live_session_projects(&root, &state.inner)?;
     let project = projects
         .first()
         .map(|project| project.root.display().to_string())
@@ -693,6 +828,7 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
     });
     let providers = config.summaries();
     Ok(StateResponse {
+        live_revision,
         project,
         session,
         projects,
@@ -937,28 +1073,7 @@ async fn chat(
         let event_output = output_tx.clone();
         let forward_events = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
-                let message = match event {
-                    AgentEvent::UserMessage(message) => ChatStreamMessage::UserMessage { message },
-                    AgentEvent::AssistantMessage(message) => {
-                        ChatStreamMessage::AssistantMessage { message }
-                    }
-                    AgentEvent::AssistantTextDelta {
-                        delta,
-                        start,
-                        sequence,
-                        created_at,
-                    } => ChatStreamMessage::AssistantTextDelta {
-                        delta,
-                        start,
-                        sequence,
-                        created_at,
-                    },
-                    AgentEvent::AssistantStreamReset => ChatStreamMessage::AssistantStreamReset,
-                    AgentEvent::AssistantMessageCompleted(message) => {
-                        ChatStreamMessage::AssistantMessageCompleted { message }
-                    }
-                    AgentEvent::Activity(activity) => ChatStreamMessage::Activity { activity },
-                };
+                let message = chat_stream_event(event);
                 if !send_stream_message(&event_output, message).await {
                     break;
                 }
@@ -1019,16 +1134,183 @@ async fn cancel_chat(
     Json(json!({ "cancelled": cancelled }))
 }
 
-async fn send_stream_message(
+async fn session_stream(State(state): State<ServerState>) -> Response {
+    let mut live_events = state.inner.conversations.subscribe_live();
+    let (output_tx, output_rx) = mpsc::channel::<std::result::Result<Bytes, Infallible>>(32);
+    tokio::spawn(async move {
+        let revision = state.inner.conversations.live_revision();
+        let Ok(initial) = session_sync_message(&state, revision).await else {
+            return;
+        };
+        if !send_ndjson(&output_tx, &initial).await {
+            return;
+        }
+        loop {
+            let envelope = tokio::select! {
+                _ = output_tx.closed() => break,
+                event = live_events.recv() => event,
+            };
+            let envelope = match envelope {
+                Ok(envelope) => envelope,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let revision = state.inner.conversations.live_revision();
+                    let Ok(message) = session_sync_message(&state, revision).await else {
+                        continue;
+                    };
+                    if !send_ndjson(&output_tx, &message).await {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match envelope.event {
+                ConversationLiveEvent::Agent(event) => {
+                    let message = SessionStreamMessage::Event {
+                        revision: envelope.revision,
+                        session_id: envelope.session_id,
+                        project_root: envelope.project_root,
+                        observation_revision: envelope.observation_revision,
+                        event: chat_stream_event(event),
+                    };
+                    if !send_ndjson(&output_tx, &message).await {
+                        break;
+                    }
+                }
+                ConversationLiveEvent::Lifecycle => {
+                    let Some(handle) = state.inner.conversations.get(envelope.session_id) else {
+                        continue;
+                    };
+                    let message = SessionStreamMessage::Session {
+                        revision: envelope.revision,
+                        session: handle.live_state().into(),
+                    };
+                    if !send_ndjson(&output_tx, &message).await {
+                        break;
+                    }
+                }
+                ConversationLiveEvent::Installed | ConversationLiveEvent::Snapshot => {
+                    let Ok(catalog) = session_catalog_message(&state, envelope.revision).await
+                    else {
+                        continue;
+                    };
+                    if !send_ndjson(&output_tx, &catalog).await {
+                        break;
+                    }
+                    let Some(handle) = state.inner.conversations.get(envelope.session_id) else {
+                        continue;
+                    };
+                    let message = SessionStreamMessage::Session {
+                        revision: envelope.revision,
+                        session: handle.live_state().into(),
+                    };
+                    if !send_ndjson(&output_tx, &message).await {
+                        break;
+                    }
+                }
+                ConversationLiveEvent::Removed => {
+                    let Ok(message) = session_catalog_message(&state, envelope.revision).await
+                    else {
+                        continue;
+                    };
+                    if !send_ndjson(&output_tx, &message).await {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut response = Body::from_stream(ReceiverStream::new(output_rx)).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache"),
+    );
+    response
+}
+
+async fn session_sync_message(state: &ServerState, revision: u64) -> Result<SessionStreamMessage> {
+    let (root, selected_session) = {
+        let workspace = state.inner.workspace.lock().await;
+        (workspace.root.clone(), workspace.selected_session)
+    };
+    Ok(SessionStreamMessage::Sync {
+        revision,
+        projects: live_session_projects(&root, &state.inner)?,
+        workers: state.inner.conversations.statuses(),
+        sessions: state
+            .inner
+            .conversations
+            .live_states()
+            .into_iter()
+            .filter(|state| {
+                Some(state.snapshot.session.id) == selected_session
+                    || matches!(
+                        state.lifecycle,
+                        ConversationLifecycle::Running | ConversationLifecycle::Stopping
+                    )
+            })
+            .map(Into::into)
+            .collect(),
+    })
+}
+
+async fn session_catalog_message(
+    state: &ServerState,
+    revision: u64,
+) -> Result<SessionStreamMessage> {
+    let root = state.inner.workspace.lock().await.root.clone();
+    Ok(SessionStreamMessage::Catalog {
+        revision,
+        projects: live_session_projects(&root, &state.inner)?,
+        workers: state.inner.conversations.statuses(),
+    })
+}
+
+fn chat_stream_event(event: AgentEvent) -> ChatStreamMessage {
+    match event {
+        AgentEvent::UserMessage(message) => ChatStreamMessage::UserMessage { message },
+        AgentEvent::AssistantMessage(message) => ChatStreamMessage::AssistantMessage { message },
+        AgentEvent::AssistantTextDelta {
+            delta,
+            start,
+            sequence,
+            created_at,
+        } => ChatStreamMessage::AssistantTextDelta {
+            delta,
+            start,
+            sequence,
+            created_at,
+        },
+        AgentEvent::AssistantStreamReset => ChatStreamMessage::AssistantStreamReset,
+        AgentEvent::AssistantMessageCompleted(message) => {
+            ChatStreamMessage::AssistantMessageCompleted { message }
+        }
+        AgentEvent::Activity(activity) => ChatStreamMessage::Activity { activity },
+    }
+}
+
+async fn send_ndjson(
     output: &mpsc::Sender<std::result::Result<Bytes, Infallible>>,
-    message: ChatStreamMessage,
+    message: &impl Serialize,
 ) -> bool {
-    let mut line = match serde_json::to_vec(&message) {
+    let mut line = match serde_json::to_vec(message) {
         Ok(line) => line,
         Err(_) => return false,
     };
     line.push(b'\n');
     output.send(Ok(Bytes::from(line))).await.is_ok()
+}
+
+async fn send_stream_message(
+    output: &mpsc::Sender<std::result::Result<Bytes, Infallible>>,
+    message: ChatStreamMessage,
+) -> bool {
+    send_ndjson(output, &message).await
 }
 
 async fn set_model(
@@ -1207,7 +1489,7 @@ async fn preview_branch(
         .session
         .preview_branch(request.node_id)?;
     let mut response = snapshot_for(&state, Some(conversation_snapshot.session.id)).await?;
-    response.session = Some(WebSession(preview));
+    response.session = Some(WebSession::persisted(preview));
     Ok(Json(response))
 }
 
@@ -1691,7 +1973,7 @@ mod tests {
             "Inspect the tree",
         ));
 
-        let value = serde_json::to_value(WebSession(session)).unwrap();
+        let value = serde_json::to_value(WebSession::persisted(session)).unwrap();
         assert_eq!(value["messages"].as_array().unwrap().len(), 1);
         assert_eq!(value["active_message_ids"].as_array().unwrap().len(), 1);
         assert_eq!(value["branch_nodes"].as_array().unwrap().len(), 1);
@@ -1700,6 +1982,98 @@ mod tests {
             value["messages"][0]["content"].as_str(),
             Some("Inspect the tree")
         );
+    }
+
+    #[test]
+    fn live_web_sessions_override_stale_transcript_and_activity_state() {
+        let root = tempfile::tempdir().unwrap();
+        let session = SessionStore::new(root.path())
+            .unwrap()
+            .create("test-model".into())
+            .unwrap();
+        let snapshot = crate::conversation::ConversationSnapshot {
+            project_root: root.path().to_path_buf(),
+            session: session.clone(),
+            skills: Vec::new(),
+            model_catalog: Vec::new(),
+        };
+        let mut observation = crate::conversation::ConversationObservation {
+            revision: 3,
+            title: "Live delegated title".into(),
+            lifecycle: ConversationLifecycle::Running,
+            active_turn_started_at: Some(chrono::Utc::now()),
+            latest_event_at: chrono::Utc::now(),
+            catalog_error: None,
+            last_turn: None,
+            visible_goal: None,
+            messages: vec![crate::conversation::ObservedMessage {
+                id: "user:live".into(),
+                role: "user",
+                sequence: None,
+                created_at: chrono::Utc::now(),
+                content: "Live delegated title".into(),
+                partial: false,
+            }],
+            activity: None,
+            display_messages: vec![Message::text(
+                crate::provider::Role::User,
+                "Live delegated title",
+            )],
+            activities: Vec::new(),
+        };
+        let activity = AgentActivity::started(
+            "delegated-read".into(),
+            Uuid::new_v4(),
+            0,
+            1,
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+        );
+        observation.activities.push(activity);
+
+        let value = serde_json::to_value(WebSession::live(snapshot.session, observation)).unwrap();
+        assert_eq!(value["title"], "Live delegated title");
+        assert_eq!(value["messages"][0]["content"], "Live delegated title");
+        assert_eq!(value["activities"][0]["id"], "delegated-read");
+        assert_eq!(value["activities"][0]["detail"], "src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn session_stream_sync_bootstraps_selected_views_without_idle_transcript_fanout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("test-model", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "test-model".into())
+            .unwrap();
+        SessionStore::new(&root).unwrap().save(&session).unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let conversation = test_conversation(agent);
+        let state = test_state(config.clone(), root.clone(), conversation, false);
+        let idle_session = SessionStore::new(&root)
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "test-model".into())
+            .unwrap();
+        SessionStore::new(&root)
+            .unwrap()
+            .save(&idle_session)
+            .unwrap();
+        let idle_agent = build_agent(&root, &config, false, idle_session).unwrap();
+        state.inner.conversations.install(idle_agent).unwrap();
+
+        let message = session_sync_message(&state, 7).await.unwrap();
+        let value = serde_json::to_value(message).unwrap();
+
+        assert_eq!(value["type"], "sync");
+        assert_eq!(value["revision"], 7);
+        assert_eq!(
+            value["projects"][0]["sessions"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(value["workers"].as_array().unwrap().len(), 2);
+        assert_eq!(value["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(value["sessions"][0]["lifecycle"], "idle");
     }
 
     fn test_state(

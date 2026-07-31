@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -33,6 +33,13 @@ pub(crate) struct ConversationSnapshot {
 }
 
 #[derive(Clone)]
+pub(crate) struct ConversationLiveState {
+    pub snapshot: ConversationSnapshot,
+    pub observation: ConversationObservation,
+    pub lifecycle: ConversationLifecycle,
+}
+
+#[derive(Clone)]
 pub(crate) struct ConversationSkill {
     pub name: String,
     pub description: String,
@@ -42,6 +49,69 @@ pub(crate) struct ConversationSkill {
 pub(crate) struct ConversationTurn {
     pub result: Result<String>,
     pub snapshot: ConversationSnapshot,
+}
+
+const LIVE_EVENT_BUFFER: usize = 1_024;
+
+#[derive(Clone)]
+pub(crate) struct ConversationLiveEnvelope {
+    pub revision: u64,
+    pub session_id: Uuid,
+    pub project_root: PathBuf,
+    pub observation_revision: u64,
+    pub event: ConversationLiveEvent,
+}
+
+#[derive(Clone)]
+pub(crate) enum ConversationLiveEvent {
+    Installed,
+    Removed,
+    Lifecycle,
+    Agent(AgentEvent),
+    Snapshot,
+}
+
+#[derive(Clone)]
+pub(crate) struct ConversationLiveHub {
+    revision: Arc<AtomicU64>,
+    events: broadcast::Sender<ConversationLiveEnvelope>,
+}
+
+impl Default for ConversationLiveHub {
+    fn default() -> Self {
+        let (events, _) = broadcast::channel(LIVE_EVENT_BUFFER);
+        Self {
+            revision: Arc::new(AtomicU64::new(0)),
+            events,
+        }
+    }
+}
+
+impl ConversationLiveHub {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ConversationLiveEnvelope> {
+        self.events.subscribe()
+    }
+
+    fn publish(
+        &self,
+        session_id: Uuid,
+        project_root: PathBuf,
+        observation_revision: u64,
+        event: ConversationLiveEvent,
+    ) {
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.events.send(ConversationLiveEnvelope {
+            revision,
+            session_id,
+            project_root,
+            observation_revision,
+            event,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -70,10 +140,11 @@ impl ConversationLifecycle {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ObservedMessage {
     pub id: String,
     pub role: &'static str,
+    pub sequence: Option<u64>,
     pub created_at: DateTime<Utc>,
     pub content: String,
     pub partial: bool,
@@ -100,7 +171,7 @@ pub(crate) struct ObservedGoal {
     pub status: GoalStatus,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ConversationObservation {
     pub revision: u64,
     pub title: String,
@@ -112,6 +183,8 @@ pub(crate) struct ConversationObservation {
     pub visible_goal: Option<ObservedGoal>,
     pub messages: Vec<ObservedMessage>,
     pub activity: Option<ObservedActivity>,
+    pub display_messages: Vec<Message>,
+    pub activities: Vec<AgentActivity>,
 }
 
 #[derive(Clone)]
@@ -152,6 +225,9 @@ pub(crate) struct ConversationHandle {
     lifecycle: Arc<AtomicU8>,
     observation: Arc<Mutex<ConversationObservation>>,
     observation_hub: ObservationHub,
+    session_id: Uuid,
+    project_root: PathBuf,
+    live_hub: ConversationLiveHub,
 }
 
 enum ConversationCommand {
@@ -213,20 +289,31 @@ struct ConversationWorkerState {
     lifecycle: Arc<AtomicU8>,
     observation: Arc<Mutex<ConversationObservation>>,
     observation_hub: ObservationHub,
+    session_id: Uuid,
+    project_root: PathBuf,
+    live_hub: ConversationLiveHub,
 }
 
 impl ConversationHandle {
     #[cfg(test)]
     pub(crate) fn spawn(agent: Agent, registry: SessionRegistry) -> Result<Self> {
-        Self::spawn_with_hub(agent, registry, ObservationHub::default())
+        Self::spawn_with_hubs(
+            agent,
+            registry,
+            ObservationHub::default(),
+            ConversationLiveHub::default(),
+        )
     }
 
-    pub(crate) fn spawn_with_hub(
+    fn spawn_with_hubs(
         agent: Agent,
         registry: SessionRegistry,
         observation_hub: ObservationHub,
+        live_hub: ConversationLiveHub,
     ) -> Result<Self> {
         let initial = snapshot(&agent);
+        let session_id = initial.session.id;
+        let project_root = initial.project_root.clone();
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (snapshot_tx, snapshot_rx) = watch::channel(initial.clone());
         let active_cancellation = Arc::new(Mutex::new(None));
@@ -250,6 +337,9 @@ impl ConversationHandle {
                 lifecycle: lifecycle.clone(),
                 observation: observation.clone(),
                 observation_hub: observation_hub.clone(),
+                session_id,
+                project_root: project_root.clone(),
+                live_hub: live_hub.clone(),
             },
         ))?;
         Ok(Self {
@@ -262,6 +352,9 @@ impl ConversationHandle {
             lifecycle,
             observation,
             observation_hub,
+            session_id,
+            project_root,
+            live_hub,
         })
     }
 
@@ -284,6 +377,14 @@ impl ConversationHandle {
             .clone()
     }
 
+    pub(crate) fn live_state(&self) -> ConversationLiveState {
+        ConversationLiveState {
+            snapshot: self.snapshot(),
+            observation: self.observation(),
+            lifecycle: self.lifecycle(),
+        }
+    }
+
     pub(crate) fn cancel(&self) -> bool {
         let requested = self
             .active_cancellation
@@ -294,9 +395,16 @@ impl ConversationHandle {
         if requested {
             self.lifecycle
                 .store(ConversationLifecycle::Stopping.as_u8(), Ordering::Release);
-            update_observation(&self.observation, &self.observation_hub, |observation| {
-                observation.lifecycle = ConversationLifecycle::Stopping;
-            });
+            let observation_revision =
+                update_observation(&self.observation, &self.observation_hub, |observation| {
+                    observation.lifecycle = ConversationLifecycle::Stopping;
+                });
+            self.live_hub.publish(
+                self.session_id,
+                self.project_root.clone(),
+                observation_revision,
+                ConversationLiveEvent::Lifecycle,
+            );
         }
         requested
     }
@@ -359,11 +467,18 @@ impl ConversationHandle {
             .expect("conversation cancellation mutex poisoned") = Some(cancel_tx);
         self.lifecycle
             .store(ConversationLifecycle::Running.as_u8(), Ordering::Release);
-        update_observation(&self.observation, &self.observation_hub, |observation| {
-            observation.lifecycle = ConversationLifecycle::Running;
-            observation.active_turn_started_at = Some(Utc::now());
-            observation.activity = None;
-        });
+        let observation_revision =
+            update_observation(&self.observation, &self.observation_hub, |observation| {
+                observation.lifecycle = ConversationLifecycle::Running;
+                observation.active_turn_started_at = Some(Utc::now());
+                observation.activity = None;
+            });
+        self.live_hub.publish(
+            self.session_id,
+            self.project_root.clone(),
+            observation_revision,
+            ConversationLiveEvent::Lifecycle,
+        );
         let (reply, response) = oneshot::channel();
         if let Err(error) = self.send_unchecked(ConversationCommand::Turn {
             prompt,
@@ -381,10 +496,17 @@ impl ConversationHandle {
             self.turn_reserved.store(false, Ordering::Release);
             self.lifecycle
                 .store(ConversationLifecycle::Idle.as_u8(), Ordering::Release);
-            update_observation(&self.observation, &self.observation_hub, |observation| {
-                observation.lifecycle = ConversationLifecycle::Idle;
-                observation.active_turn_started_at = None;
-            });
+            let observation_revision =
+                update_observation(&self.observation, &self.observation_hub, |observation| {
+                    observation.lifecycle = ConversationLifecycle::Idle;
+                    observation.active_turn_started_at = None;
+                });
+            self.live_hub.publish(
+                self.session_id,
+                self.project_root.clone(),
+                observation_revision,
+                ConversationLiveEvent::Lifecycle,
+            );
             return Err(error);
         }
         Ok(tokio::spawn(async move {
@@ -582,6 +704,9 @@ async fn run_worker(
         lifecycle,
         observation,
         observation_hub,
+        session_id,
+        project_root,
+        live_hub,
     } = state;
     let mut explicitly_stopped = false;
     while let Some(command) = commands.recv().await {
@@ -598,11 +723,20 @@ async fn run_worker(
                 update_observation(&observation, &observation_hub, |_| {});
                 let (internal_events, mut event_rx) = mpsc::unbounded_channel();
                 let live_observation = observation.clone();
-                let live_hub = observation_hub.clone();
+                let live_observation_hub = observation_hub.clone();
+                let event_hub = live_hub.clone();
+                let event_project_root = project_root.clone();
                 let forwarded_events = events.clone();
                 let observer = tokio::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
-                        apply_agent_event(&live_observation, &live_hub, &event);
+                        let observation_revision =
+                            apply_agent_event(&live_observation, &live_observation_hub, &event);
+                        event_hub.publish(
+                            session_id,
+                            event_project_root.clone(),
+                            observation_revision,
+                            ConversationLiveEvent::Agent(event.clone()),
+                        );
                         if let Some(events) = &forwarded_events {
                             let _ = events.send(event);
                         } else if let AgentEvent::Activity(activity) = &event
@@ -676,7 +810,18 @@ async fn run_worker(
                     TurnOutcome::Failed => ConversationLifecycle::Failed,
                 };
                 lifecycle.store(terminal_lifecycle.as_u8(), Ordering::Release);
-                reconcile_observation(&observation, &observation_hub, &current, terminal_lifecycle);
+                let observation_revision = reconcile_observation(
+                    &observation,
+                    &observation_hub,
+                    &current,
+                    terminal_lifecycle,
+                );
+                live_hub.publish(
+                    session_id,
+                    project_root.clone(),
+                    observation_revision,
+                    ConversationLiveEvent::Snapshot,
+                );
                 let _ = reply.send(ConversationTurn {
                     result,
                     snapshot: current,
@@ -769,7 +914,7 @@ async fn run_worker(
         },
         Ordering::Release,
     );
-    update_observation(&observation, &observation_hub, |observation| {
+    let observation_revision = update_observation(&observation, &observation_hub, |observation| {
         observation.lifecycle = if explicitly_stopped {
             ConversationLifecycle::Stopped
         } else {
@@ -777,29 +922,37 @@ async fn run_worker(
         };
         observation.active_turn_started_at = None;
     });
+    live_hub.publish(
+        session_id,
+        project_root,
+        observation_revision,
+        ConversationLiveEvent::Lifecycle,
+    );
 }
 
 fn update_observation(
     observation: &Arc<Mutex<ConversationObservation>>,
     hub: &ObservationHub,
     update: impl FnOnce(&mut ConversationObservation),
-) {
-    {
+) -> u64 {
+    let revision = {
         let mut observation = observation
             .lock()
             .expect("conversation observation mutex poisoned");
         update(&mut observation);
         observation.revision = observation.revision.saturating_add(1);
         observation.latest_event_at = Utc::now();
-    }
+        observation.revision
+    };
     hub.publish();
+    revision
 }
 
 fn apply_agent_event(
     observation: &Arc<Mutex<ConversationObservation>>,
     hub: &ObservationHub,
     event: &AgentEvent,
-) {
+) -> u64 {
     update_observation(observation, hub, |observation| match event {
         AgentEvent::UserMessage(message) => {
             if observation.messages.is_empty()
@@ -810,11 +963,13 @@ fn apply_agent_event(
             if let Some(message) = observed_message(message, false) {
                 observation.messages.push(message);
             }
+            observation.display_messages.push(message.clone());
         }
         AgentEvent::AssistantMessage(message) => {
             if let Some(message) = observed_message(message, false) {
                 upsert_observed_message(&mut observation.messages, message);
             }
+            upsert_display_message(&mut observation.display_messages, message.clone());
         }
         AgentEvent::AssistantTextDelta {
             delta,
@@ -827,9 +982,19 @@ fn apply_agent_event(
                 observation.messages.push(ObservedMessage {
                     id,
                     role: "assistant",
+                    sequence: Some(*sequence),
                     created_at: *created_at,
                     content: delta.clone(),
                     partial: true,
+                });
+                observation.display_messages.push(Message {
+                    role: Role::Assistant,
+                    sequence: Some(*sequence),
+                    created_at: Some(*created_at),
+                    content: Some(delta.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    hidden: false,
                 });
             } else if let Some(message) = observation
                 .messages
@@ -839,21 +1004,51 @@ fn apply_agent_event(
             {
                 message.content.push_str(delta);
             }
+            if !*start
+                && let Some(message) = observation
+                    .display_messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.sequence == Some(*sequence))
+            {
+                message.content.get_or_insert_default().push_str(delta);
+            }
         }
         AgentEvent::AssistantStreamReset => {
+            let partial_sequences = observation
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant" && message.partial)
+                .filter_map(|message| message.sequence)
+                .collect::<Vec<_>>();
             observation
                 .messages
                 .retain(|message| !(message.role == "assistant" && message.partial));
+            observation.display_messages.retain(|message| {
+                message
+                    .sequence
+                    .is_none_or(|sequence| !partial_sequences.contains(&sequence))
+            });
         }
         AgentEvent::AssistantMessageCompleted(message) => {
             if let Some(message) = observed_message(message, false) {
                 upsert_observed_message(&mut observation.messages, message);
             }
+            upsert_display_message(&mut observation.display_messages, message.clone());
         }
         AgentEvent::Activity(activity) => {
             observation.activity = Some(observed_activity(activity));
+            if let Some(existing) = observation
+                .activities
+                .iter_mut()
+                .find(|existing| existing.id == activity.id)
+            {
+                existing.clone_from(activity);
+            } else {
+                observation.activities.push(activity.clone());
+            }
         }
-    });
+    })
 }
 
 fn reconcile_observation(
@@ -861,13 +1056,13 @@ fn reconcile_observation(
     hub: &ObservationHub,
     snapshot: &ConversationSnapshot,
     lifecycle: ConversationLifecycle,
-) {
+) -> u64 {
     update_observation(observation, hub, |observation| {
         let revision = observation.revision;
         let catalog_error = observation.catalog_error.clone();
         *observation = observation_from_snapshot(snapshot, lifecycle, revision);
         observation.catalog_error = catalog_error;
-    });
+    })
 }
 
 fn observation_from_snapshot(
@@ -919,6 +1114,12 @@ fn observation_from_snapshot(
         visible_goal,
         messages,
         activity: session.activities.last().map(observed_activity),
+        display_messages: session
+            .messages
+            .active_entries()
+            .map(|(_, message)| message.clone())
+            .collect(),
+        activities: session.activities.clone(),
     }
 }
 
@@ -955,6 +1156,7 @@ fn observed_message(message: &Message, partial: bool) -> Option<ObservedMessage>
     Some(ObservedMessage {
         id,
         role,
+        sequence: message.sequence,
         created_at,
         content: message.content.clone().unwrap_or_default(),
         partial,
@@ -967,6 +1169,20 @@ fn upsert_observed_message(messages: &mut Vec<ObservedMessage>, message: Observe
         .rev()
         .find(|existing| existing.id == message.id)
     {
+        *existing = message;
+    } else {
+        messages.push(message);
+    }
+}
+
+fn upsert_display_message(messages: &mut Vec<Message>, message: Message) {
+    let existing = message.sequence.and_then(|sequence| {
+        messages
+            .iter_mut()
+            .rev()
+            .find(|existing| existing.sequence == Some(sequence))
+    });
+    if let Some(existing) = existing {
         *existing = message;
     } else {
         messages.push(message);
@@ -994,6 +1210,7 @@ pub(crate) struct ConversationManager {
     conversations: Arc<RwLock<HashMap<Uuid, ConversationHandle>>>,
     registry: SessionRegistry,
     observation_hub: ObservationHub,
+    live_hub: ConversationLiveHub,
 }
 
 impl ConversationManager {
@@ -1002,6 +1219,7 @@ impl ConversationManager {
             conversations: Arc::new(RwLock::new(HashMap::new())),
             registry,
             observation_hub: ObservationHub::default(),
+            live_hub: ConversationLiveHub::default(),
         }
     }
 
@@ -1026,12 +1244,22 @@ impl ConversationManager {
         if let Some(existing) = conversations.get(&id) {
             return Ok(existing.clone());
         }
-        let handle = ConversationHandle::spawn_with_hub(
+        let handle = ConversationHandle::spawn_with_hubs(
             agent,
             self.registry.clone(),
             self.observation_hub.clone(),
+            self.live_hub.clone(),
         )?;
+        let observation_revision = handle.observation().revision;
+        let project_root = handle.snapshot().project_root;
         conversations.insert(id, handle.clone());
+        drop(conversations);
+        self.live_hub.publish(
+            id,
+            project_root,
+            observation_revision,
+            ConversationLiveEvent::Installed,
+        );
         Ok(handle)
     }
 
@@ -1070,7 +1298,18 @@ impl ConversationManager {
         if handle.is_running() {
             anyhow::bail!("wait for the active turn before deleting its session");
         }
-        Ok(conversations.remove(&id))
+        let removed = conversations.remove(&id);
+        drop(conversations);
+        if let Some(handle) = &removed {
+            let state = handle.live_state();
+            self.live_hub.publish(
+                id,
+                state.snapshot.project_root,
+                state.observation.revision,
+                ConversationLiveEvent::Removed,
+            );
+        }
+        Ok(removed)
     }
 
     pub(crate) fn cancel(&self, id: Uuid) -> bool {
@@ -1090,6 +1329,28 @@ impl ConversationManager {
 
     pub(crate) fn observation_hub(&self) -> ObservationHub {
         self.observation_hub.clone()
+    }
+
+    pub(crate) fn live_revision(&self) -> u64 {
+        self.live_hub.revision()
+    }
+
+    pub(crate) fn subscribe_live(&self) -> broadcast::Receiver<ConversationLiveEnvelope> {
+        self.live_hub.subscribe()
+    }
+
+    pub(crate) fn live_states(&self) -> Vec<ConversationLiveState> {
+        let handles = self
+            .conversations
+            .read()
+            .expect("conversation manager lock poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.live_state())
+            .collect()
     }
 
     pub(crate) async fn shutdown_all(&self) -> Result<Vec<ConversationSnapshot>> {
@@ -1217,14 +1478,14 @@ mod tests {
         config::Config, provider::OpenAiCompatible, skills::SkillRegistry, tools::ToolBox,
     };
 
-    fn test_handle(root: &Path) -> ConversationHandle {
+    fn test_agent(root: &Path) -> Agent {
         let config = Config::test("model", "http://127.0.0.1:1/v1");
         let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let session = SessionStore::new(root)
             .unwrap()
             .create_for_provider(config.active_provider.clone(), "model".into())
             .unwrap();
-        let agent = Agent::new(
+        Agent::new(
             provider,
             ToolBox::new(root.to_path_buf()),
             SkillRegistry::default(),
@@ -1232,12 +1493,83 @@ mod tests {
             root.join(".test-global-config").join("AGENTS.md"),
             crate::diagnostics::DiagnosticLog::default(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn test_handle(root: &Path) -> ConversationHandle {
+        let agent = test_agent(root);
         ConversationHandle::spawn(
             agent,
             SessionRegistry::at(root.join("test-global-config.toml")),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn live_observation_preserves_messages_and_complete_activities() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = test_agent(root.path());
+        let snapshot = snapshot(&agent);
+        let observation = Arc::new(Mutex::new(observation_from_snapshot(
+            &snapshot,
+            ConversationLifecycle::Running,
+            0,
+        )));
+        let hub = ObservationHub::default();
+        let user = Message::text(Role::User, "Delegated work");
+        apply_agent_event(&observation, &hub, &AgentEvent::UserMessage(user.clone()));
+        let mut first = AgentActivity::started(
+            "call-1".into(),
+            Uuid::new_v4(),
+            0,
+            1,
+            "read_file",
+            r#"{"path":"src/main.rs"}"#,
+        );
+        apply_agent_event(&observation, &hub, &AgentEvent::Activity(first.clone()));
+        first.finish(true);
+        apply_agent_event(&observation, &hub, &AgentEvent::Activity(first.clone()));
+        let second = AgentActivity::started(
+            "call-2".into(),
+            Uuid::new_v4(),
+            0,
+            2,
+            "search",
+            r#"{"query":"needle","path":"src"}"#,
+        );
+        apply_agent_event(&observation, &hub, &AgentEvent::Activity(second.clone()));
+
+        let observation = observation.lock().unwrap();
+        assert_eq!(observation.messages.len(), 1);
+        assert_eq!(
+            observation.messages[0].content,
+            user.content.as_deref().unwrap()
+        );
+        assert_eq!(observation.activities.len(), 2);
+        assert_eq!(observation.activities[0].id, first.id);
+        assert_eq!(observation.activities[0].status, ActivityStatus::Completed);
+        assert_eq!(observation.activities[0].detail, "src/main.rs");
+        assert_eq!(observation.activities[1].id, second.id);
+        assert_eq!(observation.activities[1].status, ActivityStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn manager_publishes_install_and_removal_events() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::at(root.path().join("manager-global-config.toml"));
+        let manager = ConversationManager::new(registry);
+        let mut events = manager.subscribe_live();
+        let handle = manager.install(test_agent(root.path())).unwrap();
+        let id = handle.snapshot().session.id;
+
+        let installed = events.recv().await.unwrap();
+        assert_eq!(installed.session_id, id);
+        assert!(matches!(installed.event, ConversationLiveEvent::Installed));
+
+        assert!(manager.take_if_idle(id).unwrap().is_some());
+        let removed = events.recv().await.unwrap();
+        assert_eq!(removed.session_id, id);
+        assert!(matches!(removed.event, ConversationLiveEvent::Removed));
     }
 
     #[tokio::test]

@@ -48,6 +48,13 @@ import {
   isDictationShortcut
 } from "./dictation.js";
 import {
+  acceptsRevision,
+  consumeNdjson,
+  localStreamEndState,
+  liveTurnState,
+  mergeCatalog
+} from "./session-live.js";
+import {
   activityEventTimestamp,
   formatEventTimestamp
 } from "./timestamps.js";
@@ -155,6 +162,11 @@ let branchOriginalScrollTop = 0;
 let branchOriginalAutoScroll = true;
 const sessionStates = new Map();
 const sessionRuntimes = new Map();
+const liveObservationRevisions = new Map();
+let liveRevision = 0;
+let sessionStreamController = null;
+let sessionStreamRetry = null;
+let sessionStreamRetryDelay = 250;
 const composerDraftStore = createComposerDraftStore();
 const composerDrafts = createComposerDraftController({
   store: composerDraftStore,
@@ -173,6 +185,8 @@ function runtimeFor(id) {
   if (!id) {
     return {
       sending: false,
+      localStreaming: false,
+      liveLifecycle: "",
       cancelling: false,
       promptQueue: createPromptQueue(),
       queuedPromptEdit: null,
@@ -184,6 +198,8 @@ function runtimeFor(id) {
   if (!sessionRuntimes.has(id)) {
     sessionRuntimes.set(id, reactive({
       sending: false,
+      localStreaming: false,
+      liveLifecycle: "",
       cancelling: false,
       promptQueue: createPromptQueue(),
       queuedPromptEdit: null,
@@ -643,6 +659,7 @@ async function deleteSession(project, id) {
     });
     sessionStates.delete(id);
     sessionRuntimes.delete(id);
+    liveObservationRevisions.delete(id);
     composerDrafts.forget(project, id);
     virtualTimelineStore.delete(id);
     applyServerState(nextState, {
@@ -658,7 +675,25 @@ async function deleteSession(project, id) {
   }
 }
 
+function preserveNewerLiveGlobals(nextState) {
+  const revision = Number(nextState?.live_revision ?? 0);
+  if (
+    state.value &&
+    !acceptsRevision(liveRevision, revision)
+  ) {
+    return {
+      ...nextState,
+      live_revision: liveRevision,
+      projects: state.value.projects,
+      workers: state.value.workers
+    };
+  }
+  liveRevision = Math.max(liveRevision, revision);
+  return nextState;
+}
+
 function applyServerState(nextState, { selectActiveProject = false } = {}) {
+  nextState = preserveNewerLiveGlobals(nextState);
   const id = nextState.session?.id;
   const cached = id ? sessionStates.get(id) : null;
   const effective =
@@ -667,6 +702,7 @@ function applyServerState(nextState, { selectActiveProject = false } = {}) {
       : nextState;
   state.value = effective;
   if (id) sessionStates.set(id, effective);
+  applyWorkerLifecycles(effective.workers ?? []);
   expandedProjects.value = expandKnownProject(
     expandedProjects.value,
     effective.projects ?? [],
@@ -680,6 +716,7 @@ function targetState(sessionId) {
 }
 
 function setTargetState(sessionId, nextState) {
+  nextState = preserveNewerLiveGlobals(nextState);
   sessionStates.set(sessionId, nextState);
   if (session.value?.id === sessionId) {
     state.value = nextState;
@@ -690,6 +727,149 @@ function setTargetState(sessionId, nextState) {
       workers: nextState.workers ?? state.value.workers,
       providers: nextState.providers ?? state.value.providers
     };
+  }
+}
+
+function setLiveLifecycle(sessionId, lifecycle) {
+  const runtime = runtimeFor(sessionId);
+  runtime.liveLifecycle = lifecycle;
+  if (runtime.localStreaming) return;
+  const wasSending = runtime.sending;
+  const live = liveTurnState(lifecycle);
+  runtime.sending = live.sending;
+  runtime.cancelling = live.cancelling;
+  if (wasSending && !live.sending) {
+    window.queueMicrotask(() => {
+      const goalAction = runtime.pendingGoalAction;
+      runtime.pendingGoalAction = null;
+      if (goalAction) {
+        runtime.resumeGoalAfterQueue = false;
+        void goalAction().finally(() => dispatchQueuedPromptIfIdle(sessionId));
+        return;
+      }
+      dispatchQueuedPromptIfIdle(sessionId);
+    });
+  }
+}
+
+function applyWorkerLifecycles(workers) {
+  const lifecycleById = new Map(
+    workers.map((worker) => [worker.id, worker.lifecycle])
+  );
+  for (const [id, runtime] of sessionRuntimes) {
+    if (!runtime.localStreaming) {
+      setLiveLifecycle(id, lifecycleById.get(id) ?? "idle");
+    }
+  }
+  for (const worker of workers) {
+    setLiveLifecycle(worker.id, worker.lifecycle);
+  }
+}
+
+function applyLiveCatalog(message) {
+  if (!state.value) return;
+  const merged = mergeCatalog(state.value, message, liveRevision);
+  if (!merged.applied) return;
+  liveRevision = merged.revision;
+  state.value = merged.state;
+  applyWorkerLifecycles(message.workers ?? []);
+  expandedProjects.value = expandKnownProject(
+    expandedProjects.value,
+    message.projects ?? [],
+    null
+  );
+}
+
+function liveStateFor(view) {
+  const current = targetState(view.session.id);
+  const shared = state.value ?? {};
+  return {
+    ...(current ?? shared),
+    live_revision: liveRevision,
+    project: view.project_root,
+    session: view.session,
+    projects: shared.projects ?? [],
+    workers: shared.workers ?? []
+  };
+}
+
+function applyLiveSession(view) {
+  const id = view?.session?.id;
+  if (!id) return;
+  const currentRevision = liveObservationRevisions.get(id) ?? -1;
+  if (view.observation_revision < currentRevision) return;
+  liveObservationRevisions.set(id, view.observation_revision);
+  setLiveLifecycle(id, view.lifecycle);
+  if (runtimeFor(id).localStreaming) return;
+  setTargetState(id, liveStateFor(view));
+}
+
+function updateLiveSessionSummary(sessionId, patch) {
+  if (!state.value?.projects) return;
+  state.value = {
+    ...state.value,
+    projects: state.value.projects.map((project) => ({
+      ...project,
+      sessions: project.sessions.map((item) =>
+        item.id === sessionId ? { ...item, ...patch } : item
+      )
+    }))
+  };
+}
+
+async function applySessionStreamMessage(message) {
+  liveRevision = Math.max(liveRevision, Number(message.revision ?? 0));
+  if (message.type === "sync" || message.type === "catalog") {
+    if (message.type === "sync") sessionStreamRetryDelay = 250;
+    applyLiveCatalog(message);
+  }
+  if (message.type === "sync") {
+    for (const view of message.sessions ?? []) applyLiveSession(view);
+    return;
+  }
+  if (message.type === "session") {
+    applyLiveSession(message.session);
+    return;
+  }
+  if (message.type !== "event") return;
+  const id = message.session_id;
+  const currentRevision = liveObservationRevisions.get(id) ?? -1;
+  if (message.observation_revision <= currentRevision) return;
+  liveObservationRevisions.set(id, message.observation_revision);
+  if (runtimeFor(id).localStreaming || !targetState(id)?.session) return;
+  await handleChatStreamEvent(id, message.event);
+}
+
+function scheduleSessionStreamReconnect() {
+  if (sessionStreamRetry || sessionStreamController?.signal.aborted) return;
+  const delay = sessionStreamRetryDelay;
+  sessionStreamRetryDelay = Math.min(sessionStreamRetryDelay * 2, 5_000);
+  sessionStreamRetry = window.setTimeout(() => {
+    sessionStreamRetry = null;
+    void connectSessionStream();
+  }, delay);
+}
+
+async function connectSessionStream() {
+  sessionStreamController?.abort();
+  const controller = new AbortController();
+  sessionStreamController = controller;
+  try {
+    const response = await fetch("/api/sessions/stream", {
+      signal: controller.signal,
+      headers: { Accept: "application/x-ndjson" }
+    });
+    if (!response.ok) {
+      throw new Error(`Session stream failed with ${response.status}`);
+    }
+    await consumeNdjson(response, applySessionStreamMessage);
+    if (!controller.signal.aborted) {
+      throw new Error("Session stream ended unexpectedly");
+    }
+  } catch (cause) {
+    if (cause.name !== "AbortError" && !controller.signal.aborted) {
+      scheduleSessionStreamReconnect();
+    }
   }
 }
 
@@ -1511,6 +1691,28 @@ function applyAssistantMessage(sessionId, message) {
   }));
 }
 
+function applyUserMessage(sessionId, message) {
+  const current = targetState(sessionId)?.session;
+  const firstVisibleMessage = !(current?.messages ?? []).some(
+    (item) => !item.hidden && (item.role === "user" || item.role === "assistant")
+  );
+  updateTargetSession(sessionId, (targetSession) => ({
+    ...targetSession,
+    title:
+      firstVisibleMessage && message.content
+        ? message.content.slice(0, 72)
+        : targetSession.title,
+    updated_at: message.created_at ?? targetSession.updated_at,
+    messages: [...(targetSession.messages ?? []), message]
+  }));
+  if (firstVisibleMessage && message.content) {
+    updateLiveSessionSummary(sessionId, {
+      title: message.content.slice(0, 72),
+      updated_at: message.created_at
+    });
+  }
+}
+
 function applyEditedUserMessage(sessionId, message) {
   const messages = [...(targetState(sessionId)?.session?.messages ?? [])];
   if (messages.at(-1)?.role === "user") {
@@ -1576,7 +1778,7 @@ async function handleChatStreamEvent(
 ) {
   if (event.type === "user_message") {
     if (editing) applyEditedUserMessage(sessionId, event.message);
-    else applyAssistantMessage(sessionId, event.message);
+    else applyUserMessage(sessionId, event.message);
     if (session.value?.id === sessionId) await scrollToBottom();
     return false;
   }
@@ -1611,10 +1813,12 @@ async function handleChatStreamEvent(
   }
   if (event.type === "done") {
     setTargetState(sessionId, event.state);
+    applyWorkerLifecycles(event.state.workers ?? []);
     return true;
   }
   if (event.type === "cancelled") {
     setTargetState(sessionId, event.state);
+    applyWorkerLifecycles(event.state.workers ?? []);
     return true;
   }
   if (event.type === "error") {
@@ -1781,6 +1985,8 @@ async function runPrompt(
   if (!sessionId) return;
   const runtime = runtimeFor(sessionId);
   if (session.value?.id === sessionId) closeAutocomplete();
+  runtime.localStreaming = true;
+  runtime.liveLifecycle = "running";
   runtime.sending = true;
   runtime.cancelling = false;
   if (session.value?.id === sessionId) error.value = "";
@@ -1795,11 +2001,26 @@ async function runPrompt(
   } catch (cause) {
     const streamError = cause.message;
     runtime.error = streamError;
-    if (session.value?.id === sessionId) {
-      await loadState();
-      error.value = streamError;
+    try {
+      const latest = await api(
+        `/api/state?session_id=${encodeURIComponent(sessionId)}`
+      );
+      if (session.value?.id === sessionId) applyServerState(latest);
+      else setTargetState(sessionId, latest);
+      applyWorkerLifecycles(latest.workers ?? []);
+    } catch {
+      // The live session feed may still recover the authoritative lifecycle.
     }
+    if (session.value?.id === sessionId) error.value = streamError;
   } finally {
+    runtime.localStreaming = false;
+    const streamEnd = localStreamEndState(completed, runtime.liveLifecycle);
+    if (streamEnd.keepFollowing) {
+      runtime.sending = streamEnd.sending;
+      runtime.cancelling = streamEnd.cancelling;
+      if (session.value?.id === sessionId) await scrollToBottom();
+      return completed;
+    }
     runtime.sending = false;
     runtime.cancelling = false;
     if (session.value?.id === sessionId) await scrollToBottom();
@@ -2609,7 +2830,7 @@ onMounted(() => {
   observeConversationSize();
   document.fonts?.addEventListener?.("loadingdone", handleFontMetricsChange);
   void document.fonts?.ready?.then(handleFontMetricsChange);
-  loadState({ resumeGoal: true });
+  void loadState({ resumeGoal: true }).then(() => connectSessionStream());
 });
 onBeforeUnmount(() => {
   saveVirtualSessionView();
@@ -2622,6 +2843,8 @@ onBeforeUnmount(() => {
   );
   composerDrafts.persist();
   autocompleteController?.abort();
+  sessionStreamController?.abort();
+  window.clearTimeout(sessionStreamRetry);
   window.removeEventListener("popstate", handleHistoryNavigation);
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.clearTimeout(copiedMessageTimer);

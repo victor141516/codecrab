@@ -588,6 +588,7 @@ fn persisted_observation(session: &Session) -> ConversationObservation {
             crate::conversation::ObservedMessage {
                 id,
                 role,
+                sequence: message.sequence,
                 created_at,
                 content: message.content.clone().unwrap_or_default(),
                 partial: false,
@@ -639,6 +640,12 @@ fn persisted_observation(session: &Session) -> ConversationObservation {
         visible_goal,
         messages,
         activity,
+        display_messages: session
+            .messages
+            .active_entries()
+            .map(|(_, message)| message.clone())
+            .collect(),
+        activities: session.activities.clone(),
     }
 }
 
@@ -820,6 +827,7 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let config = Config::test("mock-model", format!("http://{address}/v1"));
         let (coordinator, registry) = test_coordinator(&root, config);
+        let mut live_events = coordinator.manager().subscribe_live();
         let caller = Uuid::new_v4();
         let created = coordinator
             .create_child(caller, &root, &json!({"prompt": "isolated task"}))
@@ -836,6 +844,41 @@ mod tests {
                 coordinator.status(child, &root).unwrap()
             );
         }
+        let mut saw_installed = false;
+        let mut saw_running = false;
+        let mut saw_user = false;
+        let mut saw_delta = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !(saw_installed && saw_running && saw_user && saw_delta) {
+                let event = live_events.recv().await.unwrap();
+                if event.session_id != child {
+                    continue;
+                }
+                match event.event {
+                    crate::conversation::ConversationLiveEvent::Installed => {
+                        saw_installed = true;
+                    }
+                    crate::conversation::ConversationLiveEvent::Lifecycle => {
+                        saw_running = coordinator.inner.manager.get(child).is_some_and(|handle| {
+                            handle.lifecycle() == ConversationLifecycle::Running
+                        });
+                    }
+                    crate::conversation::ConversationLiveEvent::Agent(
+                        crate::events::AgentEvent::UserMessage(_),
+                    ) => {
+                        saw_user = true;
+                    }
+                    crate::conversation::ConversationLiveEvent::Agent(
+                        crate::events::AgentEvent::AssistantTextDelta { .. },
+                    ) => {
+                        saw_delta = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("delegated session did not publish its live event sequence");
         for _ in 0..100 {
             if coordinator
                 .inner
