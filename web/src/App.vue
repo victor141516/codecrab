@@ -3162,7 +3162,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="h-dvh overflow-hidden bg-ink text-zinc-200">
+  <div class="app-shell h-dvh overflow-hidden bg-ink text-zinc-200">
     <div
       v-if="sidebarOpen"
       class="fixed inset-0 z-30 bg-black/60 backdrop-blur-sm lg:hidden"
@@ -3480,19 +3480,19 @@ onBeforeUnmount(() => {
     </div>
 
     <aside
-      class="fixed inset-y-0 left-0 z-40 flex w-72 -translate-x-full flex-col border-r border-white/6 bg-panel transition-transform duration-200 lg:translate-x-0"
+      class="app-sidebar fixed inset-y-0 left-0 z-40 flex w-72 -translate-x-full flex-col border-r bg-panel transition-transform duration-200 lg:translate-x-0"
       :class="{ 'translate-x-0': sidebarOpen }"
     >
-      <div class="flex h-14 items-center gap-3 border-b border-white/6 px-4">
-        <div class="grid size-7 place-items-center rounded-md bg-coral text-sm font-black text-black">
+      <div class="flex h-14 items-center gap-3 border-b border-white/7 px-4">
+        <div class="brand-mark grid size-7 place-items-center rounded-md bg-coral text-sm font-black text-black">
           C
         </div>
         <span class="text-sm font-semibold tracking-tight text-white">CodeCrab</span>
       </div>
 
-      <div class="p-3">
+      <div class="px-3 py-3.5">
         <button
-          class="flex w-full items-center justify-center gap-2 rounded-md border border-cyan-400/15 bg-cyan-400/7 px-3 py-2 text-xs font-semibold text-cyan-200 transition hover:border-cyan-400/25 hover:bg-cyan-400/12"
+          class="project-add-button flex w-full items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-xs font-semibold transition"
           @click="showProjectPicker"
         >
           <FolderPlus class="size-4" aria-hidden="true" />
@@ -3514,8 +3514,8 @@ onBeforeUnmount(() => {
           :data-project-root="project.root"
         >
           <div
-            class="group flex w-full items-center rounded-md transition hover:bg-white/4"
-            :class="{ 'bg-white/5': project.root === state?.project }"
+            class="sidebar-project-row group flex w-full items-center rounded-lg transition"
+            :class="{ 'is-active': project.root === state?.project }"
           >
             <button
               class="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
@@ -3534,14 +3534,14 @@ onBeforeUnmount(() => {
                 aria-hidden="true"
               />
               <span class="min-w-0 flex-1">
-                <span class="block truncate text-xs font-semibold text-zinc-300 group-hover:text-white">
+                <span class="block truncate text-[13px] font-semibold text-zinc-300 group-hover:text-white">
                   {{ projectName(project.root) }}
                 </span>
-                <span class="mt-0.5 block truncate font-mono text-[8px] text-zinc-700">
+                <span class="mt-0.5 block truncate font-mono text-[9px] text-zinc-500">
                   {{ project.root }}
                 </span>
               </span>
-              <span class="font-mono text-[9px] text-zinc-700">
+              <span class="font-mono text-[10px] text-zinc-500">
                 {{ project.sessions.length }}
               </span>
             </button>
@@ -3568,18 +3568,18 @@ onBeforeUnmount(() => {
             <div
               v-for="item in project.sessions"
               :key="item.id"
-              class="group/session mb-0.5 flex w-full items-center rounded-md transition hover:bg-white/4"
-              :class="{ 'bg-white/5': isCurrentSession(project, item) }"
+              class="sidebar-session-row group/session mb-0.5 flex w-full items-center rounded-lg transition"
+              :class="{ 'is-current': isCurrentSession(project, item) }"
             >
               <button
                 class="min-w-0 flex-1 px-2 py-2 text-left"
                 @click="resumeSession(project.root, item.id)"
               >
-                <span class="block truncate text-xs text-zinc-400 group-hover/session:text-white">
+                <span class="block truncate text-[13px] text-zinc-400 group-hover/session:text-white">
                   {{ item.title || "New session" }}
                 </span>
-                <span class="mt-1 flex items-center justify-between font-mono text-[9px] text-zinc-700">
-                  <span class="flex items-center gap-1.5">
+                <span class="session-meta mt-1 flex items-center justify-between gap-2 font-mono text-[9px] text-zinc-500">
+                  <span class="flex min-w-0 items-center gap-1.5">
                     <span
                       v-if="workerLifecycle(item.id)"
                       class="size-1.5 rounded-full"
@@ -3589,9 +3589,10 @@ onBeforeUnmount(() => {
                         'bg-zinc-600': workerLifecycle(item.id) === 'idle'
                       }"
                     />
-                    <span>{{ workerLifecycle(item.id) || shortId(item.id) }}</span>
+                    <span class="truncate">{{ workerLifecycle(item.id) || shortId(item.id) }}</span>
                   </span>
                   <span
+                    class="shrink-0 whitespace-nowrap"
                     :title="`Created ${formatEventTimestamp(item.created_at)} · Updated ${formatEventTimestamp(item.updated_at)}`"
                   >
                     C {{ formatTime(item.created_at) }} · U {{ formatTime(item.updated_at) }}
@@ -3614,7 +3615,7 @@ onBeforeUnmount(() => {
     </aside>
 
     <main class="flex h-full min-w-0 flex-col lg:pl-72">
-      <header class="flex h-14 shrink-0 items-center gap-3 border-b border-white/6 bg-ink/90 px-4 backdrop-blur">
+      <header class="app-header flex h-14 shrink-0 items-center gap-3 border-b bg-ink/90 px-4 backdrop-blur">
         <button
           class="grid size-8 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-white lg:hidden"
           aria-label="Open sessions"
@@ -3624,10 +3625,10 @@ onBeforeUnmount(() => {
         </button>
 
         <div class="min-w-0">
-          <h1 class="truncate text-xs font-medium text-zinc-200">
+          <h1 class="truncate text-[13px] font-semibold text-zinc-100">
             {{ session?.title || "No session" }}
           </h1>
-          <p class="mt-0.5 truncate font-mono text-[9px] text-zinc-600">
+          <p class="mt-0.5 truncate font-mono text-[10px] text-zinc-400">
             {{ state?.project }}
           </p>
         </div>
@@ -3723,7 +3724,7 @@ onBeforeUnmount(() => {
 
         <div
           v-else
-          class="mx-auto max-w-3xl px-4 py-8 sm:px-8"
+          class="mx-auto max-w-3xl px-4 py-6 sm:px-8"
           :data-timeline-mounted="virtualTimelineItems.length"
           :data-timeline-total="timeline.length"
         >
@@ -3746,7 +3747,7 @@ onBeforeUnmount(() => {
               }"
             >
               <div
-                class="grid size-6 shrink-0 place-items-center rounded-md bg-white/7 text-[10px] font-bold text-zinc-300"
+                class="user-badge grid size-7 shrink-0 place-items-center rounded-md text-[10px] font-bold text-zinc-200"
               >
                 U
               </div>
@@ -3796,17 +3797,17 @@ onBeforeUnmount(() => {
                   <div class="mt-1 flex justify-end gap-1">
                     <button
                       type="button"
-                      class="grid size-5 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
+                      class="grid size-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"
                       :disabled="sending || branchSelecting"
                       title="Edit message"
                       aria-label="Edit message"
                       @click="beginMessageEdit(item)"
                     >
-                      <Pencil class="size-3" aria-hidden="true" />
+                      <Pencil class="size-3.5" aria-hidden="true" />
                     </button>
                     <button
                       type="button"
-                      class="grid size-5 place-items-center rounded text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
+                      class="grid size-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"
                       :aria-label="
                         copiedMessageKey === item.key
                           ? 'Message copied'
@@ -3824,7 +3825,7 @@ onBeforeUnmount(() => {
                         class="size-3 text-emerald-400"
                         aria-hidden="true"
                       />
-                      <Copy v-else class="size-3" aria-hidden="true" />
+                      <Copy v-else class="size-3.5" aria-hidden="true" />
                     </button>
                   </div>
                 </template>
@@ -3832,7 +3833,7 @@ onBeforeUnmount(() => {
             </article>
 
             <article v-else class="message-row group">
-              <div class="grid size-6 shrink-0 place-items-center rounded-md bg-coral/12 text-[10px] font-bold text-coral">
+              <div class="assistant-badge grid size-7 shrink-0 place-items-center rounded-md text-[10px] font-bold text-coral">
                 C
               </div>
               <div class="min-w-0 flex-1">
@@ -3919,7 +3920,7 @@ onBeforeUnmount(() => {
                       :ref="
                         (element) => bindActivityDetail(event.key, element)
                       "
-                      class="min-w-0 flex-1 font-mono text-[10px] text-zinc-600"
+                      class="activity-detail min-w-0 flex-1 font-mono text-[11px]"
                       :class="
                         expandedActivityKeys.has(event.key)
                           ? 'whitespace-pre-wrap break-all'
@@ -3974,7 +3975,7 @@ onBeforeUnmount(() => {
                     />
                     <button
                       type="button"
-                      class="ml-auto mt-1 grid size-3 place-items-center text-zinc-600 transition hover:text-zinc-300"
+                      class="ml-auto mt-1 grid size-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"
                       :aria-label="
                         copiedMessageKey === event.key
                           ? 'Message copied'
@@ -3994,7 +3995,7 @@ onBeforeUnmount(() => {
                         class="size-3 text-emerald-400"
                         aria-hidden="true"
                       />
-                      <Copy v-else class="size-3" aria-hidden="true" />
+                      <Copy v-else class="size-3.5" aria-hidden="true" />
                     </button>
                   </div>
                 </template>
@@ -4016,7 +4017,7 @@ onBeforeUnmount(() => {
           />
 
           <div v-if="sending && !activeAssistantTurnKey" class="message-row">
-            <div class="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md bg-coral/12 text-[10px] font-bold text-coral">
+            <div class="assistant-badge mt-0.5 grid size-7 shrink-0 place-items-center rounded-md text-[10px] font-bold text-coral">
               C
             </div>
             <div class="pt-1.5">
@@ -4124,7 +4125,7 @@ onBeforeUnmount(() => {
         </aside>
       </div>
 
-      <div class="shrink-0 bg-gradient-to-t from-ink via-ink to-transparent px-3 pb-3 pt-6 sm:px-6">
+      <div class="composer-dock shrink-0 bg-gradient-to-t from-ink via-ink to-transparent px-3 pb-4 pt-5 sm:px-6">
         <div class="mx-auto max-w-3xl">
           <div
             v-if="error"
@@ -4303,7 +4304,7 @@ onBeforeUnmount(() => {
                 ref="composer"
                 v-model="draft"
                 rows="1"
-                class="max-h-48 min-h-11 w-full resize-none bg-transparent px-3 py-3 text-sm leading-5 text-zinc-200 outline-none placeholder:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+                class="max-h-48 min-h-12 w-full resize-none bg-transparent px-4 py-3.5 text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 disabled:cursor-not-allowed disabled:opacity-40"
                 :disabled="branchesOpen || Boolean(editingMessageNode)"
                 placeholder="Message CodeCrab…"
                 aria-label="Message CodeCrab"
