@@ -1,16 +1,16 @@
 @import "tailwindcss";
 
 @theme {
-  --color-ink: #0c0d0e;
-  --color-panel: #111214;
-  --color-coral: #f46356;
+  --color-ink: #0d0f12;
+  --color-panel: #111419;
+  --color-coral: #ff6b5f;
   --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: #2a2c30 transparent;
+  scrollbar-color: #25282d transparent;
 }
 
 html,
@@ -22,8 +22,77 @@ body,
 
 body {
   overflow: hidden;
-  background: #0c0d0e;
+  background: #0d0f12;
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgb(34 211 238 / 0.24);
+  color: #fafafa;
+}
+
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgb(103 232 249 / 0.48);
+  outline-offset: 2px;
+}
+
+.app-shell {
+  background:
+    radial-gradient(circle at 72% -18%, rgb(244 99 86 / 0.045), transparent 32rem),
+    #0d0f12;
+}
+
+.app-sidebar {
+  border-color: rgb(255 255 255 / 0.075);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 0.015), transparent 10rem),
+    #111419;
+  box-shadow: 12px 0 32px rgb(0 0 0 / 0.12);
+}
+
+.app-header {
+  border-color: rgb(255 255 255 / 0.075);
+  box-shadow: 0 1px rgb(0 0 0 / 0.3);
+}
+
+.brand-mark {
+  box-shadow:
+    0 0 0 1px rgb(255 255 255 / 0.1),
+    0 5px 14px rgb(244 99 86 / 0.16);
+}
+
+.project-add-button {
+  border-color: rgb(34 211 238 / 0.2);
+  background: rgb(34 211 238 / 0.075);
+  color: #a5f3fc;
+  box-shadow: inset 0 1px rgb(255 255 255 / 0.035);
+}
+
+.project-add-button:hover {
+  border-color: rgb(34 211 238 / 0.34);
+  background: rgb(34 211 238 / 0.12);
+  color: #cffafe;
+}
+
+.sidebar-project-row:hover,
+.sidebar-session-row:hover {
+  background: rgb(255 255 255 / 0.045);
+}
+
+.sidebar-project-row.is-active {
+  background: rgb(255 255 255 / 0.055);
+  box-shadow: inset 2px 0 rgb(34 211 238 / 0.55);
+}
+
+.sidebar-session-row.is-current {
+  background: rgb(255 255 255 / 0.06);
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.055),
+    inset 2px 0 #ff6b5f;
 }
 
 button,
@@ -42,16 +111,16 @@ button:disabled {
 }
 
 .control {
-  height: 2rem;
+  height: 2.125rem;
   min-width: 0;
   appearance: none;
-  border: 1px solid rgb(255 255 255 / 0.07);
-  border-radius: 0.375rem;
-  background: #131416;
+  border: 1px solid rgb(255 255 255 / 0.09);
+  border-radius: 0.5rem;
+  background-color: #15181d;
   padding: 0 1.75rem 0 0.625rem;
-  color: #a1a1aa;
+  color: #b4b4bd;
   font-family: var(--font-mono);
-  font-size: 0.625rem;
+  font-size: 0.6875rem;
   outline: none;
   background-image:
     linear-gradient(45deg, transparent 50%, #52525b 50%),
@@ -65,15 +134,16 @@ button:disabled {
 
 .control:hover,
 .control:focus {
-  border-color: rgb(255 255 255 / 0.14);
+  border-color: rgb(255 255 255 / 0.18);
+  background-color: #181b20;
   color: #e4e4e7;
 }
 
 .message-row {
   display: flex;
-  gap: 0.875rem;
-  padding: 1.125rem 0;
-  border-bottom: 1px solid rgb(255 255 255 / 0.035);
+  gap: 1rem;
+  padding: 1.25rem 0;
+  border-bottom: 1px solid rgb(255 255 255 / 0.05);
   border-radius: 0.5rem;
   transition:
     background-color 120ms ease,
@@ -83,6 +153,18 @@ button:disabled {
 .branch-message-highlight {
   background: rgb(244 99 86 / 0.07);
   box-shadow: inset 3px 0 rgb(244 99 86 / 0.75);
+}
+
+.user-badge {
+  border: 1px solid rgb(255 255 255 / 0.075);
+  background: rgb(255 255 255 / 0.07);
+  box-shadow: inset 0 1px rgb(255 255 255 / 0.035);
+}
+
+.assistant-badge {
+  border: 1px solid rgb(244 99 86 / 0.16);
+  background: rgb(244 99 86 / 0.11);
+  box-shadow: inset 0 1px rgb(255 255 255 / 0.03);
 }
 
 .conversation-viewport {
@@ -156,9 +238,9 @@ button:disabled {
 }
 
 .message-content {
-  color: #d4d4d8;
-  font-size: 0.8125rem;
-  line-height: 1.65;
+  color: #dddde2;
+  font-size: 0.875rem;
+  line-height: 1.68;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -192,9 +274,9 @@ button:disabled {
 }
 
 .markdown-body {
-  color: #d4d4d8;
-  font-size: 0.8125rem;
-  line-height: 1.7;
+  color: #dadae0;
+  font-size: 0.875rem;
+  line-height: 1.72;
   overflow-wrap: anywhere;
 }
 
@@ -212,7 +294,7 @@ button:disabled {
 .markdown-body blockquote,
 .markdown-body pre,
 .markdown-body table {
-  margin: 0.75rem 0;
+  margin: 0.8rem 0;
 }
 
 .markdown-body h1,
@@ -362,9 +444,9 @@ button:disabled {
   display: flex;
   min-height: 2rem;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.28rem 0;
-  color: #a1a1aa;
+  gap: 0.625rem;
+  padding: 0.4rem 0;
+  color: #a8a8b1;
 }
 
 .activity-row-expanded {
@@ -382,8 +464,8 @@ button:disabled {
 
 .activity-title {
   flex: none;
-  color: #d4d4d8;
-  font-size: 0.7rem;
+  color: #dddde2;
+  font-size: 0.725rem;
   font-weight: 600;
 }
 
@@ -410,22 +492,27 @@ button:disabled {
 
 .composer-shell {
   overflow: hidden;
-  border: 1px solid rgb(255 255 255 / 0.09);
-  border-radius: 0.625rem;
-  background: #131416;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 0.75rem;
+  background: #15181d;
   box-shadow:
-    0 18px 48px rgb(0 0 0 / 0.28),
-    inset 0 1px rgb(255 255 255 / 0.025);
+    0 18px 48px rgb(0 0 0 / 0.34),
+    inset 0 1px rgb(255 255 255 / 0.04);
   transition:
     border-color 150ms ease,
     box-shadow 150ms ease;
 }
 
 .composer-shell:focus-within {
-  border-color: rgb(244 99 86 / 0.35);
+  border-color: rgb(244 99 86 / 0.46);
   box-shadow:
-    0 18px 48px rgb(0 0 0 / 0.28),
-    0 0 0 3px rgb(244 99 86 / 0.045);
+    0 18px 48px rgb(0 0 0 / 0.34),
+    0 0 0 3px rgb(244 99 86 / 0.065);
+}
+
+.activity-detail {
+  color: #9aa1ab;
+  line-height: 1.45;
 }
 
 .thinking-dot {
