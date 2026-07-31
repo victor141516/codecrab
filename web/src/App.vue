@@ -44,6 +44,10 @@ import {
 } from "./completion-updates.js";
 import { isScrolledToBottom } from "./scroll.js";
 import {
+  insertTranscriptAtSelection,
+  isDictationShortcut
+} from "./dictation.js";
+import {
   activityEventTimestamp,
   formatEventTimestamp
 } from "./timestamps.js";
@@ -138,6 +142,7 @@ let mediaRecorder = null;
 let microphoneStream = null;
 let recordingChunks = [];
 let discardRecording = false;
+let recordingStopping = false;
 let sendAfterTranscription = false;
 let audioContext = null;
 let microphoneSource = null;
@@ -1306,27 +1311,25 @@ async function startWaveform(stream) {
 }
 
 async function insertTranscript(text) {
-  const transcript = text.trim();
-  if (!transcript) return false;
   const element = composer.value;
-  const start = element?.selectionStart ?? draft.value.length;
-  const end = element?.selectionEnd ?? start;
-  const before = draft.value.slice(0, start);
-  const after = draft.value.slice(end);
-  const leading = before && !/\s$/.test(before) ? " " : "";
-  const trailing = after && !/^\s/.test(after) ? " " : "";
-  const insertion = `${leading}${transcript}${trailing}`;
-  draft.value = before + insertion + after;
-  const cursor = start + insertion.length;
+  const focused = document.activeElement === element;
+  const result = insertTranscriptAtSelection(draft.value, text, {
+    focused,
+    start: focused ? element.selectionStart : draft.value.length,
+    end: focused ? element.selectionEnd : draft.value.length
+  });
+  if (!result.inserted) return false;
+  draft.value = result.value;
   await nextTick();
   element?.focus();
-  element?.setSelectionRange(cursor, cursor);
+  element?.setSelectionRange(result.cursor, result.cursor);
   resizeComposer();
   await refreshAutocomplete(element);
   return true;
 }
 
 async function transcribeRecording() {
+  recordingStopping = false;
   const discard = discardRecording;
   discardRecording = false;
   const shouldSend = sendAfterTranscription;
@@ -1370,13 +1373,29 @@ async function transcribeRecording() {
   }
 }
 
+function cancelDictation() {
+  if (!recording.value) return false;
+  discardRecording = true;
+  sendAfterTranscription = false;
+  error.value = "";
+  if (!recordingStopping && mediaRecorder?.state === "recording") {
+    recordingStopping = true;
+    mediaRecorder.stop();
+  }
+  recordingChunks = [];
+  stopMicrophoneTracks();
+  return true;
+}
+
 async function toggleDictation() {
   if (recording.value) {
+    if (recordingStopping) return;
+    recordingStopping = true;
     sendAfterTranscription = false;
     mediaRecorder?.stop();
     return;
   }
-  if (transcribing.value || !dictationAvailable.value) return;
+  if (recordingStopping || transcribing.value || !dictationAvailable.value) return;
   error.value = "";
   try {
     discardRecording = false;
@@ -1401,6 +1420,7 @@ async function toggleDictation() {
       "error",
       (event) => {
         discardRecording = true;
+        recordingStopping = false;
         error.value = `Dictation failed: ${event.error?.message || "microphone recording failed"}`;
         stopMicrophoneTracks();
       },
@@ -1670,6 +1690,8 @@ async function sendPrompt() {
     return;
   }
   if (recording.value) {
+    if (recordingStopping) return;
+    recordingStopping = true;
     sendAfterTranscription = true;
     mediaRecorder?.stop();
     return;
@@ -1931,8 +1953,28 @@ function steerQueuedPrompt(item) {
 
 function handleGlobalKeydown(event) {
   if (event.repeat) return;
+  const platform =
+    navigator.userAgentData?.platform ?? navigator.platform ?? navigator.userAgent;
+  if (
+    isDictationShortcut(event, platform) &&
+    !branchesOpen.value &&
+    !editingMessageNode.value &&
+    !recordingStopping &&
+    (recording.value || (!transcribing.value && dictationAvailable.value))
+  ) {
+    event.preventDefault();
+    lastEscapeAt = 0;
+    void toggleDictation();
+    return;
+  }
   if (event.key !== "Escape") {
     lastEscapeAt = 0;
+    return;
+  }
+  if (recording.value) {
+    event.preventDefault();
+    lastEscapeAt = 0;
+    cancelDictation();
     return;
   }
   if (editingMessageNode.value) {
@@ -3758,6 +3800,15 @@ onBeforeUnmount(() => {
                 />
                 <div class="ml-auto flex items-center gap-1">
                   <button
+                    v-if="recording"
+                    class="grid size-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"
+                    title="Discard recording"
+                    aria-label="Discard recording"
+                    @click="cancelDictation"
+                  >
+                    <X class="size-3.5" aria-hidden="true" />
+                  </button>
+                  <button
                     class="grid size-7 place-items-center rounded-md text-sm transition disabled:cursor-not-allowed disabled:text-zinc-700"
                     :class="
                       recording
@@ -3773,11 +3824,11 @@ onBeforeUnmount(() => {
                     :title="
                       dictationAvailable
                         ? recording
-                          ? 'Stop dictation'
+                          ? 'Stop and transcribe dictation'
                           : 'Start voice dictation'
                         : 'Dictation requires the official OpenAI provider and valid authentication'
                     "
-                    :aria-label="recording ? 'Stop dictation' : 'Start voice dictation'"
+                    :aria-label="recording ? 'Stop and transcribe dictation' : 'Start voice dictation'"
                     @click="toggleDictation"
                   >
                     <LoaderCircle
