@@ -3122,13 +3122,18 @@ impl App {
         }
 
         if self.recording.is_some() {
-            if key.code == KeyCode::Enter
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT)
-                && let Err(error) = self.stop_dictation(true)
-            {
-                self.error = Some(format!("Dictation failed: {error:#}"));
+            match recording_key_action(&key) {
+                RecordingKeyAction::Cancel => {
+                    self.recording = None;
+                    self.send_after_transcription = false;
+                    self.error = None;
+                }
+                RecordingKeyAction::StopAndSend => {
+                    if let Err(error) = self.stop_dictation(true) {
+                        self.error = Some(format!("Dictation failed: {error:#}"));
+                    }
+                }
+                RecordingKeyAction::Ignore => {}
             }
             return Ok(());
         }
@@ -4619,6 +4624,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             "  {:<30}start or stop voice dictation",
             dictation_shortcut_label()
         )),
+        Line::from("  Esc                   discard active recording"),
         Line::from("  ↑ / ↓                 navigate menu or move between lines"),
         Line::from("  PgUp / PgDn           scroll conversation"),
         Line::from("  Ctrl+U / Ctrl+K       delete to line start / end"),
@@ -5145,6 +5151,27 @@ fn display_width(text: &str) -> usize {
     text.chars()
         .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
         .sum()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordingKeyAction {
+    Cancel,
+    StopAndSend,
+    Ignore,
+}
+
+fn recording_key_action(key: &KeyEvent) -> RecordingKeyAction {
+    if key.code == KeyCode::Esc {
+        RecordingKeyAction::Cancel
+    } else if key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT)
+    {
+        RecordingKeyAction::StopAndSend
+    } else {
+        RecordingKeyAction::Ignore
+    }
 }
 
 fn is_dictation_shortcut(key: &KeyEvent) -> bool {
@@ -7271,6 +7298,22 @@ mod tests {
 
         assert_eq!(rendered, ["a🦀", "bc"]);
         assert_eq!(composer_cursor_position(input, &rows, "a🦀".len()), (1, 0));
+    }
+
+    #[test]
+    fn recording_keys_cancel_or_send_without_conflicting_with_modified_enter() {
+        assert_eq!(
+            recording_key_action(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            RecordingKeyAction::Cancel
+        );
+        assert_eq!(
+            recording_key_action(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            RecordingKeyAction::StopAndSend
+        );
+        assert_eq!(
+            recording_key_action(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            RecordingKeyAction::Ignore
+        );
     }
 
     #[test]

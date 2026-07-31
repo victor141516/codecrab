@@ -94,7 +94,7 @@ Useful composer controls:
 | `Ctrl+Shift+S` | Start or stop dictation (`Ctrl+S` on macOS) |
 | `Up` / `Down` | Navigate menus or move between visual editor rows |
 | `PgUp` / `PgDn`, mouse wheel | Scroll the conversation |
-| `Esc` twice within one second | Stop the active turn |
+| `Esc` | Discard an active recording; press twice within one second to stop an active turn |
 | `Ctrl+D` or `Ctrl+C` | Save and quit while idle |
 
 Run `/help` or press `F1` for the complete keyboard reference. The terminal handles Unicode-aware soft wrapping, international keyboard layouts including AltGr, Markdown and code highlighting, mouse selection, and native clipboard copy.
@@ -338,7 +338,7 @@ A PTY command still running after five seconds returns a conversation-scoped ter
 
 ## Voice dictation
 
-Terminal capture uses `Ctrl+Shift+S` (`Ctrl+S` on macOS); the web client uses the microphone button and displays a live waveform. Stopping normally transcribes and inserts text for review. Pressing Enter in an active terminal recording, or Send in an active web recording, transcribes and submits immediately.
+Terminal and web capture use `Ctrl+Shift+S` (`Ctrl+S` on macOS); the web client also provides a microphone button and displays a live waveform. Stopping normally transcribes and inserts text at the current composer cursor, or at the end of an unfocused web draft. Pressing Enter in an active terminal recording, or Send in an active web recording, transcribes and submits immediately. Pressing `Esc` in either client, or using the web discard button, stops recording and deletes the captured audio without transcribing it.
 
 With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription endpoint. This is not a public compatibility contract and may change without notice. API-key transcription uses the official provider's `/audio/transcriptions` endpoint. Microphone permission is required.
 
