@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
+    attachments::{AttachmentKind, ImageDetail},
     auth::{OAuthCredentials, OAuthStore},
     config::{CatalogOptionConfig, Config, ModelCapabilitiesConfig},
     diagnostics::DebugOutput,
@@ -202,12 +203,40 @@ pub(crate) struct Message {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<MessagePart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum MessagePart {
+    Text {
+        text: String,
+    },
+    Attachment {
+        attachment_id: Uuid,
+        reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_text: Option<String>,
+        kind: AttachmentKind,
+        #[serde(default)]
+        detail: ImageDetail,
+        #[serde(skip)]
+        image_url: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct AttachmentBinding {
+    pub attachment_id: Uuid,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -235,6 +264,7 @@ impl Message {
             sequence: None,
             created_at: Some(Utc::now()),
             content: Some(content.into()),
+            parts: Vec::new(),
             tool_calls: None,
             tool_call_id: None,
             hidden: false,
@@ -247,6 +277,7 @@ impl Message {
             sequence: None,
             created_at: Some(Utc::now()),
             content: Some(content.into()),
+            parts: Vec::new(),
             tool_calls: None,
             tool_call_id: None,
             hidden: true,
@@ -298,7 +329,7 @@ struct ChatStreamOptions {
 struct ChatMessage<'a> {
     role: &'a Role,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a String>,
+    content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<&'a Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,11 +340,45 @@ impl<'a> From<&'a Message> for ChatMessage<'a> {
     fn from(message: &'a Message) -> Self {
         Self {
             role: &message.role,
-            content: message.content.as_ref(),
+            content: chat_content(message),
             tool_calls: message.tool_calls.as_ref(),
             tool_call_id: message.tool_call_id.as_ref(),
         }
     }
+}
+
+fn chat_content(message: &Message) -> Option<Value> {
+    if message.parts.is_empty() {
+        return message.content.as_ref().map(|content| json!(content));
+    }
+    let mut content = Vec::new();
+    for part in &message.parts {
+        match part {
+            MessagePart::Text { text } if !text.is_empty() => {
+                content.push(json!({"type": "text", "text": text}));
+            }
+            MessagePart::Attachment {
+                kind: AttachmentKind::Image,
+                image_url: Some(image_url),
+                ..
+            } => content.push(json!({
+                "type": "image_url",
+                "image_url": {"url": image_url}
+            })),
+            MessagePart::Attachment {
+                reference,
+                provider_text,
+                ..
+            } => {
+                content.push(json!({
+                    "type": "text",
+                    "text": provider_text.as_deref().unwrap_or(reference)
+                }));
+            }
+            MessagePart::Text { .. } => {}
+        }
+    }
+    (!content.is_empty()).then(|| json!(content))
 }
 
 #[derive(Deserialize)]
@@ -420,6 +485,10 @@ impl OpenAiCompatible {
         if let Backend::ChatGptSubscription { auth } = &mut self.backend {
             auth.set_debug_openai(self.debug_openai.clone());
         }
+    }
+
+    pub(crate) fn supports_structured_image_tool_output(&self) -> bool {
+        matches!(&self.backend, Backend::ChatGptSubscription { .. })
     }
 
     pub(crate) fn set_selection(&mut self, selection: &ModelSelection) {
@@ -771,11 +840,11 @@ fn responses_payload(
         match message.role {
             Role::System => {}
             Role::User => {
-                if let Some(content) = &message.content {
+                if let Some(content) = responses_message_content(message, true) {
                     input.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": [{"type": "input_text", "text": content}]
+                        "content": content
                     }));
                 }
             }
@@ -799,7 +868,10 @@ fn responses_payload(
                 }
             }
             Role::Tool => {
-                if let (Some(call_id), Some(content)) = (&message.tool_call_id, &message.content) {
+                if let (Some(call_id), Some(content)) = (
+                    &message.tool_call_id,
+                    responses_message_content(message, true),
+                ) {
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
@@ -849,6 +921,41 @@ fn responses_payload(
         payload["max_output_tokens"] = json!(maximum_output_tokens);
     }
     payload
+}
+
+fn responses_message_content(message: &Message, input: bool) -> Option<Value> {
+    if message.parts.is_empty() {
+        return message.content.as_ref().map(|content| {
+            json!([{
+                "type": if input { "input_text" } else { "output_text" },
+                "text": content
+            }])
+        });
+    }
+    let mut content = Vec::new();
+    for part in &message.parts {
+        match part {
+            MessagePart::Text { text } if !text.is_empty() => content.push(json!({
+                "type": if input { "input_text" } else { "output_text" },
+                "text": text
+            })),
+            MessagePart::Attachment {
+                kind: AttachmentKind::Image,
+                image_url: Some(image_url),
+                ..
+            } => content.push(json!({"type": "input_image", "image_url": image_url})),
+            MessagePart::Attachment {
+                reference,
+                provider_text,
+                ..
+            } => content.push(json!({
+                "type": if input { "input_text" } else { "output_text" },
+                "text": provider_text.as_deref().unwrap_or(reference)
+            })),
+            MessagePart::Text { .. } => {}
+        }
+    }
+    (!content.is_empty()).then(|| json!(content))
 }
 
 fn merge_model_catalog(
@@ -1435,6 +1542,7 @@ fn completed_message(text: String, calls: Vec<ToolCall>, empty_error: &str) -> R
         sequence: None,
         created_at: None,
         content: (!text.is_empty()).then_some(text),
+        parts: Vec::new(),
         tool_calls: (!calls.is_empty()).then_some(calls),
         tool_call_id: None,
         hidden: false,
@@ -1600,6 +1708,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: None,
+                parts: Vec::new(),
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".into(),
                     kind: "function".into(),
@@ -1616,6 +1725,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: Some("file contents".into()),
+                parts: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
                 hidden: false,
@@ -1637,6 +1747,115 @@ mod tests {
         assert_eq!(payload["reasoning"]["effort"], "high");
         assert_eq!(payload["service_tier"], "fast");
         assert_eq!(payload["max_output_tokens"], 8_000);
+    }
+
+    #[test]
+    fn ordered_text_and_images_use_each_provider_protocol_shape() {
+        let attachment_id = Uuid::new_v4();
+        let mut message = Message::text(Role::User, "before @preview.png after");
+        message.parts = vec![
+            MessagePart::Text {
+                text: "before ".into(),
+            },
+            MessagePart::Attachment {
+                attachment_id,
+                reference: "@preview.png".into(),
+                provider_text: None,
+                kind: AttachmentKind::Image,
+                detail: ImageDetail::Preview,
+                image_url: Some("data:image/png;base64,AAAA".into()),
+            },
+            MessagePart::Text {
+                text: " after".into(),
+            },
+        ];
+
+        let chat = serde_json::to_value(ChatMessage::from(&message)).unwrap();
+        assert_eq!(
+            chat["content"][0],
+            json!({"type": "text", "text": "before "})
+        );
+        assert_eq!(
+            chat["content"][1],
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"}
+            })
+        );
+        assert_eq!(
+            chat["content"][2],
+            json!({"type": "text", "text": " after"})
+        );
+
+        let responses = responses_payload(
+            "image-model",
+            None,
+            None,
+            &[message],
+            &[],
+            None,
+            Uuid::nil(),
+        );
+        assert_eq!(responses["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(responses["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(responses["input"][0]["content"][2]["text"], " after");
+    }
+
+    #[test]
+    fn attachment_data_urls_are_never_persisted() {
+        let mut message = Message::text(Role::User, "@preview.png");
+        message.parts = vec![MessagePart::Attachment {
+            attachment_id: Uuid::new_v4(),
+            reference: "@preview.png".into(),
+            provider_text: None,
+            kind: AttachmentKind::Image,
+            detail: ImageDetail::Preview,
+            image_url: Some("data:image/png;base64,SECRET".into()),
+        }];
+        let persisted = serde_json::to_string(&message).unwrap();
+        assert!(!persisted.contains("base64"));
+        assert!(persisted.contains("attachment_id"));
+    }
+
+    #[test]
+    fn responses_tool_output_keeps_structured_image_content() {
+        let message = Message {
+            role: Role::Tool,
+            sequence: None,
+            created_at: None,
+            content: None,
+            parts: vec![
+                MessagePart::Text {
+                    text: "Original attachment".into(),
+                },
+                MessagePart::Attachment {
+                    attachment_id: Uuid::new_v4(),
+                    reference: "@preview.png".into(),
+                    provider_text: None,
+                    kind: AttachmentKind::Image,
+                    detail: ImageDetail::Original,
+                    image_url: Some("data:image/png;base64,AAAA".into()),
+                },
+            ],
+            tool_calls: None,
+            tool_call_id: Some("image-call".into()),
+            hidden: false,
+        };
+
+        let responses = responses_payload(
+            "image-model",
+            None,
+            None,
+            &[message],
+            &[],
+            None,
+            Uuid::nil(),
+        );
+
+        assert_eq!(responses["input"][0]["type"], "function_call_output");
+        assert_eq!(responses["input"][0]["call_id"], "image-call");
+        assert_eq!(responses["input"][0]["output"][0]["type"], "input_text");
+        assert_eq!(responses["input"][0]["output"][1]["type"], "input_image");
     }
 
     #[test]

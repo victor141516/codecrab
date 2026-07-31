@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    attachments::{Attachment, AttachmentStore},
     config::{SessionRegistry, normalized_root, paths_equal},
     events::AgentActivity,
     provider::{Message, Role, TokenUsage},
@@ -212,7 +213,7 @@ impl ConversationTree {
         Ok(leaf_id)
     }
 
-    fn branch_from_edited_user_message(&mut self, id: Uuid, content: String) -> Result<Uuid> {
+    fn branch_from_edited_user_message(&mut self, id: Uuid, message: Message) -> Result<Uuid> {
         let node = self
             .nodes
             .iter()
@@ -222,7 +223,7 @@ impl ConversationTree {
             anyhow::bail!("only visible user messages can be edited");
         }
         let parent_id = node.parent_id;
-        self.branch_from(parent_id, Message::text(Role::User, content))
+        self.branch_from(parent_id, message)
     }
 
     fn rebuild_active_path(&mut self) -> std::result::Result<(), String> {
@@ -441,6 +442,8 @@ pub(crate) struct Session {
     pub next_terminal_id: u64,
     #[serde(default)]
     pub terminals: Vec<TerminalRecord>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 fn default_provider() -> String {
@@ -627,7 +630,17 @@ impl Session {
         Ok(leaf_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn edit_user_message(&mut self, node_id: Uuid, content: String) -> Result<Uuid> {
+        self.edit_user_message_with(node_id, Message::text(Role::User, content))
+    }
+
+    pub(crate) fn edit_user_message_with(
+        &mut self,
+        node_id: Uuid,
+        message: Message,
+    ) -> Result<Uuid> {
+        let content = message.content.clone().unwrap_or_default();
         if content.trim().is_empty() {
             anyhow::bail!("edited message is empty");
         }
@@ -640,7 +653,7 @@ impl Session {
         });
         let edited_id = self
             .messages
-            .branch_from_edited_user_message(node_id, content.clone())?;
+            .branch_from_edited_user_message(node_id, message)?;
         self.refresh_active_indexes();
         if editing_root {
             self.title = content.chars().take(72).collect();
@@ -749,6 +762,7 @@ impl SessionStore {
             latest_request_usage: None,
             next_terminal_id: 1,
             terminals: Vec::new(),
+            attachments: Vec::new(),
         })
     }
 
@@ -797,7 +811,39 @@ impl SessionStore {
     pub(crate) fn delete(&self, query: &str) -> Result<Uuid> {
         let id = self.resolve_id(Some(query))?;
         let path = self.dir.join(format!("{id}.json"));
-        fs::remove_file(&path).with_context(|| format!("cannot delete {}", path.display()))?;
+        let project_root = self
+            .dir
+            .parent()
+            .and_then(Path::parent)
+            .context("session store has no project root")?;
+        let attachment_store = AttachmentStore::new(project_root);
+        let attachment_dir = attachment_store.session_dir(id);
+        let tombstone = attachment_dir.with_extension(format!("deleting-{}", Uuid::new_v4()));
+        let moved_data = if attachment_dir.exists() {
+            fs::rename(&attachment_dir, &tombstone).with_context(|| {
+                format!(
+                    "cannot prepare attachment data {} for deletion",
+                    attachment_dir.display()
+                )
+            })?;
+            true
+        } else {
+            false
+        };
+        if let Err(error) = fs::remove_file(&path) {
+            if moved_data {
+                let _ = fs::rename(&tombstone, &attachment_dir);
+            }
+            return Err(error).with_context(|| format!("cannot delete {}", path.display()));
+        }
+        if moved_data {
+            fs::remove_dir_all(&tombstone).with_context(|| {
+                format!(
+                    "session was deleted, but cannot remove {}",
+                    tombstone.display()
+                )
+            })?;
+        }
         Ok(id)
     }
 
@@ -1458,6 +1504,22 @@ mod tests {
 
         assert_eq!(deleted, session.id);
         assert!(store.list().unwrap().is_empty());
+        assert!(store.load(Some(&session.id.to_string())).is_err());
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_attachment_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = store.create("model".into()).unwrap();
+        store.save(&session).unwrap();
+        let attachment_dir = AttachmentStore::new(root.path()).session_dir(session.id);
+        fs::create_dir_all(attachment_dir.join("attachments/hash")).unwrap();
+        fs::write(attachment_dir.join("attachments/hash/original"), b"data").unwrap();
+
+        store.delete(&session.id.to_string()).unwrap();
+
+        assert!(!attachment_dir.exists());
         assert!(store.load(Some(&session.id.to_string())).is_err());
     }
 

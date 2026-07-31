@@ -25,15 +25,18 @@ use axum_server::{Handle, tls_rustls::RustlsConfig};
 use rcgen::{CertificateParams, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::{
+    io::AsyncWriteExt,
     net::TcpListener,
     sync::{Mutex, broadcast, mpsc},
 };
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use uuid::Uuid;
 
 use crate::{
     agent::{Agent, turn_was_cancelled},
+    attachments::{Attachment, AttachmentStore, MAX_ATTACHMENT_BYTES, validate_sha256},
     auth::OAuthStore,
     completion::{
         CompletionItem, complete as complete_input, file_completion_context,
@@ -51,7 +54,7 @@ use crate::{
     diagnostics::{DebugOutput, DiagnosticLog},
     events::{AgentActivity, AgentEvent},
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
-    provider::{Message, ModelCatalogEntry, ModelSelection},
+    provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection},
     session::{
         Session, SessionProject, SessionStore, SessionSummary, list_session_projects,
         resolve_global_session,
@@ -221,6 +224,31 @@ struct ChatRequest {
     #[serde(default)]
     continuation: bool,
     edit_node_id: Option<Uuid>,
+    #[serde(default)]
+    attachments: Vec<AttachmentBinding>,
+}
+
+#[derive(Deserialize)]
+struct AttachmentPreflightRequest {
+    project: PathBuf,
+    session_id: Uuid,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+struct AttachmentUploadQuery {
+    project: PathBuf,
+    session_id: Uuid,
+    sha256: String,
+    name: String,
+    mime_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AttachmentResponse {
+    attachment: Attachment,
+    reference: String,
+    reused: bool,
 }
 
 #[derive(Deserialize)]
@@ -509,6 +537,8 @@ fn server_app(state: ServerState) -> Router {
                 .route("/completions/recursive", post(recursive_completions))
                 .route("/chat", post(chat))
                 .route("/chat/cancel", post(cancel_chat))
+                .route("/attachments/preflight", post(attachment_preflight))
+                .route("/attachments/upload", post(upload_attachment))
                 .route(
                     "/transcribe",
                     post(transcribe).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
@@ -1029,6 +1059,131 @@ async fn transcribe(
     Ok(Json(TranscriptResponse { text }))
 }
 
+fn attachment_conversation(
+    state: &ServerState,
+    project: &std::path::Path,
+    session_id: Uuid,
+) -> std::result::Result<(ConversationHandle, PathBuf), ApiError> {
+    let conversation = state.inner.conversations.get(session_id).ok_or_else(|| {
+        ApiError::message(
+            StatusCode::CONFLICT,
+            "resume the target session before attaching files",
+        )
+    })?;
+    let snapshot = conversation.snapshot();
+    if snapshot.session.id != session_id || !paths_equal(&snapshot.project_root, project) {
+        return Err(ApiError::message(
+            StatusCode::CONFLICT,
+            "attachment project and session do not match",
+        ));
+    }
+    Ok((conversation, snapshot.project_root))
+}
+
+async fn attachment_preflight(
+    State(state): State<ServerState>,
+    Json(request): Json<AttachmentPreflightRequest>,
+) -> ApiResult<AttachmentResponse> {
+    validate_sha256(&request.sha256).map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        error,
+    })?;
+    let (conversation, root) =
+        attachment_conversation(&state, &request.project, request.session_id)?;
+    let snapshot = conversation.snapshot();
+    let attachment = AttachmentStore::find_by_hash(&snapshot.session.attachments, &request.sha256)
+        .cloned()
+        .ok_or_else(|| ApiError::message(StatusCode::NOT_FOUND, "attachment hash is not stored"))?;
+    let reference = AttachmentStore::new(&root).visible_reference(&attachment);
+    Ok(Json(AttachmentResponse {
+        attachment,
+        reference,
+        reused: true,
+    }))
+}
+
+async fn upload_attachment(
+    State(state): State<ServerState>,
+    Query(request): Query<AttachmentUploadQuery>,
+    body: Body,
+) -> ApiResult<AttachmentResponse> {
+    validate_sha256(&request.sha256).map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        error,
+    })?;
+    let (conversation, root) =
+        attachment_conversation(&state, &request.project, request.session_id)?;
+    let snapshot = conversation.snapshot();
+    let store = AttachmentStore::new(&root);
+    if let Some(attachment) =
+        AttachmentStore::find_by_hash(&snapshot.session.attachments, &request.sha256).cloned()
+    {
+        let reference = store.visible_reference(&attachment);
+        return Ok(Json(AttachmentResponse {
+            attachment,
+            reference,
+            reused: true,
+        }));
+    }
+
+    let temp_path = store.upload_temp_path(request.session_id)?;
+    let upload_result = async {
+        let mut file = tokio::fs::File::create(&temp_path).await?;
+        let mut stream = body.into_data_stream();
+        let mut size = 0_u64;
+        let mut digest = Sha256::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("cannot read attachment upload")?;
+            size = size.saturating_add(chunk.len() as u64);
+            if size > MAX_ATTACHMENT_BYTES {
+                anyhow::bail!(
+                    "attachment exceeds the {} MiB limit",
+                    MAX_ATTACHMENT_BYTES / 1024 / 1024
+                );
+            }
+            digest.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        drop(file);
+        if size == 0 {
+            anyhow::bail!("attachment is empty");
+        }
+        let actual = format!("{:x}", digest.finalize());
+        if !actual.eq_ignore_ascii_case(&request.sha256) {
+            anyhow::bail!("attachment SHA-256 does not match the uploaded bytes");
+        }
+        let attachment = store.import_uploaded_file(
+            request.session_id,
+            &snapshot.session.attachments,
+            &temp_path,
+            &request.name,
+            request.mime_type.as_deref(),
+            &request.sha256,
+        )?;
+        let (_, attachment) = conversation.add_attachment(attachment).await?;
+        let reference = store.visible_reference(&attachment);
+        Ok::<_, anyhow::Error>(AttachmentResponse {
+            attachment,
+            reference,
+            reused: false,
+        })
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temp_path).await;
+    match upload_result {
+        Ok(response) => Ok(Json(response)),
+        Err(error) => Err(ApiError {
+            status: if format!("{error:#}").contains("limit") {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            error,
+        }),
+    }
+}
+
 async fn chat(
     State(state): State<ServerState>,
     Json(request): Json<ChatRequest>,
@@ -1057,11 +1212,16 @@ async fn chat(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let session_id = conversation.snapshot().session.id;
     let turn = if let Some(node_id) = request.edit_node_id {
-        conversation.start_edit_turn(node_id, prompt, Some(event_tx))
+        conversation.start_edit_turn_with_attachments(
+            node_id,
+            prompt,
+            request.attachments,
+            Some(event_tx),
+        )
     } else if request.continuation {
         conversation.start_goal_continuation(Some(event_tx))
     } else {
-        conversation.start_turn(prompt, Some(event_tx))
+        conversation.start_turn_with_attachments(prompt, request.attachments, Some(event_tx))
     }
     .map_err(|error| ApiError {
         status: StatusCode::CONFLICT,
@@ -2732,6 +2892,7 @@ mod tests {
                 prompt: "Read the note".into(),
                 continuation: false,
                 edit_node_id: None,
+                attachments: Vec::new(),
             }),
         )
         .await
@@ -2834,6 +2995,7 @@ mod tests {
                 prompt: "Edited follow-up".into(),
                 continuation: false,
                 edit_node_id: Some(edited_node),
+                attachments: Vec::new(),
             }),
         )
         .await
@@ -2942,6 +3104,7 @@ mod tests {
                 prompt: "First".into(),
                 continuation: false,
                 edit_node_id: None,
+                attachments: Vec::new(),
             }),
         )
         .await
@@ -2954,6 +3117,7 @@ mod tests {
                 prompt: "Second".into(),
                 continuation: false,
                 edit_node_id: None,
+                attachments: Vec::new(),
             }),
         )
         .await

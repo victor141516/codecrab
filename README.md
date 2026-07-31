@@ -121,6 +121,7 @@ Useful composer controls:
 | `/` at the beginning | Complete built-in commands and skills |
 | `/` after existing text | Complete skills only |
 | `@path` | Find and reference a file or directory |
+| `Ctrl+V`, `Alt+V`, `Command+V` when reported | Paste clipboard files or image pixels; terminals may consume `Command+V` before CodeCrab sees it |
 | `Enter` | Complete the selected item or send |
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | Insert a newline (`Alt+Enter` or `Ctrl+J` on macOS) |
 | `Ctrl+Shift+S` | Start or stop dictation (`Ctrl+S` on macOS) |
@@ -129,7 +130,7 @@ Useful composer controls:
 | `Esc` | Discard an active recording; press twice within one second to stop an active turn |
 | `Ctrl+D` or `Ctrl+C` | Save and quit while idle |
 
-Run `/help` or press `F1` for the complete keyboard reference. The terminal handles Unicode-aware soft wrapping, international keyboard layouts including AltGr, Markdown and code highlighting, mouse selection, and native clipboard copy.
+Run `/help` or press `F1` for the complete keyboard reference. The terminal handles Unicode-aware soft wrapping, international keyboard layouts including AltGr, Markdown and code highlighting, mouse selection, native clipboard copy, and explicit image/file clipboard paste.
 
 You can keep typing while an agent turn runs. Sending adds an editable follow-up to a queue; **Steer** cancels the current turn and sends one selected follow-up next without reordering the rest.
 
@@ -194,6 +195,18 @@ codecrab resume <session-id-or-prefix>
 The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
 
 Web session URLs use `/sessions/<id>`, so a clean reload or shared URL resolves the correct registered project without relying on browser storage. Unsent composer drafts remain browser-local and isolated by project and session.
+
+### File and image attachments
+
+The web composer accepts multiple files through its paperclip button, paste, or drag and drop. Browser files are hashed before upload, checked against the selected session, and streamed to the agent host only when that SHA-256 is not already present. Uploads are limited to 25 MiB per file. Generic files remain unchanged and are exposed to the agent as stable host-side paths; CodeCrab does not automatically parse, OCR, or upload them to the model provider.
+
+The terminal keeps ordinary local files lightweight: `@path` and pasted non-image files remain direct absolute or project-relative host paths. Images selected through `@`, copied as files, or copied as raw screenshot/browser pixels are imported into session storage. `Ctrl+V` is the reliable in-app clipboard action, with `Alt+V` as a fallback; `Command+V` works only when the terminal forwards it.
+
+Attachment metadata is stored in the session JSON while bytes live under `.codecrab/session-data/<session-id>/attachments/<sha256>/`. Deduplication is deliberately per session, and deleting a session deletes its attachment data. Composer bindings preserve the order of text and images across drafts, queued prompts, edits, branches, persistence, and resume.
+
+Images retain their original bytes and receive a metadata-stripped, aspect-preserving model rendition no larger than 1024 px on either edge. CodeCrab never upscales. PNG is used when alpha matters and JPEG otherwise; the agent can call `view_attachment_image` for a bounded higher-detail rendition. Structured image tool results use the ChatGPT Responses path; compatible Chat Completions backends receive an explicit unsupported-output error. Image submission is rejected without clearing the draft unless the provider catalog explicitly declares image input support for the selected model.
+
+Because browser uploads write files on the CodeCrab host, the existing server warning is especially important: remotely exposed servers must be placed behind an authenticated gateway. Attachment contents are not logged except when the explicitly unredacted `--debug-openai` mode includes a multimodal provider request.
 
 ### Commands
 
@@ -386,6 +399,8 @@ With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription 
 | `POST` | `/api/completions/recursive` | Progressive fuzzy filesystem completion batches |
 | `POST` | `/api/chat` | Run or edit a prompt as an ordered NDJSON event stream |
 | `POST` | `/api/chat/cancel` | Cancel one session's active provider or tool operation |
+| `POST` | `/api/attachments/preflight` | Look up a session attachment by browser-computed SHA-256 |
+| `POST` | `/api/attachments/upload` | Stream and verify one bounded browser file upload for an explicit project/session |
 | `POST` | `/api/transcribe` | Transcribe uploaded audio |
 | `PUT` | `/api/model` | Change model, reasoning, and service tier |
 | `POST` | `/api/providers` | Add or replace a provider profile |
@@ -453,6 +468,7 @@ The main implementation areas are:
 - `src/conversation.rs` — persistent Tokio workers, commands, snapshots, and cancellation.
 - `src/coordination.rs` — shared agent construction and session delegation.
 - `src/provider.rs` — ChatGPT Responses and compatible Chat Completions protocols.
+- `src/attachments.rs` — session attachment storage, hashing, image processing, and model renditions.
 - `src/tools.rs` and `src/terminal/` — filesystem, commands, PTYs, and terminal emulation.
 - `src/completion.rs` — shared slash, skill, and filesystem completion.
 - `src/session.rs` — conversation trees, goals, persistence, and project catalogs.

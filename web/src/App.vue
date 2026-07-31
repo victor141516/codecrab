@@ -25,6 +25,7 @@ import {
   Mic,
   Settings,
   Pause,
+  Paperclip,
   Pencil,
   Play,
   Plus,
@@ -35,8 +36,15 @@ import {
 import { renderMarkdown } from "./markdown.js";
 import {
   createComposerDraftController,
-  createComposerDraftStore
+  createComposerDraftStore,
+  composerDraftKey
 } from "./composer-drafts.js";
+import {
+  bindingsFromMessage,
+  insertAttachmentReference,
+  reconcileAttachmentBindings,
+  trimAttachmentDraft
+} from "./attachment-bindings.js";
 import { recalledMessageForComposer } from "./composer-recall.js";
 import {
   consumeCompletionNdjson,
@@ -86,6 +94,9 @@ import {
 
 const state = ref(null);
 const draft = ref("");
+const draftAttachments = ref([]);
+const attachmentInput = ref(null);
+const uploadingAttachments = ref(false);
 const loading = ref(true);
 const recording = ref(false);
 const transcribing = ref(false);
@@ -123,6 +134,7 @@ const branchOriginalPath = ref(new Set());
 const editingMessageNode = ref(null);
 const recalledMessageNode = ref(null);
 const messageEditDraft = ref("");
+const messageEditAttachments = ref([]);
 const messageEditor = ref(null);
 let autocompleteRequest = 0;
 let autocompleteController = null;
@@ -178,7 +190,99 @@ const composerDrafts = createComposerDraftController({
   resize: resizeComposer,
   focus: () => composer.value?.focus()
 });
-watch(draft, (value) => composerDrafts.persist(value), { flush: "sync" });
+let attachmentDraftIdentity = null;
+let replacingAttachmentDraft = false;
+
+function attachmentStorageKey(project, sessionId) {
+  return `${composerDraftKey(project, sessionId)}:attachments`;
+}
+
+function persistAttachmentDraft() {
+  if (!attachmentDraftIdentity || replacingAttachmentDraft) return;
+  const { project, sessionId } = attachmentDraftIdentity;
+  try {
+    const key = attachmentStorageKey(project, sessionId);
+    if (draftAttachments.value.length) {
+      localStorage.setItem(key, JSON.stringify(draftAttachments.value));
+    } else {
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // Storage failures must not block composing or navigation.
+  }
+}
+
+function loadAttachmentDraft(project, sessionId) {
+  replacingAttachmentDraft = true;
+  attachmentDraftIdentity = sessionId ? { project, sessionId } : null;
+  try {
+    draftAttachments.value = sessionId
+      ? JSON.parse(localStorage.getItem(attachmentStorageKey(project, sessionId)) || "[]")
+      : [];
+  } catch {
+    draftAttachments.value = [];
+  }
+  replacingAttachmentDraft = false;
+}
+
+async function activateComposerDraft(project, sessionId, options) {
+  await composerDrafts.activate(project, sessionId, options);
+  loadAttachmentDraft(project, sessionId);
+}
+
+async function beginComposerNavigation() {
+  persistAttachmentDraft();
+  const attachmentSource = {
+    identity: attachmentDraftIdentity ? { ...attachmentDraftIdentity } : null,
+    bindings: draftAttachments.value.map((binding) => ({ ...binding }))
+  };
+  attachmentDraftIdentity = null;
+  replacingAttachmentDraft = true;
+  draftAttachments.value = [];
+  replacingAttachmentDraft = false;
+  return { text: await composerDrafts.beginNavigation(), attachmentSource };
+}
+
+async function rollbackComposerNavigation(source) {
+  await composerDrafts.rollbackNavigation(source.text);
+  replacingAttachmentDraft = true;
+  attachmentDraftIdentity = source.attachmentSource.identity;
+  draftAttachments.value = source.attachmentSource.bindings;
+  replacingAttachmentDraft = false;
+}
+
+function forgetComposerDraft(project, sessionId) {
+  composerDrafts.forget(project, sessionId);
+  try {
+    localStorage.removeItem(attachmentStorageKey(project, sessionId));
+  } catch {
+    // Deletion continues when browser storage is unavailable.
+  }
+}
+
+watch(
+  draft,
+  (value, previous) => {
+    if (!replacingAttachmentDraft) {
+      draftAttachments.value = reconcileAttachmentBindings(
+        previous ?? "",
+        value,
+        draftAttachments.value
+      );
+    }
+    composerDrafts.persist(value);
+    persistAttachmentDraft();
+  },
+  { flush: "sync" }
+);
+watch(draftAttachments, persistAttachmentDraft, { deep: true, flush: "sync" });
+watch(messageEditDraft, (value, previous) => {
+  messageEditAttachments.value = reconcileAttachmentBindings(
+    previous ?? "",
+    value,
+    messageEditAttachments.value
+  );
+});
 
 const session = computed(() => state.value?.session ?? null);
 function runtimeFor(id) {
@@ -550,7 +654,7 @@ async function loadState({ resumeGoal = false } = {}) {
     if (!requestedSession) {
       updateSessionUrl(nextState.session?.id, "replace");
     }
-    await composerDrafts.activate(nextState.project, nextState.session?.id);
+    await activateComposerDraft(nextState.project, nextState.session?.id);
     if (
       resumeGoal &&
       !runtimeFor(nextState.session?.id).sending &&
@@ -592,7 +696,7 @@ async function runAction(
 
 async function newSession(project) {
   closeAutocomplete();
-  const source = await composerDrafts.beginNavigation();
+  const source = await beginComposerNavigation();
   const nextState = await runAction(
     () =>
       api("/api/sessions", {
@@ -606,17 +710,17 @@ async function newSession(project) {
     }
   );
   if (nextState) {
-    await composerDrafts.activate(nextState.project, nextState.session?.id, {
+    await activateComposerDraft(nextState.project, nextState.session?.id, {
       focusComposer: true
     });
   } else {
-    await composerDrafts.rollbackNavigation(source);
+    await rollbackComposerNavigation(source);
   }
 }
 
 async function resumeSession(project, id) {
   closeAutocomplete();
-  const source = await composerDrafts.beginNavigation();
+  const source = await beginComposerNavigation();
   const nextState = await runAction(
     () =>
       api("/api/sessions/resume", {
@@ -630,10 +734,10 @@ async function resumeSession(project, id) {
     }
   );
   if (!nextState) {
-    await composerDrafts.rollbackNavigation(source);
+    await rollbackComposerNavigation(source);
     return;
   }
-  await composerDrafts.activate(nextState.project, nextState.session?.id);
+  await activateComposerDraft(nextState.project, nextState.session?.id);
   if (
     !runtimeFor(nextState.session?.id).sending &&
     nextState.session?.goals?.some((goal) => goal.status === "active")
@@ -649,7 +753,7 @@ async function deleteSession(project, id) {
     project === state.value?.project && id === session.value?.id;
   if (deletingActive) closeAutocomplete();
   const source = deletingActive
-    ? await composerDrafts.beginNavigation()
+    ? await beginComposerNavigation()
     : null;
   error.value = "";
   try {
@@ -660,17 +764,17 @@ async function deleteSession(project, id) {
     sessionStates.delete(id);
     sessionRuntimes.delete(id);
     liveObservationRevisions.delete(id);
-    composerDrafts.forget(project, id);
+    forgetComposerDraft(project, id);
     virtualTimelineStore.delete(id);
     applyServerState(nextState, {
       selectActiveProject: deletingActive
     });
     if (deletingActive) {
       updateSessionUrl(nextState.session?.id, "replace");
-      await composerDrafts.activate(nextState.project, nextState.session?.id);
+      await activateComposerDraft(nextState.project, nextState.session?.id);
     }
   } catch (cause) {
-    if (source) await composerDrafts.rollbackNavigation(source);
+    if (source) await rollbackComposerNavigation(source);
     error.value = cause.message;
   }
 }
@@ -924,7 +1028,7 @@ async function createDirectory() {
 
 async function openProject(path = directoryListing.value?.path) {
   if (!path) return;
-  const source = await composerDrafts.beginNavigation();
+  const source = await beginComposerNavigation();
   const nextState = await runAction(
     () =>
       api("/api/projects/open", {
@@ -934,11 +1038,11 @@ async function openProject(path = directoryListing.value?.path) {
     { selectActiveProject: true, historyMode: "replace" }
   );
   if (!nextState) {
-    await composerDrafts.rollbackNavigation(source);
+    await rollbackComposerNavigation(source);
     return;
   }
   projectPickerOpen.value = false;
-  await composerDrafts.activate(nextState.project, nextState.session?.id);
+  await activateComposerDraft(nextState.project, nextState.session?.id);
 }
 
 function sessionIdFromLocation() {
@@ -957,7 +1061,7 @@ async function handleHistoryNavigation() {
   const id = sessionIdFromLocation();
   if (!id || id === session.value?.id) return;
   closeAutocomplete();
-  const source = await composerDrafts.beginNavigation();
+  const source = await beginComposerNavigation();
   error.value = "";
   try {
     const nextState = await api("/api/sessions/resume", {
@@ -965,13 +1069,13 @@ async function handleHistoryNavigation() {
       body: JSON.stringify({ id })
     });
     applyServerState(nextState, { selectActiveProject: true });
-    await composerDrafts.activate(nextState.project, nextState.session?.id);
+    await activateComposerDraft(nextState.project, nextState.session?.id);
     await scrollToBottom();
     if (!sending.value && activeGoal.value) {
       void runPrompt("", { continuation: true });
     }
   } catch (cause) {
-    await composerDrafts.rollbackNavigation(source);
+    await rollbackComposerNavigation(source);
     updateSessionUrl(source.identity?.sessionId, "replace");
     error.value = cause.message;
   }
@@ -1168,6 +1272,7 @@ async function beginMessageEdit(item) {
   }
   editingMessageNode.value = item.nodeId;
   messageEditDraft.value = item.message.content ?? "";
+  messageEditAttachments.value = bindingsFromMessage(item.message);
   closeAutocomplete();
   error.value = "";
   await nextTick();
@@ -1181,6 +1286,7 @@ async function beginMessageEdit(item) {
 function cancelMessageEdit() {
   editingMessageNode.value = null;
   messageEditDraft.value = "";
+  messageEditAttachments.value = [];
 }
 
 async function recallLatestUserMessage() {
@@ -1201,6 +1307,10 @@ async function recallLatestUserMessage() {
   if (!recalled) return false;
   recalledMessageNode.value = recalled.nodeId;
   draft.value = recalled.content;
+  const recalledIndex = session.value.active_message_ids.indexOf(recalled.nodeId);
+  draftAttachments.value = bindingsFromMessage(
+    session.value.messages[recalledIndex]
+  );
   closeAutocomplete();
   error.value = "";
   await nextTick();
@@ -1235,7 +1345,10 @@ function projectEditedMessage(nodeId, content) {
 
 async function saveMessageEdit() {
   const nodeId = editingMessageNode.value;
-  const prompt = messageEditDraft.value.trim();
+  const { prompt, attachments } = trimAttachmentDraft(
+    messageEditDraft.value,
+    messageEditAttachments.value
+  );
   if (!nodeId || !prompt || sending.value) return;
   if (!projectEditedMessage(nodeId, prompt)) {
     error.value = "The message is no longer on the visible branch.";
@@ -1243,7 +1356,10 @@ async function saveMessageEdit() {
   }
   const keepBranchesOpen = branchesOpen.value;
   cancelMessageEdit();
-  await runPrompt(prompt, { editNodeId: nodeId });
+  await runPrompt(prompt, {
+    editNodeId: nodeId,
+    attachmentBindings: attachments
+  });
   if (keepBranchesOpen && branchesOpen.value) {
     await nextTick();
     rebaseBranchNavigator();
@@ -1832,7 +1948,8 @@ async function streamChat(
   {
     continuation = false,
     sessionId = session.value?.id,
-    editNodeId = null
+    editNodeId = null,
+    attachments = []
   } = {}
 ) {
   if (!sessionId) throw new Error("Create or resume a session first");
@@ -1843,7 +1960,8 @@ async function streamChat(
       session_id: sessionId,
       prompt,
       continuation,
-      edit_node_id: editNodeId
+      edit_node_id: editNodeId,
+      attachments
     })
   });
   if (!response.ok) {
@@ -1901,7 +2019,10 @@ async function sendPrompt() {
     return;
   }
   if (transcribing.value) return;
-  const prompt = draft.value.trim();
+  const { prompt, attachments } = trimAttachmentDraft(
+    draft.value,
+    draftAttachments.value
+  );
   const runtime = selectedRuntime.value;
   if (!prompt) {
     if (runtime.queuedPromptEdit) {
@@ -1910,7 +2031,7 @@ async function sendPrompt() {
     return;
   }
   if (runtime.queuedPromptEdit) {
-    await finishQueuedPromptEdit(prompt);
+    await finishQueuedPromptEdit(prompt, attachments);
     return;
   }
   if (recalledMessageNode.value) {
@@ -1920,10 +2041,18 @@ async function sendPrompt() {
       return;
     }
     const sent = composerDrafts.snapshot();
+    const sentAttachments = draftAttachments.value.map((binding) => ({ ...binding }));
     recalledMessageNode.value = null;
     await clearComposer({ keepStored: true });
-    const completed = await runPrompt(prompt, { editNodeId: nodeId });
+    const completed = await runPrompt(prompt, {
+      editNodeId: nodeId,
+      attachmentBindings: attachments
+    });
     await composerDrafts.finishSend(sent, completed);
+    finishAttachmentSend(sent, completed);
+    if (!completed && !draftAttachments.value.length) {
+      draftAttachments.value = sentAttachments;
+    }
     if (
       !completed &&
       session.value?.active_message_ids?.includes(nodeId)
@@ -1955,15 +2084,25 @@ async function sendPrompt() {
     return;
   }
   if (sending.value) {
-    enqueuePrompt(runtime.promptQueue, prompt);
+    enqueuePrompt(
+      runtime.promptQueue,
+      prompt,
+      attachments,
+      draftAttachments.value.map((binding) => ({ ...binding }))
+    );
     await clearComposer();
     closeAutocomplete();
     return;
   }
   const sent = composerDrafts.snapshot();
+  const sentAttachments = draftAttachments.value.map((binding) => ({ ...binding }));
   await clearComposer({ keepStored: true });
-  const completed = await runPrompt(prompt);
+  const completed = await runPrompt(prompt, { attachmentBindings: attachments });
   await composerDrafts.finishSend(sent, completed);
+  finishAttachmentSend(sent, completed);
+  if (!completed && !draftAttachments.value.length) {
+    draftAttachments.value = sentAttachments;
+  }
 }
 
 function activeGoalFor(sessionId) {
@@ -1979,7 +2118,8 @@ async function runPrompt(
   {
     continuation = false,
     sessionId = session.value?.id,
-    editNodeId = null
+    editNodeId = null,
+    attachmentBindings = []
   } = {}
 ) {
   if (!sessionId) return;
@@ -1995,7 +2135,12 @@ async function runPrompt(
 
   let completed = false;
   try {
-    await streamChat(prompt, { continuation, sessionId, editNodeId });
+    await streamChat(prompt, {
+      continuation,
+      sessionId,
+      editNodeId,
+      attachments: attachmentBindings
+    });
     completed = true;
     runtime.error = "";
   } catch (cause) {
@@ -2035,7 +2180,10 @@ async function runPrompt(
       completed && Boolean(activeGoalFor(sessionId));
     const nextPrompt = takeNextQueuedPrompt(runtime.promptQueue);
     if (nextPrompt) {
-      void runPrompt(nextPrompt.content, { sessionId });
+      void runPrompt(nextPrompt.content, {
+        sessionId,
+        attachmentBindings: nextPrompt.attachments ?? []
+      });
     } else if (
       runtime.promptQueue.items.length === 0 &&
       runtime.resumeGoalAfterQueue
@@ -2083,10 +2231,14 @@ async function beginQueuedPromptEdit(item) {
   }
   runtime.queuedPromptEdit = {
     id: item.id,
-    previousDraft: draft.value
+    previousDraft: draft.value,
+    previousAttachments: draftAttachments.value.map((binding) => ({ ...binding }))
   };
   runtime.promptQueue.editingId = item.id;
   draft.value = item.content;
+  draftAttachments.value = (item.composerAttachments ?? []).map((binding) => ({
+    ...binding
+  }));
   closeAutocomplete();
   error.value = "";
   await nextTick();
@@ -2099,6 +2251,7 @@ async function restoreDraftAfterQueuedPromptEdit(runtime, edit) {
   runtime.queuedPromptEdit = null;
   runtime.promptQueue.editingId = null;
   draft.value = edit.previousDraft;
+  draftAttachments.value = edit.previousAttachments;
   closeAutocomplete();
   await nextTick();
   resizeComposer();
@@ -2110,7 +2263,10 @@ function dispatchQueuedPromptIfIdle(sessionId) {
   if (runtime.sending || runtime.pendingGoalAction) return false;
   const nextPrompt = takeNextQueuedPrompt(runtime.promptQueue);
   if (nextPrompt) {
-    void runPrompt(nextPrompt.content, { sessionId });
+    void runPrompt(nextPrompt.content, {
+      sessionId,
+      attachmentBindings: nextPrompt.attachments ?? []
+    });
     return true;
   }
   if (
@@ -2125,11 +2281,19 @@ function dispatchQueuedPromptIfIdle(sessionId) {
   return false;
 }
 
-async function finishQueuedPromptEdit(content) {
+async function finishQueuedPromptEdit(content, attachments) {
   const runtime = selectedRuntime.value;
   const edit = runtime.queuedPromptEdit;
   if (!edit) return;
-  if (!updateQueuedPrompt(runtime.promptQueue, edit.id, content)) {
+  if (
+    !updateQueuedPrompt(
+      runtime.promptQueue,
+      edit.id,
+      content,
+      attachments,
+      draftAttachments.value.map((binding) => ({ ...binding }))
+    )
+  ) {
     error.value = "The queued message no longer exists.";
   } else {
     error.value = "";
@@ -2450,7 +2614,148 @@ function resizeComposer() {
 }
 
 async function clearComposer(options) {
+  replacingAttachmentDraft = true;
   await composerDrafts.clear(options);
+  draftAttachments.value = [];
+  replacingAttachmentDraft = false;
+  if (!options?.keepStored && attachmentDraftIdentity) {
+    try {
+      localStorage.removeItem(
+        attachmentStorageKey(
+          attachmentDraftIdentity.project,
+          attachmentDraftIdentity.sessionId
+        )
+      );
+    } catch {
+      // Clearing the composer remains available without browser storage.
+    }
+  }
+}
+
+function finishAttachmentSend(sent, completed) {
+  if (!completed || !sent.identity) return;
+  try {
+    localStorage.removeItem(
+      attachmentStorageKey(sent.identity.project, sent.identity.sessionId)
+    );
+  } catch {
+    // Sending succeeds independently of browser storage cleanup.
+  }
+}
+
+async function sha256Hex(file) {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function acquireBrowserAttachment(file, target) {
+  if (file.size > 25 * 1024 * 1024) {
+    throw new Error("Attachment exceeds the 25 MiB limit");
+  }
+  const sha256 = await sha256Hex(file);
+  const preflight = await fetch("/api/attachments/preflight", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      project: target.project,
+      session_id: target.sessionId,
+      sha256
+    })
+  });
+  if (preflight.ok) return preflight.json();
+  if (preflight.status !== 404) {
+    const body = await preflight.json().catch(() => ({}));
+    throw new Error(body.error || `Attachment preflight failed with ${preflight.status}`);
+  }
+  const query = new URLSearchParams({
+    project: target.project,
+    session_id: target.sessionId,
+    sha256,
+    name: file.name || "pasted-image",
+    mime_type: file.type || "application/octet-stream"
+  });
+  const upload = await fetch(`/api/attachments/upload?${query}`, {
+    method: "POST",
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+    body: file
+  });
+  const body = await upload.json().catch(() => ({}));
+  if (!upload.ok) {
+    throw new Error(body.error || `Attachment upload failed with ${upload.status}`);
+  }
+  return body;
+}
+
+async function insertBrowserFiles(files) {
+  const target = {
+    project: state.value?.project,
+    sessionId: session.value?.id
+  };
+  if (!target.project || !target.sessionId || !files.length) return;
+  uploadingAttachments.value = true;
+  error.value = "";
+  try {
+    for (const file of files) {
+      const attachment = await acquireBrowserAttachment(file, target);
+      if (
+        state.value?.project !== target.project ||
+        session.value?.id !== target.sessionId
+      ) {
+        continue;
+      }
+      const element = composer.value;
+      const start = element?.selectionStart ?? draft.value.length;
+      const end = element?.selectionEnd ?? start;
+      const previousDraft = draft.value;
+      const inserted = insertAttachmentReference(
+        previousDraft,
+        start,
+        end,
+        attachment
+      );
+      replacingAttachmentDraft = true;
+      draft.value = inserted.text;
+      draftAttachments.value = [
+        ...reconcileAttachmentBindings(
+          previousDraft,
+          inserted.text,
+          draftAttachments.value
+        ),
+        inserted.binding
+      ].sort((left, right) => left.start - right.start);
+      replacingAttachmentDraft = false;
+      await nextTick();
+      resizeComposer();
+      composer.value?.focus();
+      composer.value?.setSelectionRange(inserted.cursor, inserted.cursor);
+      persistAttachmentDraft();
+    }
+  } catch (cause) {
+    error.value = `Could not attach file: ${cause.message}`;
+  } finally {
+    uploadingAttachments.value = false;
+    if (attachmentInput.value) attachmentInput.value.value = "";
+  }
+}
+
+function selectAttachments(event) {
+  void insertBrowserFiles([...event.target.files]);
+}
+
+function pasteAttachments(event) {
+  const files = [...(event.clipboardData?.files ?? [])];
+  if (!files.length) return;
+  event.preventDefault();
+  void insertBrowserFiles(files);
+}
+
+function dropAttachments(event) {
+  const files = [...(event.dataTransfer?.files ?? [])];
+  if (!files.length) return;
+  event.preventDefault();
+  void insertBrowserFiles(files);
 }
 
 function timelineDescriptor(item) {
@@ -4010,6 +4315,9 @@ onBeforeUnmount(() => {
                 :aria-expanded="Boolean(autocomplete?.items?.length)"
                 aria-autocomplete="list"
                 @input="handleComposerInput"
+                @paste="pasteAttachments"
+                @dragover.prevent
+                @drop.prevent="dropAttachments"
                 @select="refreshAutocomplete($event.target)"
                 @blur="handleComposerBlur"
                 @keydown="handleComposerKey"
@@ -4022,6 +4330,31 @@ onBeforeUnmount(() => {
                   aria-hidden="true"
                 />
                 <div class="ml-auto flex items-center gap-1">
+                  <input
+                    ref="attachmentInput"
+                    type="file"
+                    class="hidden"
+                    multiple
+                    @change="selectAttachments"
+                  />
+                  <button
+                    class="grid size-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200 disabled:text-zinc-700"
+                    :disabled="
+                      branchesOpen ||
+                      Boolean(editingMessageNode) ||
+                      uploadingAttachments
+                    "
+                    title="Attach files"
+                    aria-label="Attach files"
+                    @click="attachmentInput?.click()"
+                  >
+                    <LoaderCircle
+                      v-if="uploadingAttachments"
+                      class="size-3.5 animate-spin"
+                      aria-hidden="true"
+                    />
+                    <Paperclip v-else class="size-3.5" aria-hidden="true" />
+                  </button>
                   <button
                     v-if="recording"
                     class="grid size-7 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"

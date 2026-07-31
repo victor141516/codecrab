@@ -18,9 +18,10 @@ use uuid::Uuid;
 
 use crate::{
     agent::{Agent, turn_was_cancelled},
+    attachments::Attachment,
     config::SessionRegistry,
     events::{ActivityStatus, AgentActivity, AgentEvent},
-    provider::{Message, ModelCatalogEntry, ModelSelection, Role},
+    provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection, Role},
     session::{GoalStatus, Session, SessionStore, TurnOutcome},
 };
 
@@ -233,12 +234,17 @@ pub(crate) struct ConversationHandle {
 enum ConversationCommand {
     Turn {
         prompt: String,
+        attachments: Vec<AttachmentBinding>,
         hidden: bool,
         edit_node_id: Option<Uuid>,
         initialize_catalog: bool,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         cancellation: watch::Receiver<bool>,
         reply: oneshot::Sender<ConversationTurn>,
+    },
+    AddAttachment {
+        attachment: Attachment,
+        reply: oneshot::Sender<Result<(ConversationSnapshot, Attachment)>>,
     },
     SetModel {
         selection: ModelSelection,
@@ -414,35 +420,46 @@ impl ConversationHandle {
         prompt: String,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(prompt, false, None, false, events)
+        self.start_turn_with_attachments(prompt, Vec::new(), events)
+    }
+
+    pub(crate) fn start_turn_with_attachments(
+        &self,
+        prompt: String,
+        attachments: Vec<AttachmentBinding>,
+        events: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<JoinHandle<Result<ConversationTurn>>> {
+        self.start_turn_kind(prompt, attachments, false, None, false, events)
     }
 
     pub(crate) fn start_new_session_turn(
         &self,
         prompt: String,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(prompt, false, None, true, None)
+        self.start_turn_kind(prompt, Vec::new(), false, None, true, None)
     }
 
-    pub(crate) fn start_edit_turn(
+    pub(crate) fn start_edit_turn_with_attachments(
         &self,
         node_id: Uuid,
         prompt: String,
+        attachments: Vec<AttachmentBinding>,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(prompt, false, Some(node_id), false, events)
+        self.start_turn_kind(prompt, attachments, false, Some(node_id), false, events)
     }
 
     pub(crate) fn start_goal_continuation(
         &self,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<JoinHandle<Result<ConversationTurn>>> {
-        self.start_turn_kind(String::new(), true, None, false, events)
+        self.start_turn_kind(String::new(), Vec::new(), true, None, false, events)
     }
 
     fn start_turn_kind(
         &self,
         prompt: String,
+        attachments: Vec<AttachmentBinding>,
         hidden: bool,
         edit_node_id: Option<Uuid>,
         initialize_catalog: bool,
@@ -482,6 +499,7 @@ impl ConversationHandle {
         let (reply, response) = oneshot::channel();
         if let Err(error) = self.send_unchecked(ConversationCommand::Turn {
             prompt,
+            attachments,
             hidden,
             edit_node_id,
             initialize_catalog,
@@ -535,6 +553,15 @@ impl ConversationHandle {
         let (reply, response) = oneshot::channel();
         self.send(ConversationCommand::Clear { reply })?;
         receive(response, "clearing the conversation").await?
+    }
+
+    pub(crate) async fn add_attachment(
+        &self,
+        attachment: Attachment,
+    ) -> Result<(ConversationSnapshot, Attachment)> {
+        let (reply, response) = oneshot::channel();
+        self.send(ConversationCommand::AddAttachment { attachment, reply })?;
+        receive(response, "adding a session attachment").await?
     }
 
     pub(crate) async fn select_branch(&self, node_id: Uuid) -> Result<ConversationSnapshot> {
@@ -713,6 +740,7 @@ async fn run_worker(
         let stop = match command {
             ConversationCommand::Turn {
                 prompt,
+                attachments,
                 hidden,
                 edit_node_id,
                 initialize_catalog,
@@ -771,7 +799,13 @@ async fn run_worker(
                 }
                 let result = if let Some(node_id) = edit_node_id {
                     agent
-                        .edit_turn_controlled(node_id, &prompt, Some(internal_events), cancellation)
+                        .edit_turn_with_attachments_controlled(
+                            node_id,
+                            &prompt,
+                            &attachments,
+                            Some(internal_events),
+                            cancellation,
+                        )
                         .await
                 } else if hidden {
                     agent
@@ -779,7 +813,12 @@ async fn run_worker(
                         .await
                 } else {
                     agent
-                        .turn_controlled(&prompt, Some(internal_events), cancellation)
+                        .turn_with_attachments_controlled(
+                            &prompt,
+                            &attachments,
+                            Some(internal_events),
+                            cancellation,
+                        )
                         .await
                 };
                 let _ = observer.await;
@@ -826,6 +865,14 @@ async fn run_worker(
                     result,
                     snapshot: current,
                 });
+                false
+            }
+            ConversationCommand::AddAttachment { attachment, reply } => {
+                let attachment = agent.add_attachment(attachment);
+                let current = snapshot(&agent);
+                let _ = snapshots.send(current.clone());
+                let result = persist(&agent, &registry).map(|()| (current, attachment));
+                let _ = reply.send(result);
                 false
             }
             ConversationCommand::SetModel { selection, reply } => {
@@ -992,6 +1039,7 @@ fn apply_agent_event(
                     sequence: Some(*sequence),
                     created_at: Some(*created_at),
                     content: Some(delta.clone()),
+                    parts: Vec::new(),
                     tool_calls: None,
                     tool_call_id: None,
                     hidden: false,
@@ -1471,11 +1519,12 @@ fn test_runtime() -> &'static tokio::runtime::Runtime {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
     use super::*;
     use crate::{
-        config::Config, provider::OpenAiCompatible, skills::SkillRegistry, tools::ToolBox,
+        attachments::AttachmentStore, config::Config, provider::OpenAiCompatible,
+        skills::SkillRegistry, tools::ToolBox,
     };
 
     fn test_agent(root: &Path) -> Agent {
@@ -1587,6 +1636,28 @@ mod tests {
             .load(Some(&original.to_string()))
             .unwrap();
         assert_eq!(saved.goals[0].objective, "Ship it");
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_attachment_additions_deduplicate_in_the_session_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let handle = test_handle(root.path());
+        let session_id = handle.snapshot().session.id;
+        let source = root.path().join("same.txt");
+        fs::write(&source, b"same bytes").unwrap();
+        let store = AttachmentStore::new(root.path());
+        let first = store.import_path(session_id, &[], &source).unwrap();
+        let second = store.import_path(session_id, &[], &source).unwrap();
+        assert_ne!(first.id, second.id);
+
+        let (first_result, second_result) =
+            tokio::join!(handle.add_attachment(first), handle.add_attachment(second));
+        let (_, first) = first_result.unwrap();
+        let (_, second) = second_result.unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(handle.snapshot().session.attachments.len(), 1);
         handle.shutdown().await.unwrap();
     }
 

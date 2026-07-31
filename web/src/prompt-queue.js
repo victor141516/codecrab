@@ -7,17 +7,30 @@ export function createPromptQueue() {
   };
 }
 
-export function enqueuePrompt(queue, content) {
-  const item = { id: queue.nextId, content };
+export function enqueuePrompt(
+  queue,
+  content,
+  attachments = [],
+  composerAttachments = []
+) {
+  const item = { id: queue.nextId, content, attachments, composerAttachments };
   queue.nextId += 1;
   queue.items.push(item);
   return item.id;
 }
 
-export function updateQueuedPrompt(queue, id, content) {
+export function updateQueuedPrompt(
+  queue,
+  id,
+  content,
+  attachments = [],
+  composerAttachments = []
+) {
   const item = queue.items.find((candidate) => candidate.id === id);
   if (!item) return false;
   item.content = content;
+  item.attachments = attachments;
+  item.composerAttachments = composerAttachments;
   return true;
 }
 

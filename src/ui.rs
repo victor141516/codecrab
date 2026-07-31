@@ -35,6 +35,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     agent::{Agent, turn_was_cancelled},
+    attachments::AttachmentStore,
     audio::AudioRecording,
     completion::{
         CompletionKind, CompletionMenu, CompletionSearch, builtin_command_from_input,
@@ -51,7 +52,7 @@ use crate::{
     coordination::SessionCoordinator,
     diagnostics::{DebugOutput, DiagnosticLog},
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
-    provider::{Message, ModelCatalogEntry, ModelSelection, Role},
+    provider::{AttachmentBinding, Message, MessagePart, ModelCatalogEntry, ModelSelection, Role},
     session::{
         AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionProject, SessionStore,
         list_session_projects,
@@ -236,6 +237,7 @@ struct MessageEdit {
     node_id: Uuid,
     previous_input: String,
     previous_cursor: usize,
+    previous_attachments: Vec<AttachmentBinding>,
 }
 
 impl ConversationView {
@@ -695,6 +697,7 @@ impl SessionPicker {
 struct QueuedPrompt {
     id: u64,
     content: String,
+    attachments: Vec<AttachmentBinding>,
 }
 
 struct PromptQueue {
@@ -714,18 +717,23 @@ impl Default for PromptQueue {
 }
 
 impl PromptQueue {
-    fn push(&mut self, content: String) -> u64 {
+    fn push(&mut self, content: String, attachments: Vec<AttachmentBinding>) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        self.items.push_back(QueuedPrompt { id, content });
+        self.items.push_back(QueuedPrompt {
+            id,
+            content,
+            attachments,
+        });
         id
     }
 
-    fn update(&mut self, id: u64, content: String) -> bool {
+    fn update(&mut self, id: u64, content: String, attachments: Vec<AttachmentBinding>) -> bool {
         let Some(prompt) = self.items.iter_mut().find(|prompt| prompt.id == id) else {
             return false;
         };
         prompt.content = content;
+        prompt.attachments = attachments;
         true
     }
 
@@ -765,6 +773,7 @@ struct QueuedPromptEdit {
     id: u64,
     previous_input: String,
     previous_cursor: usize,
+    previous_attachments: Vec<AttachmentBinding>,
 }
 
 #[derive(Clone, Copy)]
@@ -802,10 +811,12 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     markdown: Arc<MarkdownHighlighter>,
     input: String,
+    composer_attachments: Vec<AttachmentBinding>,
     cursor: usize,
     preferred_column: Option<usize>,
     composer_width: usize,
     pending_user: Option<String>,
+    pending_user_attachments: Vec<AttachmentBinding>,
     prompt_queue: PromptQueue,
     queued_prompt_edit: Option<QueuedPromptEdit>,
     resume_goal_after_queue: bool,
@@ -857,6 +868,7 @@ struct BackgroundTurn {
     running: Option<JoinHandle<Result<ConversationTurn>>>,
     event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     pending_user: Option<String>,
+    pending_user_attachments: Vec<AttachmentBinding>,
     prompt_queue: PromptQueue,
     queued_prompt_edit: Option<QueuedPromptEdit>,
     resume_goal_after_queue: bool,
@@ -922,10 +934,12 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             markdown: shared_markdown_highlighter(),
             input: String::new(),
+            composer_attachments: Vec::new(),
             cursor: 0,
             preferred_column: None,
             composer_width: 80,
             pending_user: None,
+            pending_user_attachments: Vec::new(),
             prompt_queue: PromptQueue::default(),
             queued_prompt_edit: None,
             resume_goal_after_queue: false,
@@ -1006,10 +1020,58 @@ impl App {
     }
 
     fn insert(&mut self, text: &str) {
-        self.input.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        let cursor = self.cursor;
+        self.replace_composer_range(cursor, cursor, text);
+        self.cursor = cursor + text.len();
         self.preferred_column = None;
         self.refresh_completion();
+    }
+
+    fn replace_composer_range(&mut self, start: usize, end: usize, replacement: &str) {
+        self.input.replace_range(start..end, replacement);
+        let removed = end - start;
+        let added = replacement.len();
+        self.composer_attachments.retain_mut(|binding| {
+            if binding.end <= start {
+                true
+            } else if binding.start >= end {
+                if added >= removed {
+                    let delta = added - removed;
+                    binding.start += delta;
+                    binding.end += delta;
+                } else {
+                    let delta = removed - added;
+                    binding.start -= delta;
+                    binding.end -= delta;
+                }
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn clear_composer_text(&mut self) {
+        self.input.clear();
+        self.composer_attachments.clear();
+        self.cursor = 0;
+    }
+
+    fn trimmed_composer(&self) -> (String, Vec<AttachmentBinding>) {
+        let trimmed_start = self.input.len() - self.input.trim_start().len();
+        let trimmed_end = self.input.trim_end().len();
+        let prompt = self.input[trimmed_start..trimmed_end].to_owned();
+        let attachments = self
+            .composer_attachments
+            .iter()
+            .filter(|binding| binding.start >= trimmed_start && binding.end <= trimmed_end)
+            .map(|binding| AttachmentBinding {
+                attachment_id: binding.attachment_id,
+                start: binding.start - trimmed_start,
+                end: binding.end - trimmed_start,
+            })
+            .collect();
+        (prompt, attachments)
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
@@ -1031,11 +1093,97 @@ impl App {
         true
     }
 
+    fn insert_clipboard_item(&mut self, value: &str, attachment_id: Option<Uuid>) {
+        let leading_space = self.cursor > 0
+            && !self.input[..self.cursor]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        let trailing_space = self.cursor < self.input.len()
+            && !self.input[self.cursor..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
+        if leading_space {
+            self.insert(" ");
+        }
+        let start = self.cursor;
+        self.insert(value);
+        let end = self.cursor;
+        if let Some(attachment_id) = attachment_id {
+            self.composer_attachments.push(AttachmentBinding {
+                attachment_id,
+                start,
+                end,
+            });
+        }
+        if trailing_space || self.cursor == self.input.len() {
+            self.insert(" ");
+        }
+        self.close_completion();
+    }
+
+    async fn import_clipboard_image_path(&mut self, path: &Path) -> Result<()> {
+        let snapshot = self.conversation.snapshot();
+        let store = AttachmentStore::new(&self.project_root);
+        let attachment = store.import_path(self.session_id, &snapshot.session.attachments, path)?;
+        let (_, attachment) = self.conversation.add_attachment(attachment).await?;
+        let reference = store.visible_reference(&attachment);
+        self.insert_clipboard_item(&reference, Some(attachment.id));
+        Ok(())
+    }
+
+    async fn paste_operating_system_clipboard(&mut self) -> Result<bool> {
+        let files = self
+            .clipboard
+            .as_mut()
+            .and_then(|clipboard| clipboard.get().file_list().ok())
+            .unwrap_or_default();
+        if !files.is_empty() {
+            for path in files {
+                let is_image = AttachmentStore::path_is_supported_image(&path);
+                if is_image {
+                    self.import_clipboard_image_path(&path).await?;
+                } else {
+                    let reference = format!("@{}", path.to_string_lossy());
+                    self.insert_clipboard_item(&reference, None);
+                }
+            }
+            return Ok(true);
+        }
+
+        let image = self
+            .clipboard
+            .as_mut()
+            .and_then(|clipboard| clipboard.get_image().ok());
+        if let Some(image) = image {
+            let width = u32::try_from(image.width).context("clipboard image is too wide")?;
+            let height = u32::try_from(image.height).context("clipboard image is too tall")?;
+            let snapshot = self.conversation.snapshot();
+            let store = AttachmentStore::new(&self.project_root);
+            let attachment = store.import_rgba(
+                self.session_id,
+                &snapshot.session.attachments,
+                width,
+                height,
+                image.bytes.as_ref(),
+            )?;
+            let (_, attachment) = self.conversation.add_attachment(attachment).await?;
+            let reference = store.visible_reference(&attachment);
+            self.insert_clipboard_item(&reference, Some(attachment.id));
+            return Ok(true);
+        }
+
+        let text = self
+            .clipboard
+            .as_mut()
+            .and_then(|clipboard| clipboard.get_text().ok());
+        Ok(text.as_deref().is_some_and(|text| self.handle_paste(text)))
+    }
+
     fn insert_char(&mut self, value: char) {
-        self.input.insert(self.cursor, value);
-        self.cursor += value.len_utf8();
-        self.preferred_column = None;
-        self.refresh_completion();
+        let mut text = [0; 4];
+        self.insert(value.encode_utf8(&mut text));
     }
 
     fn insert_transcript(&mut self, transcript: &str) -> bool {
@@ -1144,7 +1292,7 @@ impl App {
             .next_back()
             .map(|(index, _)| index)
             .unwrap_or(0);
-        self.input.drain(previous..self.cursor);
+        self.replace_composer_range(previous, self.cursor, "");
         self.cursor = previous;
         self.preferred_column = None;
         self.refresh_completion();
@@ -1159,7 +1307,7 @@ impl App {
             .nth(1)
             .map(|(index, _)| self.cursor + index)
             .unwrap_or(self.input.len());
-        self.input.drain(self.cursor..next);
+        self.replace_composer_range(self.cursor, next, "");
         self.preferred_column = None;
         self.refresh_completion();
     }
@@ -1192,12 +1340,12 @@ impl App {
             EditorAction::MoveWordRight => self.cursor = word_right_index(&self.input, self.cursor),
             EditorAction::DeleteWordLeft => {
                 let start = word_left_index(&self.input, self.cursor);
-                self.input.drain(start..self.cursor);
+                self.replace_composer_range(start, self.cursor, "");
                 self.cursor = start;
             }
             EditorAction::DeleteWordRight => {
                 let end = word_right_index(&self.input, self.cursor);
-                self.input.drain(self.cursor..end);
+                self.replace_composer_range(self.cursor, end, "");
             }
             EditorAction::MoveLineStart => {
                 self.cursor = hard_line_start(&self.input, self.cursor);
@@ -1207,12 +1355,12 @@ impl App {
             }
             EditorAction::DeleteToLineStart => {
                 let start = hard_line_start(&self.input, self.cursor);
-                self.input.drain(start..self.cursor);
+                self.replace_composer_range(start, self.cursor, "");
                 self.cursor = start;
             }
             EditorAction::DeleteToLineEnd => {
                 let end = hard_line_end(&self.input, self.cursor);
-                self.input.drain(self.cursor..end);
+                self.replace_composer_range(self.cursor, end, "");
             }
         }
         self.preferred_column = None;
@@ -1314,7 +1462,7 @@ impl App {
         menu.selected = (menu.selected as isize + delta).rem_euclid(len) as usize;
     }
 
-    fn accept_completion(&mut self) -> bool {
+    async fn accept_completion(&mut self) -> bool {
         let Some(menu) = self.completion.take() else {
             return false;
         };
@@ -1323,9 +1471,51 @@ impl App {
         let Some(item) = menu.items.get(menu.selected) else {
             return false;
         };
-        self.input
-            .replace_range(menu.token_start..menu.token_end, &item.replacement);
-        self.cursor = menu.token_start + item.replacement.len();
+        let mut replacement = item.replacement.clone();
+        let mut attachment_id = None;
+        if item.kind == CompletionKind::File {
+            let path = PathBuf::from(&item.name);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                self.project_root.join(path)
+            };
+            let is_image = AttachmentStore::path_is_supported_image(&path);
+            if is_image {
+                let snapshot = self.conversation.snapshot();
+                let store = AttachmentStore::new(&self.project_root);
+                let imported = match store.import_path(
+                    self.session_id,
+                    &snapshot.session.attachments,
+                    &path,
+                ) {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        self.error = Some(format!("Could not import image: {error:#}"));
+                        return false;
+                    }
+                };
+                match self.conversation.add_attachment(imported).await {
+                    Ok((_, attachment)) => {
+                        replacement = format!("{} ", store.visible_reference(&attachment));
+                        attachment_id = Some(attachment.id);
+                    }
+                    Err(error) => {
+                        self.error = Some(format!("Could not import image: {error:#}"));
+                        return false;
+                    }
+                }
+            }
+        }
+        self.replace_composer_range(menu.token_start, menu.token_end, &replacement);
+        self.cursor = menu.token_start + replacement.len();
+        if let Some(attachment_id) = attachment_id {
+            self.composer_attachments.push(AttachmentBinding {
+                attachment_id,
+                start: menu.token_start,
+                end: self.cursor.saturating_sub(1),
+            });
+        }
         if item.kind == CompletionKind::Directory {
             self.refresh_completion();
             return true;
@@ -1726,21 +1916,22 @@ impl App {
         };
         let node_id = navigator.nodes[navigator.selected].id;
         let snapshot = self.conversation.snapshot();
-        let Some(content) = snapshot
-            .session
-            .messages
-            .message(node_id)
-            .and_then(visible_message_content)
-            .map(str::to_owned)
-        else {
+        let Some(message) = snapshot.session.messages.message(node_id) else {
             self.error = Some("Only visible user messages can be edited.".into());
             return;
         };
+        let Some(content) = visible_message_content(message).map(str::to_owned) else {
+            self.error = Some("Only visible user messages can be edited.".into());
+            return;
+        };
+        let attachments = attachment_bindings_for_message(message);
         let previous_input = std::mem::take(&mut self.input);
         let previous_cursor = self.cursor;
+        let previous_attachments = std::mem::take(&mut self.composer_attachments);
         self.branch_navigator = None;
         self.pending_branch_node = None;
         self.input = content;
+        self.composer_attachments = attachments;
         self.cursor = self.input.len();
         self.preferred_column = None;
         self.close_completion();
@@ -1748,6 +1939,7 @@ impl App {
             node_id,
             previous_input,
             previous_cursor,
+            previous_attachments,
         });
         self.error = None;
     }
@@ -1757,6 +1949,7 @@ impl App {
             return;
         };
         self.input = edit.previous_input;
+        self.composer_attachments = edit.previous_attachments;
         self.cursor = edit.previous_cursor.min(self.input.len());
         self.preferred_column = None;
         self.close_completion();
@@ -1770,16 +1963,18 @@ impl App {
         if self.is_busy() || !self.input.is_empty() || self.editing_message.is_some() {
             return;
         }
-        let Some((message_index, content)) =
-            self.transcript
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(index, message)| {
-                    matches!(message.role, Role::User)
-                        .then(|| visible_message_content(message).map(|content| (index, content)))
-                        .flatten()
-                })
+        let Some((message_index, message, content)) = self
+            .transcript
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                matches!(message.role, Role::User)
+                    .then(|| {
+                        visible_message_content(message).map(|content| (index, message, content))
+                    })
+                    .flatten()
+            })
         else {
             return;
         };
@@ -1787,6 +1982,7 @@ impl App {
             return;
         };
         self.input = content.to_owned();
+        self.composer_attachments = attachment_bindings_for_message(message);
         self.cursor = self.input.len();
         self.preferred_column = None;
         self.close_completion();
@@ -1794,6 +1990,7 @@ impl App {
             node_id,
             previous_input: String::new(),
             previous_cursor: 0,
+            previous_attachments: Vec::new(),
         });
         self.error = None;
     }
@@ -1960,7 +2157,7 @@ impl App {
             self.apply_snapshot(snapshot);
         }
         if let Some(prompt) = start_prompt {
-            self.start_turn(prompt, false)?;
+            self.start_turn(prompt, Vec::new(), false)?;
             return Ok(true);
         }
         if continue_goal {
@@ -2107,6 +2304,8 @@ impl App {
         let queued_prompt_edit = self.queued_prompt_edit.take();
         if let Some(edit) = &queued_prompt_edit {
             self.input.clone_from(&edit.previous_input);
+            self.composer_attachments
+                .clone_from(&edit.previous_attachments);
             self.cursor = edit.previous_cursor.min(self.input.len());
             self.preferred_column = None;
             self.close_completion();
@@ -2121,6 +2320,7 @@ impl App {
                 running,
                 event_rx,
                 pending_user: self.pending_user.take(),
+                pending_user_attachments: std::mem::take(&mut self.pending_user_attachments),
                 prompt_queue: std::mem::take(&mut self.prompt_queue),
                 queued_prompt_edit,
                 resume_goal_after_queue: std::mem::take(&mut self.resume_goal_after_queue),
@@ -2137,6 +2337,7 @@ impl App {
         self.running = background.running;
         self.event_rx = background.event_rx;
         self.pending_user = background.pending_user;
+        self.pending_user_attachments = background.pending_user_attachments;
         self.prompt_queue = background.prompt_queue;
         self.queued_prompt_edit = background.queued_prompt_edit;
         self.resume_goal_after_queue = background.resume_goal_after_queue;
@@ -2148,6 +2349,7 @@ impl App {
                 .find(|prompt| prompt.id == edit.id)
         {
             self.input.clone_from(&prompt.content);
+            self.composer_attachments.clone_from(&prompt.attachments);
             self.cursor = self.input.len();
             self.preferred_column = None;
             self.close_completion();
@@ -2228,6 +2430,7 @@ impl App {
         self.apply_snapshot(self.conversation.snapshot());
         self.live_messages.clear();
         self.pending_user = None;
+        self.pending_user_attachments.clear();
         self.prompt_queue = PromptQueue::default();
         self.queued_prompt_edit = None;
         self.resume_goal_after_queue = false;
@@ -2420,12 +2623,12 @@ impl App {
             return;
         }
         self.cancel_queued_prompt_edit();
-        let Some(content) = self
+        let Some((content, attachments)) = self
             .prompt_queue
             .items
             .iter()
             .find(|prompt| prompt.id == id)
-            .map(|prompt| prompt.content.clone())
+            .map(|prompt| (prompt.content.clone(), prompt.attachments.clone()))
         else {
             return;
         };
@@ -2433,8 +2636,10 @@ impl App {
             id,
             previous_input: std::mem::take(&mut self.input),
             previous_cursor: self.cursor,
+            previous_attachments: std::mem::take(&mut self.composer_attachments),
         });
         self.input = content;
+        self.composer_attachments = attachments;
         self.cursor = self.input.len();
         self.preferred_column = None;
         self.close_completion();
@@ -2446,6 +2651,7 @@ impl App {
             return;
         };
         self.input = edit.previous_input;
+        self.composer_attachments = edit.previous_attachments;
         self.cursor = edit.previous_cursor.min(self.input.len());
         self.preferred_column = None;
         self.close_completion();
@@ -2456,12 +2662,14 @@ impl App {
         let Some(edit) = self.queued_prompt_edit.take() else {
             return;
         };
-        if !self.prompt_queue.update(edit.id, content) {
+        let attachments = std::mem::take(&mut self.composer_attachments);
+        if !self.prompt_queue.update(edit.id, content, attachments) {
             self.error = Some("The queued message no longer exists.".into());
         } else {
             self.error = None;
         }
         self.input = edit.previous_input;
+        self.composer_attachments = edit.previous_attachments;
         self.cursor = edit.previous_cursor.min(self.input.len());
         self.preferred_column = None;
         self.close_completion();
@@ -2679,7 +2887,8 @@ impl App {
         self.event_rx = None;
         self.last_escape = None;
         self.live_messages.clear();
-        self.pending_user = None;
+        let pending_user = self.pending_user.take();
+        let pending_attachments = std::mem::take(&mut self.pending_user_attachments);
         let turn_succeeded = match turn.result {
             Ok(_) => {
                 self.error = None;
@@ -2691,6 +2900,13 @@ impl App {
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}"));
+                if self.input.is_empty()
+                    && let Some(prompt) = pending_user
+                {
+                    self.input = prompt;
+                    self.composer_attachments = pending_attachments;
+                    self.cursor = self.input.len();
+                }
                 false
             }
         };
@@ -2698,7 +2914,7 @@ impl App {
             return Ok(());
         }
         if let Some(prompt) = self.prompt_queue.pop_next(editing_id) {
-            self.start_turn(prompt.content, false)?;
+            self.start_turn(prompt.content, prompt.attachments, false)?;
         } else if turn_succeeded
             && self.prompt_queue.items.is_empty()
             && self.active_goal_id().is_some()
@@ -2717,7 +2933,7 @@ impl App {
         }
         let editing_id = self.queued_prompt_edit.as_ref().map(|edit| edit.id);
         if let Some(prompt) = self.prompt_queue.pop_next(editing_id) {
-            self.start_turn(prompt.content, false)?;
+            self.start_turn(prompt.content, prompt.attachments, false)?;
             return Ok(true);
         }
         if self.prompt_queue.items.is_empty()
@@ -2735,7 +2951,7 @@ impl App {
         if self.recording.is_some() || self.transcription.is_some() {
             return Ok(());
         }
-        let prompt = self.input.trim().to_owned();
+        let (prompt, attachments) = self.trimmed_composer();
         if prompt.is_empty() {
             if self.queued_prompt_edit.is_some() {
                 self.error = Some("A queued message cannot be empty; delete it instead.".into());
@@ -2747,7 +2963,7 @@ impl App {
             return Ok(());
         }
         if let Some(edit) = self.editing_message.take() {
-            return self.start_message_edit_turn(edit.node_id, prompt);
+            return self.start_message_edit_turn(edit.node_id, prompt, attachments);
         }
         if let Some(id) = self.editing_goal_id.take() {
             if prompt.chars().count() > 4_000 {
@@ -2757,8 +2973,7 @@ impl App {
             }
             let resume = std::mem::take(&mut self.editing_goal_resume);
             if let Some(snapshot) = self.conversation.edit_goal(id, prompt, resume).await? {
-                self.input.clear();
-                self.cursor = 0;
+                self.clear_composer_text();
                 self.preferred_column = None;
                 self.close_completion();
                 self.apply_snapshot(snapshot);
@@ -2776,8 +2991,7 @@ impl App {
             return Ok(());
         }
         if let Some(objective) = goal_objective_from_input(&self.input).map(str::to_owned) {
-            self.input.clear();
-            self.cursor = 0;
+            self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
             self.request_goal_action(PendingGoalAction::Create(objective));
@@ -2787,56 +3001,66 @@ impl App {
             return Ok(());
         }
         if prompt == "/goals" {
-            self.input.clear();
-            self.cursor = 0;
+            self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
             return self.command(&prompt).await;
         }
         if prompt == "/providers" || prompt.starts_with("/provider ") {
-            self.input.clear();
-            self.cursor = 0;
+            self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
             return self.provider_command(&prompt);
         }
         if self.is_running() {
-            self.input.clear();
-            self.cursor = 0;
+            self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
-            self.prompt_queue.push(prompt);
+            self.prompt_queue.push(prompt, attachments);
             return Ok(());
         }
         if builtin_command_from_input(&self.input).is_some() {
-            self.input.clear();
-            self.cursor = 0;
+            self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
             return self.command(&prompt).await;
         }
 
-        self.start_turn(prompt, true)
+        self.start_turn(prompt, attachments, true)
     }
 
-    fn start_turn(&mut self, prompt: String, clear_composer: bool) -> Result<()> {
+    fn start_turn(
+        &mut self,
+        prompt: String,
+        attachments: Vec<AttachmentBinding>,
+        clear_composer: bool,
+    ) -> Result<()> {
         if clear_composer {
-            self.input.clear();
-            self.cursor = 0;
+            self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
         }
         self.error = None;
         self.pending_user = Some(prompt.clone());
+        self.pending_user_attachments = attachments.clone();
         self.live_messages.clear();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_rx = Some(event_rx);
-        self.running = Some(self.conversation.start_turn(prompt, Some(event_tx))?);
+        self.running = Some(self.conversation.start_turn_with_attachments(
+            prompt,
+            attachments,
+            Some(event_tx),
+        )?);
         Ok(())
     }
 
-    fn start_message_edit_turn(&mut self, node_id: Uuid, prompt: String) -> Result<()> {
+    fn start_message_edit_turn(
+        &mut self,
+        node_id: Uuid,
+        prompt: String,
+        attachments: Vec<AttachmentBinding>,
+    ) -> Result<()> {
         let Some(message_index) = self
             .transcript_node_ids
             .iter()
@@ -2850,26 +3074,29 @@ impl App {
         self.activities
             .retain(|activity| activity.turn_message_index < message_index);
         self.turns.retain(|turn| turn.message_index < message_index);
-        self.input.clear();
-        self.cursor = 0;
+        self.clear_composer_text();
         self.preferred_column = None;
         self.close_completion();
         self.error = None;
         self.pending_user = Some(prompt.clone());
+        self.pending_user_attachments = attachments.clone();
         self.live_messages.clear();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_rx = Some(event_rx);
-        self.running = Some(
-            self.conversation
-                .start_edit_turn(node_id, prompt, Some(event_tx))?,
-        );
+        self.running = Some(self.conversation.start_edit_turn_with_attachments(
+            node_id,
+            prompt,
+            attachments,
+            Some(event_tx),
+        )?);
         Ok(())
     }
 
     fn start_goal_continuation(&mut self) -> Result<()> {
         self.error = None;
         self.pending_user = None;
+        self.pending_user_attachments.clear();
         self.live_messages.clear();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -3098,8 +3325,7 @@ impl App {
         if self.editing_goal_id.is_some() && key.code == KeyCode::Esc {
             let id = self.editing_goal_id.take().expect("checked above");
             let resume = std::mem::take(&mut self.editing_goal_resume);
-            self.input.clear();
-            self.cursor = 0;
+            self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
             self.error = None;
@@ -3138,6 +3364,18 @@ impl App {
             return Ok(());
         }
 
+        if matches!(key.code, KeyCode::Char('v' | 'V'))
+            && matches!(
+                key.modifiers,
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
+            )
+        {
+            if let Err(error) = self.paste_operating_system_clipboard().await {
+                self.error = Some(format!("Could not paste attachment: {error:#}"));
+            }
+            return Ok(());
+        }
+
         if self.completion.is_some()
             && !key
                 .modifiers
@@ -3161,11 +3399,11 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Tab => {
-                    self.accept_completion();
+                    self.accept_completion().await;
                     return Ok(());
                 }
                 KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.accept_completion();
+                    self.accept_completion().await;
                     return Ok(());
                 }
                 KeyCode::Esc => {
@@ -3230,8 +3468,7 @@ impl App {
             KeyCode::F(1) => self.show_help = true,
             KeyCode::F(2) => self.open_skill_picker(),
             KeyCode::Esc => {
-                self.input.clear();
-                self.cursor = 0;
+                self.clear_composer_text();
                 self.preferred_column = None;
                 self.close_completion();
             }
@@ -4029,6 +4266,29 @@ fn visible_message_content(message: &Message) -> Option<&str> {
         .filter(|text| !text.trim().is_empty())
 }
 
+fn attachment_bindings_for_message(message: &Message) -> Vec<AttachmentBinding> {
+    let mut cursor = 0;
+    let mut bindings = Vec::new();
+    for part in &message.parts {
+        match part {
+            MessagePart::Text { text } => cursor += text.len(),
+            MessagePart::Attachment {
+                attachment_id,
+                reference,
+                ..
+            } => {
+                bindings.push(AttachmentBinding {
+                    attachment_id: *attachment_id,
+                    start: cursor,
+                    end: cursor + reference.len(),
+                });
+                cursor += reference.len();
+            }
+        }
+    }
+    bindings
+}
+
 fn push_actor_label(source: &mut ConversationSource, label: &str, color: Color) {
     source.lines.push(Line::from(Span::styled(
         format!(" {label} "),
@@ -4610,7 +4870,7 @@ fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rec
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered_rect(area, 74, 24);
+    let popup = centered_rect(area, 74, 25);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
@@ -4624,6 +4884,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             "  {:<30}start or stop voice dictation",
             dictation_shortcut_label()
         )),
+        Line::from("  Ctrl/Alt/Command+V    paste clipboard files or image"),
         Line::from("  Esc                   discard active recording"),
         Line::from("  ↑ / ↓                 navigate menu or move between lines"),
         Line::from("  PgUp / PgDn           scroll conversation"),
@@ -5958,6 +6219,25 @@ mod tests {
     }
 
     #[test]
+    fn composer_attachment_binding_moves_and_is_removed_when_edited() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let attachment_id = Uuid::new_v4();
+        app.insert("hello ");
+        app.insert_clipboard_item("@preview.png", Some(attachment_id));
+        assert_eq!(app.composer_attachments.len(), 1);
+        assert_eq!(app.composer_attachments[0].start, 6);
+
+        app.cursor = 0;
+        app.insert("well ");
+        assert_eq!(app.composer_attachments[0].start, 11);
+
+        app.cursor = app.composer_attachments[0].start + 1;
+        app.delete();
+        assert!(app.composer_attachments.is_empty());
+    }
+
+    #[test]
     fn terminal_paste_is_ignored_while_a_modal_owns_input() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
@@ -6108,7 +6388,7 @@ mod tests {
             .unwrap();
         assert!(app.last_escape.is_none());
 
-        let id = app.prompt_queue.push("Steer now".into());
+        let id = app.prompt_queue.push("Steer now".into(), Vec::new());
         app.queued_prompt_buttons.push(QueuedPromptButtons {
             id,
             steer: Rect::new(10, 4, 9, 3),
@@ -6130,8 +6410,10 @@ mod tests {
     fn queued_messages_render_compact_controls_above_the_composer() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
-        app.prompt_queue.push("Use the other implementation".into());
-        app.prompt_queue.push("Then update its tests".into());
+        app.prompt_queue
+            .push("Use the other implementation".into(), Vec::new());
+        app.prompt_queue
+            .push("Then update its tests".into(), Vec::new());
         let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -6176,9 +6458,9 @@ mod tests {
     async fn editing_and_deleting_queued_messages_preserves_queue_order() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
-        let first = app.prompt_queue.push("first".into());
-        let second = app.prompt_queue.push("second".into());
-        let third = app.prompt_queue.push("third".into());
+        let first = app.prompt_queue.push("first".into(), Vec::new());
+        let second = app.prompt_queue.push("second".into(), Vec::new());
+        let third = app.prompt_queue.push("third".into(), Vec::new());
         app.input = "unsent draft".into();
         app.cursor = app.input.len();
 
@@ -6217,8 +6499,8 @@ mod tests {
     async fn an_edited_front_message_waits_then_dispatches_in_place() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
-        let first = app.prompt_queue.push("first".into());
-        let second = app.prompt_queue.push("second".into());
+        let first = app.prompt_queue.push("first".into(), Vec::new());
+        let second = app.prompt_queue.push("second".into(), Vec::new());
 
         app.begin_queued_prompt_edit(first);
         assert!(!app.dispatch_queued_prompt_if_idle().unwrap());
@@ -6240,9 +6522,9 @@ mod tests {
     #[test]
     fn prompt_queue_is_fifo_but_steer_targets_the_selected_message() {
         let mut queue = PromptQueue::default();
-        let first = queue.push("first".into());
-        let second = queue.push("second".into());
-        let third = queue.push("third".into());
+        let first = queue.push("first".into(), Vec::new());
+        let second = queue.push("second".into(), Vec::new());
+        let third = queue.push("third".into(), Vec::new());
 
         assert!(queue.steer(second));
         assert_eq!(queue.pop_next(None).unwrap().id, second);
@@ -6339,6 +6621,7 @@ mod tests {
             sequence: None,
             created_at: None,
             content: Some("I’ll run the checks and update the file.".into()),
+            parts: Vec::new(),
             tool_calls: Some(vec![
                 ToolCall {
                     id: "shell-1".into(),
@@ -6794,14 +7077,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accepting_a_skill_completion_inserts_a_slash_mention() {
+    #[tokio::test]
+    async fn accepting_a_skill_completion_inserts_a_slash_mention() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
         add_test_skill(&mut app);
         app.insert("Please /rev");
 
-        assert!(app.accept_completion());
+        assert!(app.accept_completion().await);
         assert_eq!(app.input, "Please /review-rust ");
         assert!(app.completion.is_none());
     }
@@ -6947,6 +7230,7 @@ mod tests {
             sequence: None,
             created_at: None,
             content: Some("I’ll inspect the relevant file first.".into()),
+            parts: Vec::new(),
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".into(),
                 kind: "function".into(),
@@ -6963,6 +7247,7 @@ mod tests {
             sequence: None,
             created_at: None,
             content: Some("file contents".into()),
+            parts: Vec::new(),
             tool_calls: None,
             tool_call_id: Some("call-1".into()),
             hidden: false,
@@ -7377,8 +7662,8 @@ mod tests {
         assert_eq!(app.cursor, "dos\n".len());
     }
 
-    #[test]
-    fn at_menu_completes_files_folders_and_parent_paths() {
+    #[tokio::test]
+    async fn at_menu_completes_files_folders_and_parent_paths() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
@@ -7420,7 +7705,7 @@ mod tests {
         assert!(!rendered.contains(" file "));
 
         app.completion.as_mut().unwrap().selected = hello;
-        assert!(app.accept_completion());
+        assert!(app.accept_completion().await);
         assert_eq!(app.input, "@hello.txt ");
 
         app.input.clear();
