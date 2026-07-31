@@ -1,6 +1,7 @@
 #![warn(unreachable_pub)]
 
 mod agent;
+mod attachments;
 mod audio;
 mod auth;
 mod compaction;

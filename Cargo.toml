@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
@@ -39,6 +39,8 @@ webbrowser = "1.2"
 yaml_serde = "0.10"
 unicode-width = "0.2"
 ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+kamadak-exif = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

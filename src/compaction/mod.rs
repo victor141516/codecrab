@@ -409,6 +409,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: None,
+                parts: Vec::new(),
                 tool_calls: Some(vec![
                     ToolCall {
                         id: "read-a".into(),
@@ -435,6 +436,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: Some("contents a".into()),
+                parts: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some("read-a".into()),
                 hidden: false,
@@ -444,6 +446,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: Some("contents b".into()),
+                parts: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some("read-b".into()),
                 hidden: false,
@@ -518,6 +521,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: Some(content.clone()),
+                parts: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some("call-1".into()),
                 hidden: false,
@@ -553,6 +557,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: None,
+                parts: Vec::new(),
                 tool_calls: Some(vec![
                     ToolCall {
                         id: "read-1".into(),
@@ -579,6 +584,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: Some(read_secret.clone()),
+                parts: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some("read-1".into()),
                 hidden: false,
@@ -588,6 +594,7 @@ mod tests {
                 sequence: None,
                 created_at: None,
                 content: Some(r#"{"ok":true}"#.into()),
+                parts: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some("write-1".into()),
                 hidden: false,

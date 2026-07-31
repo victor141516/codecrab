@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::{
+    attachments::{Attachment, AttachmentKind, AttachmentStore, ImageDetail},
     compaction::{
         active_projection, compaction_threshold, estimate_message, estimate_messages,
         reduce_compaction_end, select_compaction_end, select_tail_start, summarizer_messages,
@@ -23,8 +24,9 @@ use crate::{
     diagnostics::DiagnosticLog,
     events::{AgentActivity, AgentEvent},
     provider::{
-        Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role, ToolCall,
-        context_length_exceeded, default_model_selection, new_session_model_selection,
+        AttachmentBinding, Message, MessagePart, ModelCatalogEntry, ModelSelection,
+        OpenAiCompatible, Role, ToolCall, context_length_exceeded, default_model_selection,
+        new_session_model_selection,
     },
     session::{
         CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
@@ -205,7 +207,8 @@ impl Agent {
     #[cfg(test)]
     pub(crate) async fn turn(&mut self, prompt: &str) -> Result<String> {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        self.turn_inner(prompt, false, None, None, cancel_rx).await
+        self.turn_inner(prompt, &[], false, None, None, cancel_rx)
+            .await
     }
 
     #[cfg(test)]
@@ -219,24 +222,37 @@ impl Agent {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn turn_controlled(
         &mut self,
         prompt: &str,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         cancellation: watch::Receiver<bool>,
     ) -> Result<String> {
-        self.turn_inner(prompt, false, None, events, cancellation)
+        self.turn_inner(prompt, &[], false, None, events, cancellation)
             .await
     }
 
-    pub(crate) async fn edit_turn_controlled(
+    pub(crate) async fn turn_with_attachments_controlled(
         &mut self,
-        node_id: Uuid,
         prompt: &str,
+        bindings: &[AttachmentBinding],
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
         cancellation: watch::Receiver<bool>,
     ) -> Result<String> {
-        self.turn_inner(prompt, false, Some(node_id), events, cancellation)
+        self.turn_inner(prompt, bindings, false, None, events, cancellation)
+            .await
+    }
+
+    pub(crate) async fn edit_turn_with_attachments_controlled(
+        &mut self,
+        node_id: Uuid,
+        prompt: &str,
+        bindings: &[AttachmentBinding],
+        events: Option<mpsc::UnboundedSender<AgentEvent>>,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<String> {
+        self.turn_inner(prompt, bindings, false, Some(node_id), events, cancellation)
             .await
     }
 
@@ -257,8 +273,15 @@ impl Agent {
         if self.session.active_goal().is_none() {
             anyhow::bail!("there is no active goal to continue");
         }
-        self.turn_inner(GOAL_CONTINUATION_PROMPT, true, None, events, cancellation)
-            .await
+        self.turn_inner(
+            GOAL_CONTINUATION_PROMPT,
+            &[],
+            true,
+            None,
+            events,
+            cancellation,
+        )
+        .await
     }
 
     pub(crate) fn create_goal(&mut self, objective: String) -> Uuid {
@@ -288,6 +311,7 @@ impl Agent {
     async fn turn_inner(
         &mut self,
         prompt: &str,
+        bindings: &[AttachmentBinding],
         hidden_prompt: bool,
         edit_node_id: Option<Uuid>,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -303,13 +327,14 @@ impl Agent {
         let user_message = if hidden_prompt {
             Message::hidden_text(Role::User, prompt)
         } else {
-            Message::text(Role::User, prompt)
+            self.user_message(prompt, bindings)?
         };
         if self.session.messages.is_empty() && !hidden_prompt && edit_node_id.is_none() {
             self.session.title = prompt.chars().take(72).collect();
         }
         let turn_message_id = if let Some(node_id) = edit_node_id {
-            self.session.edit_user_message(node_id, prompt.to_owned())?
+            self.session
+                .edit_user_message_with(node_id, user_message.clone())?
         } else {
             self.session.messages.push(user_message.clone())
         };
@@ -361,7 +386,9 @@ impl Agent {
                 &mut cancellation,
             )
             .await?;
-            let messages = self.model_projection(&system, self.session.latest_compaction(), None);
+            let mut messages =
+                self.model_projection(&system, self.session.latest_compaction(), None);
+            self.hydrate_latest_image_parts(&mut messages)?;
             let request_message_count = self.session.messages.len();
             let request_checkpoint_id = self
                 .session
@@ -369,6 +396,7 @@ impl Agent {
                 .map(|checkpoint| checkpoint.id);
             let mut definitions = self.tools.definitions();
             definitions.extend(self.skills.definitions());
+            definitions.push(view_attachment_image_definition());
             if self.session.active_goal().is_some() {
                 definitions.extend(goal_definitions());
             }
@@ -595,6 +623,7 @@ impl Agent {
                         sequence: None,
                         created_at: Some(Utc::now()),
                         content: Some(result.to_string()),
+                        parts: Vec::new(),
                         tool_calls: None,
                         tool_call_id: Some(call.id),
                         hidden: true,
@@ -626,8 +655,13 @@ impl Agent {
                     self.session.updated_at = Utc::now();
                     return Err(TurnCancelled.into());
                 }
+                let mut tool_parts = Vec::new();
                 let result = if let Some(error) = batch_rejection {
                     json!({"ok": false, "error": error})
+                } else if call.function.name == "view_attachment_image" {
+                    let (result, parts) = self.execute_attachment_tool(&call.function.arguments);
+                    tool_parts = parts;
+                    result
                 } else if self.skills.handles(&call.function.name) {
                     self.skills
                         .execute(&call.function.name, &call.function.arguments)
@@ -670,6 +704,7 @@ impl Agent {
                     sequence: None,
                     created_at: Some(Utc::now()),
                     content: Some(result.to_string()),
+                    parts: tool_parts,
                     tool_calls: None,
                     tool_call_id: Some(call.id),
                     hidden: false,
@@ -709,6 +744,225 @@ impl Agent {
         self.model_catalog
             .iter()
             .find(|model| model.slug == self.session.model)
+    }
+
+    fn selected_model_supports_images(&self) -> bool {
+        self.selected_model_metadata().is_some_and(|model| {
+            model
+                .input_modalities
+                .iter()
+                .any(|modality| modality.eq_ignore_ascii_case("image"))
+        })
+    }
+
+    fn user_message(&self, prompt: &str, bindings: &[AttachmentBinding]) -> Result<Message> {
+        if bindings.is_empty() {
+            return Ok(Message::text(Role::User, prompt));
+        }
+        let mut bindings = bindings.to_vec();
+        bindings.sort_by_key(|binding| (binding.start, binding.end));
+        let store = AttachmentStore::new(self.tools.root());
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        let mut has_images = false;
+        for binding in bindings {
+            if binding.start < cursor
+                || binding.start >= binding.end
+                || binding.end > prompt.len()
+                || !prompt.is_char_boundary(binding.start)
+                || !prompt.is_char_boundary(binding.end)
+            {
+                anyhow::bail!("attachment binding does not match the composer text");
+            }
+            let attachment = self
+                .session
+                .attachments
+                .iter()
+                .find(|attachment| attachment.id == binding.attachment_id)
+                .context(format!(
+                    "attachment {} does not exist in this session",
+                    binding.attachment_id
+                ))?;
+            let reference = store.visible_reference(attachment);
+            if prompt[binding.start..binding.end] != reference {
+                anyhow::bail!(
+                    "attachment binding text was edited; paste or select the attachment again"
+                );
+            }
+            if binding.start > cursor {
+                parts.push(MessagePart::Text {
+                    text: prompt[cursor..binding.start].to_owned(),
+                });
+            }
+            has_images |= attachment.kind == AttachmentKind::Image;
+            parts.push(MessagePart::Attachment {
+                attachment_id: attachment.id,
+                reference,
+                provider_text: (attachment.kind == AttachmentKind::File).then(|| {
+                    format!(
+                        "Attached file: id={}, name={:?}, type={}, size={} bytes, host_path={}",
+                        attachment.id,
+                        attachment.display_name,
+                        attachment.mime_type,
+                        attachment.size,
+                        self.tools.root().join(&attachment.original.path).display()
+                    )
+                }),
+                kind: attachment.kind,
+                detail: ImageDetail::Preview,
+                image_url: None,
+            });
+            cursor = binding.end;
+        }
+        if cursor < prompt.len() {
+            parts.push(MessagePart::Text {
+                text: prompt[cursor..].to_owned(),
+            });
+        }
+        if has_images && !self.selected_model_supports_images() {
+            anyhow::bail!(
+                "the selected model does not declare image input support; the draft was kept"
+            );
+        }
+        let mut message = Message::text(Role::User, prompt);
+        message.parts = parts;
+        Ok(message)
+    }
+
+    fn hydrate_latest_image_parts(&self, messages: &mut [Message]) -> Result<()> {
+        let Some(index) = messages.iter().rposition(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    MessagePart::Attachment {
+                        kind: AttachmentKind::Image,
+                        ..
+                    }
+                )
+            })
+        }) else {
+            return Ok(());
+        };
+        if messages[index + 1..]
+            .iter()
+            .any(|message| matches!(message.role, Role::Assistant))
+        {
+            return Ok(());
+        }
+        if !self.selected_model_supports_images() {
+            anyhow::bail!("the selected model does not declare image input support");
+        }
+        let store = AttachmentStore::new(self.tools.root());
+        for part in &mut messages[index].parts {
+            let MessagePart::Attachment {
+                attachment_id,
+                kind: AttachmentKind::Image,
+                detail,
+                image_url,
+                ..
+            } = part
+            else {
+                continue;
+            };
+            let attachment = self
+                .session
+                .attachments
+                .iter()
+                .find(|attachment| attachment.id == *attachment_id)
+                .context(format!(
+                    "attachment {attachment_id} is missing from the session"
+                ))?;
+            *image_url = Some(store.image_data_url(attachment, *detail)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_attachment(&mut self, attachment: Attachment) -> Attachment {
+        if let Some(existing) = self
+            .session
+            .attachments
+            .iter()
+            .find(|existing| existing.sha256 == attachment.sha256)
+        {
+            return existing.clone();
+        }
+        self.session.attachments.push(attachment.clone());
+        self.session.updated_at = Utc::now();
+        attachment
+    }
+
+    fn execute_attachment_tool(&self, arguments: &str) -> (Value, Vec<MessagePart>) {
+        let result = (|| -> Result<(Value, Vec<MessagePart>)> {
+            let parsed: Value = serde_json::from_str(arguments).context("invalid arguments")?;
+            let id = parsed
+                .get("attachment_id")
+                .and_then(Value::as_str)
+                .context("attachment_id is required")?
+                .parse::<Uuid>()
+                .context("attachment_id is invalid")?;
+            let detail = match parsed
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("preview")
+            {
+                "preview" => ImageDetail::Preview,
+                "original" => ImageDetail::Original,
+                _ => anyhow::bail!("detail must be preview or original"),
+            };
+            if !self.selected_model_supports_images() {
+                anyhow::bail!("the selected model cannot accept image tool output");
+            }
+            if !self.provider.supports_structured_image_tool_output() {
+                anyhow::bail!(
+                    "the active OpenAI-compatible backend cannot accept structured image tool output"
+                );
+            }
+            let attachment = self
+                .session
+                .attachments
+                .iter()
+                .find(|attachment| attachment.id == id)
+                .context(format!("attachment {id} does not exist in this session"))?;
+            if attachment.kind != AttachmentKind::Image {
+                anyhow::bail!("attachment {id} is not an image");
+            }
+            let reference = AttachmentStore::new(self.tools.root()).visible_reference(attachment);
+            Ok((
+                json!({
+                    "ok": true,
+                    "result": {
+                        "attachment_id": id,
+                        "detail": detail,
+                        "name": attachment.display_name,
+                        "mime_type": attachment.mime_type,
+                        "reference": reference,
+                    }
+                }),
+                vec![
+                    MessagePart::Text {
+                        text: format!(
+                            "Attachment {} ({}, {})\n",
+                            attachment.display_name, attachment.mime_type, id
+                        ),
+                    },
+                    MessagePart::Attachment {
+                        attachment_id: id,
+                        reference,
+                        provider_text: None,
+                        kind: AttachmentKind::Image,
+                        detail,
+                        image_url: None,
+                    },
+                ],
+            ))
+        })();
+        match result {
+            Ok(value) => value,
+            Err(error) => (
+                json!({"ok": false, "error": format!("{error:#}")}),
+                Vec::new(),
+            ),
+        }
     }
 
     fn estimated_active_tokens(&self, system: &str, pending: Option<&Message>) -> u64 {
@@ -1145,6 +1399,24 @@ fn goal_definitions() -> Vec<Value> {
     ]
 }
 
+fn view_attachment_image_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "view_attachment_image",
+            "description": "View a session image attachment. Preview returns the default 1024 px rendition; original returns a provider-safe higher-detail rendition.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "string", "format": "uuid"},
+                    "detail": {"type": "string", "enum": ["preview", "original"]}
+                },
+                "required": ["attachment_id"]
+            }
+        }
+    })
+}
+
 async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
     loop {
         if *cancellation.borrow() {
@@ -1162,6 +1434,7 @@ fn push_cancelled_tool_result(messages: &mut ConversationTree, tool_call_id: Str
         sequence: None,
         created_at: Some(Utc::now()),
         content: Some(r#"{"ok":false,"error":"cancelled by user"}"#.into()),
+        parts: Vec::new(),
         tool_calls: None,
         tool_call_id: Some(tool_call_id),
         hidden: false,
@@ -1480,6 +1753,69 @@ mod tests {
             global_instructions_path,
             DiagnosticLog::default(),
         )
+    }
+
+    fn test_attachment_agent(root: &Path, supports_images: bool) -> (Agent, Attachment, String) {
+        let config = Config::test("model", "http://127.0.0.1:1/v1");
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(root).unwrap();
+        let mut session = store.create("model".into()).unwrap();
+        let attachment_store = AttachmentStore::new(root);
+        let attachment = attachment_store
+            .import_rgba(session.id, &[], 1, 1, &[1, 2, 3, 255])
+            .unwrap();
+        let reference = attachment_store.visible_reference(&attachment);
+        session.attachments.push(attachment.clone());
+        let mut agent = test_agent(
+            provider,
+            ToolBox::new(root.to_path_buf()),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        let mut model = ModelCatalogEntry::from_id("model".into());
+        if supports_images {
+            model.input_modalities.push("image".into());
+        }
+        agent.model_catalog = vec![model];
+        (agent, attachment, reference)
+    }
+
+    #[tokio::test]
+    async fn unsupported_image_submission_keeps_the_session_turn_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut agent, attachment, reference) = test_attachment_agent(root.path(), false);
+        let binding = AttachmentBinding {
+            attachment_id: attachment.id,
+            start: 0,
+            end: reference.len(),
+        };
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let error = agent
+            .turn_with_attachments_controlled(&reference, &[binding], None, cancel_rx)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("does not declare image input support"));
+        assert!(agent.session.messages.is_empty());
+    }
+
+    #[test]
+    fn compatible_backend_reports_unsupported_original_image_tool_output() {
+        let root = tempfile::tempdir().unwrap();
+        let (agent, attachment, _) = test_attachment_agent(root.path(), true);
+        let (result, parts) = agent.execute_attachment_tool(
+            &json!({"attachment_id": attachment.id, "detail": "original"}).to_string(),
+        );
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot accept structured image tool output")
+        );
+        assert!(parts.is_empty());
     }
 
     #[test]

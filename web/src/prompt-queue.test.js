@@ -62,3 +62,30 @@ test("an item being edited blocks only when it is next", () => {
   assert.equal(takeNextQueuedPrompt(queue), null);
   assert.deepEqual(queue.items.map((item) => item.id), [second]);
 });
+
+test("queued prompt edits preserve attachment and composer bindings", () => {
+  const queue = createPromptQueue();
+  const attachment = { attachment_id: "image-1", start: 7, end: 15 };
+  const composerAttachment = {
+    ...attachment,
+    reference: "@preview"
+  };
+  const id = enqueuePrompt(
+    queue,
+    "before @preview",
+    [attachment],
+    [composerAttachment]
+  );
+
+  updateQueuedPrompt(
+    queue,
+    id,
+    "edited @preview",
+    [{ ...attachment, start: 7, end: 15 }],
+    [{ ...composerAttachment, start: 7, end: 15 }]
+  );
+
+  const queued = takeNextQueuedPrompt(queue);
+  assert.deepEqual(queued.attachments, [attachment]);
+  assert.deepEqual(queued.composerAttachments, [composerAttachment]);
+});
