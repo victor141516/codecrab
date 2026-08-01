@@ -56,8 +56,8 @@ use crate::{
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
     provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection},
     session::{
-        Session, SessionProject, SessionStore, SessionSummary, list_session_projects,
-        resolve_global_session,
+        Session, SessionProject, SessionStore, SessionSummary, arrange_session_projects,
+        list_session_projects, resolve_global_session,
     },
     skills::SkillRegistry,
     transcription::Transcriber,
@@ -768,10 +768,13 @@ fn live_session_projects(
         let session = &live.snapshot.session;
         let summary = SessionSummary {
             id: session.id,
+            parent_session_id: session.parent_session_id,
             created_at: session.created_at,
             updated_at: live.observation.latest_event_at,
             title: live.observation.title,
             model: session.model.clone(),
+            depth: 0,
+            descendant_count: 0,
         };
         if let Some(project) = projects
             .iter_mut()
@@ -786,9 +789,6 @@ fn live_session_projects(
             } else {
                 project.sessions.push(summary);
             }
-            project
-                .sessions
-                .sort_by_key(|session| std::cmp::Reverse((session.created_at, session.id)));
         } else {
             projects.push(SessionProject {
                 root: live.snapshot.project_root,
@@ -796,6 +796,7 @@ fn live_session_projects(
             });
         }
     }
+    arrange_session_projects(&mut projects);
     Ok(projects)
 }
 

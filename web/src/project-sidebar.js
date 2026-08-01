@@ -17,3 +17,25 @@ export function expandKnownProject(expanded, projects, root) {
 export function newSessionPayload(projectRoot) {
   return { project: projectRoot };
 }
+
+export function toggleSessionExpansion(collapsed, sessionId) {
+  const next = new Set(collapsed);
+  if (!next.delete(sessionId)) next.add(sessionId);
+  return next;
+}
+
+export function visibleSessionRows(sessions, collapsed) {
+  const visible = [];
+  let hiddenBelowDepth = null;
+  for (const session of sessions) {
+    if (hiddenBelowDepth !== null) {
+      if (session.depth > hiddenBelowDepth) continue;
+      hiddenBelowDepth = null;
+    }
+    visible.push(session);
+    if (session.descendant_count > 0 && collapsed.has(session.id)) {
+      hiddenBelowDepth = session.depth;
+    }
+  }
+  return visible;
+}

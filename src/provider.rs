@@ -1643,6 +1643,30 @@ mod tests {
                     .any(|tool| tool["name"] == name)
             );
         }
+        let chat_create = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "session_create")
+            .unwrap();
+        let responses_create = responses["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_create")
+            .unwrap();
+        assert_eq!(
+            chat_create["function"]["parameters"],
+            responses_create["parameters"]
+        );
+        assert_eq!(
+            chat_create["function"]["description"],
+            responses_create["description"]
+        );
+        assert_eq!(
+            responses_create["parameters"]["properties"]["relationship"]["default"],
+            "child"
+        );
     }
 
     #[test]

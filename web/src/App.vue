@@ -13,6 +13,7 @@ import {
   Check,
   ChevronDown,
   ChevronLeft,
+  ChevronRight,
   ChevronUp,
   Copy,
   Folder,
@@ -89,7 +90,9 @@ import {
 import {
   expandKnownProject,
   newSessionPayload,
-  toggleProjectExpansion
+  toggleProjectExpansion,
+  toggleSessionExpansion,
+  visibleSessionRows
 } from "./project-sidebar.js";
 
 const state = ref(null);
@@ -109,6 +112,7 @@ const waveformCanvas = ref(null);
 const autocomplete = ref(null);
 const autocompleteSelection = ref(0);
 const expandedProjects = ref(new Set());
+const collapsedSessions = ref(new Set());
 const projectPickerOpen = ref(false);
 const directoryListing = ref(null);
 const directoryPathDraft = ref("");
@@ -764,6 +768,9 @@ async function deleteSession(project, id) {
     sessionStates.delete(id);
     sessionRuntimes.delete(id);
     liveObservationRevisions.delete(id);
+    const nextCollapsedSessions = new Set(collapsedSessions.value);
+    nextCollapsedSessions.delete(id);
+    collapsedSessions.value = nextCollapsedSessions;
     forgetComposerDraft(project, id);
     virtualTimelineStore.delete(id);
     applyServerState(nextState, {
@@ -983,6 +990,18 @@ function projectExpanded(root) {
 
 function toggleProject(root) {
   expandedProjects.value = toggleProjectExpansion(expandedProjects.value, root);
+}
+
+function sessionCollapsed(id) {
+  return collapsedSessions.value.has(id);
+}
+
+function toggleSession(id) {
+  collapsedSessions.value = toggleSessionExpansion(collapsedSessions.value, id);
+}
+
+function visibleProjectSessions(project) {
+  return visibleSessionRows(project.sessions, collapsedSessions.value);
 }
 
 async function browseDirectory(path = directoryPathDraft.value) {
@@ -3533,13 +3552,30 @@ onBeforeUnmount(() => {
               No sessions yet. Use + on this project to create one.
             </p>
             <div
-              v-for="item in project.sessions"
+              v-for="item in visibleProjectSessions(project)"
               :key="item.id"
               class="sidebar-session-row group/session flex w-full items-center transition"
               :class="{ 'is-current': isCurrentSession(project, item) }"
+              :style="{ paddingLeft: `${item.depth * 0.75}rem` }"
+              :data-session-depth="item.depth"
             >
               <button
-                class="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
+                v-if="item.descendant_count > 0"
+                class="session-disclosure grid size-7 shrink-0 place-items-center rounded text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200"
+                :aria-label="`${sessionCollapsed(item.id) ? 'Expand' : 'Collapse'} ${item.title || 'session'}`"
+                :aria-expanded="!sessionCollapsed(item.id)"
+                @click.stop="toggleSession(item.id)"
+              >
+                <ChevronRight
+                  v-if="sessionCollapsed(item.id)"
+                  class="size-3.5"
+                  aria-hidden="true"
+                />
+                <ChevronDown v-else class="size-3.5" aria-hidden="true" />
+              </button>
+              <span v-else class="size-7 shrink-0" aria-hidden="true" />
+              <button
+                class="flex min-w-0 flex-1 items-center gap-2 py-2 pr-2 text-left"
                 @click="resumeSession(project.root, item.id)"
               >
                 <span
@@ -3549,6 +3585,20 @@ onBeforeUnmount(() => {
                 />
                 <span class="min-w-0 flex-1 truncate text-[13px] text-zinc-300 group-hover/session:text-white">
                   {{ item.title || "New session" }}
+                </span>
+                <span
+                  v-if="sessionCollapsed(item.id)"
+                  class="shrink-0 rounded bg-white/5 px-1 font-mono text-[9px] text-zinc-500"
+                  :title="`${item.descendant_count} hidden descendants`"
+                >
+                  +{{ item.descendant_count }}
+                </span>
+                <span
+                  v-else-if="item.depth === 0 && item.parent_session_id"
+                  class="shrink-0 font-mono text-[9px] text-zinc-500"
+                  :title="`Parent session ${item.parent_session_id}`"
+                >
+                  child of {{ shortId(item.parent_session_id) }}
                 </span>
                 <span
                   v-if="workerLifecycle(item.id) && workerLifecycle(item.id) !== 'idle'"
