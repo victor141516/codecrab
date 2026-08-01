@@ -1380,29 +1380,6 @@ function handleMessageEditorKey(event) {
   }
 }
 
-async function clearSession() {
-  if (
-    branchesOpen.value ||
-    editingMessageNode.value ||
-    recalledMessageNode.value
-  ) {
-    return;
-  }
-  const sessionId = session.value?.id;
-  if (!sessionId) return;
-  error.value = "";
-  try {
-    const nextState = await api("/api/session/clear", {
-      method: "POST",
-      body: JSON.stringify({ session_id: sessionId })
-    });
-    if (session.value?.id === sessionId) applyServerState(nextState);
-    else setTargetState(sessionId, nextState);
-  } catch (cause) {
-    error.value = cause.message;
-  }
-}
-
 function applyGoalState(nextState) {
   applyServerState(nextState);
 }
@@ -3119,16 +3096,6 @@ function shortId(id) {
   return id?.slice(0, 8) ?? "";
 }
 
-function formatTime(value) {
-  if (!value) return "";
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit"
-  }).format(new Date(value));
-}
-
 onMounted(() => {
   window.addEventListener("popstate", handleHistoryNavigation);
   window.addEventListener("keydown", handleGlobalKeydown);
@@ -3546,7 +3513,7 @@ onBeforeUnmount(() => {
               </span>
             </button>
             <button
-              class="mr-1 grid size-7 shrink-0 place-items-center rounded text-zinc-600 transition hover:bg-coral/10 hover:text-coral"
+              class="mr-1 grid size-7 shrink-0 place-items-center rounded text-zinc-500 transition hover:bg-coral/10 hover:text-coral"
               :aria-label="`New session in ${projectName(project.root)}`"
               title="New session in this project"
               @click.stop="newSession(project.root)"
@@ -3557,7 +3524,7 @@ onBeforeUnmount(() => {
 
           <div
             v-if="projectExpanded(project.root)"
-            class="ml-3 border-l border-white/6 pl-2"
+            class="sidebar-session-list ml-3 pl-2"
           >
             <p
               v-if="!project.sessions.length"
@@ -3568,39 +3535,33 @@ onBeforeUnmount(() => {
             <div
               v-for="item in project.sessions"
               :key="item.id"
-              class="sidebar-session-row group/session mb-0.5 flex w-full items-center rounded-lg transition"
+              class="sidebar-session-row group/session flex w-full items-center transition"
               :class="{ 'is-current': isCurrentSession(project, item) }"
             >
               <button
-                class="min-w-0 flex-1 px-2 py-2 text-left"
+                class="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
                 @click="resumeSession(project.root, item.id)"
               >
-                <span class="block truncate text-[13px] text-zinc-400 group-hover/session:text-white">
+                <span
+                  v-if="isCurrentSession(project, item)"
+                  class="current-session-dot absolute left-0 size-1.5 rounded-full bg-coral"
+                  aria-hidden="true"
+                />
+                <span class="min-w-0 flex-1 truncate text-[13px] text-zinc-300 group-hover/session:text-white">
                   {{ item.title || "New session" }}
                 </span>
-                <span class="session-meta mt-1 flex items-center justify-between gap-2 font-mono text-[9px] text-zinc-500">
-                  <span class="flex min-w-0 items-center gap-1.5">
-                    <span
-                      v-if="workerLifecycle(item.id)"
-                      class="size-1.5 rounded-full"
-                      :class="{
-                        'animate-pulse bg-cyan-400': workerLifecycle(item.id) === 'running',
-                        'bg-red-400': workerLifecycle(item.id) === 'failed',
-                        'bg-zinc-600': workerLifecycle(item.id) === 'idle'
-                      }"
-                    />
-                    <span class="truncate">{{ workerLifecycle(item.id) || shortId(item.id) }}</span>
-                  </span>
-                  <span
-                    class="shrink-0 whitespace-nowrap"
-                    :title="`Created ${formatEventTimestamp(item.created_at)} · Updated ${formatEventTimestamp(item.updated_at)}`"
-                  >
-                    C {{ formatTime(item.created_at) }} · U {{ formatTime(item.updated_at) }}
-                  </span>
-                </span>
+                <span
+                  v-if="workerLifecycle(item.id) && workerLifecycle(item.id) !== 'idle'"
+                  class="size-1.5 shrink-0 rounded-full"
+                  :class="{
+                    'animate-pulse bg-cyan-400': workerLifecycle(item.id) === 'running',
+                    'bg-red-400': workerLifecycle(item.id) === 'failed'
+                  }"
+                  :title="workerLifecycle(item.id)"
+                />
               </button>
               <button
-                class="mr-1 grid size-7 shrink-0 place-items-center rounded text-zinc-700 transition hover:bg-red-500/10 hover:text-red-400 disabled:pointer-events-none disabled:opacity-30"
+                class="mr-1 grid size-8 shrink-0 place-items-center rounded-md text-zinc-400 transition hover:bg-red-500/12 hover:text-red-300 disabled:pointer-events-none disabled:opacity-30"
                 :disabled="runtimeFor(item.id).sending"
                 :aria-label="`Delete session ${item.title || shortId(item.id)}`"
                 title="Delete session"
@@ -3637,7 +3598,7 @@ onBeforeUnmount(() => {
           <button
             v-if="session"
             class="grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-30"
-            :class="branchesOpen ? 'text-coral' : 'text-zinc-600'"
+            :class="branchesOpen ? 'text-coral' : 'text-zinc-500'"
             :disabled="
               sending ||
               Boolean(editingMessageNode) ||
@@ -3651,58 +3612,7 @@ onBeforeUnmount(() => {
           >
             <GitBranch class="size-4" aria-hidden="true" />
           </button>
-          <button class="grid size-8 place-items-center rounded-md text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300" title="Providers" aria-label="Manage providers" @click="providersOpen = true"><Settings class="size-4" /></button>
-          <select
-            v-if="session"
-            class="control max-w-44"
-            :value="session.model"
-            :disabled="branchesOpen || Boolean(editingMessageNode)"
-            aria-label="Model"
-            @change="chooseModel"
-          >
-            <option v-for="model in models" :key="model.slug" :value="model.slug">
-              {{ model.display_name }}
-            </option>
-          </select>
-          <select
-            v-if="reasoningOptions.length"
-            class="control hidden sm:block"
-            :value="session?.reasoning_effort ?? ''"
-            :disabled="branchesOpen || Boolean(editingMessageNode)"
-            aria-label="Thinking level"
-            @change="updateModel({ reasoning_effort: $event.target.value || null })"
-          >
-            <option
-              v-for="option in reasoningOptions"
-              :key="option.effort"
-              :value="option.effort"
-            >
-              {{ option.name }}
-            </option>
-          </select>
-          <select
-            v-if="speedOptions.length"
-            class="control hidden sm:block"
-            :value="session?.service_tier ?? ''"
-            :disabled="branchesOpen || Boolean(editingMessageNode)"
-            aria-label="Service speed"
-            @change="updateModel({ service_tier: $event.target.value || null })"
-          >
-            <option value="">standard</option>
-            <option v-for="tier in speedOptions" :key="tier.id" :value="tier.id">
-              {{ tier.name.toLowerCase() }}
-            </option>
-          </select>
-          <button
-            v-if="session"
-            class="grid size-8 place-items-center rounded-md text-zinc-600 transition hover:bg-white/5 hover:text-zinc-300"
-            :disabled="branchesOpen || Boolean(editingMessageNode)"
-            title="Clear conversation"
-            aria-label="Clear conversation"
-            @click="clearSession"
-          >
-            <X class="size-4" aria-hidden="true" />
-          </button>
+          <button class="grid size-8 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200" title="Providers" aria-label="Manage providers" @click="providersOpen = true"><Settings class="size-4" /></button>
         </div>
       </header>
 
@@ -4001,7 +3911,7 @@ onBeforeUnmount(() => {
                 </template>
                 <div
                   v-if="activeAssistantTurnKey === item.key"
-                  class="mt-2 flex gap-1"
+                  class="thinking-indicator mt-2"
                 >
                   <span class="thinking-dot" />
                   <span class="thinking-dot [animation-delay:120ms]" />
@@ -4017,15 +3927,13 @@ onBeforeUnmount(() => {
           />
 
           <div v-if="sending && !activeAssistantTurnKey" class="message-row">
-            <div class="assistant-badge mt-0.5 grid size-7 shrink-0 place-items-center rounded-md text-[10px] font-bold text-coral">
+            <div class="assistant-badge grid size-7 shrink-0 place-items-center rounded-md text-[10px] font-bold text-coral">
               C
             </div>
-            <div class="pt-1.5">
-              <div class="flex gap-1">
-                <span class="thinking-dot" />
-                <span class="thinking-dot [animation-delay:120ms]" />
-                <span class="thinking-dot [animation-delay:240ms]" />
-              </div>
+            <div class="thinking-indicator">
+              <span class="thinking-dot" />
+              <span class="thinking-dot [animation-delay:120ms]" />
+              <span class="thinking-dot [animation-delay:240ms]" />
             </div>
           </div>
         </div>
@@ -4323,7 +4231,57 @@ onBeforeUnmount(() => {
                 @blur="handleComposerBlur"
                 @keydown="handleComposerKey"
               />
-              <div class="flex items-center gap-2 px-2 pb-2">
+              <div class="composer-toolbar flex items-center gap-2 px-2.5 pb-2.5">
+                <div
+                  v-if="!recording"
+                  class="composer-model-controls flex min-w-0 items-center gap-1.5"
+                  aria-label="Model configuration"
+                >
+                  <select
+                    v-if="session"
+                    class="control composer-control composer-model-control"
+                    :value="session.model"
+                    :disabled="branchesOpen || Boolean(editingMessageNode)"
+                    aria-label="Model"
+                    title="Model"
+                    @change="chooseModel"
+                  >
+                    <option v-for="model in models" :key="model.slug" :value="model.slug">
+                      {{ model.display_name }}
+                    </option>
+                  </select>
+                  <select
+                    v-if="reasoningOptions.length"
+                    class="control composer-control composer-param-control"
+                    :value="session?.reasoning_effort ?? ''"
+                    :disabled="branchesOpen || Boolean(editingMessageNode)"
+                    aria-label="Thinking level"
+                    title="Thinking level"
+                    @change="updateModel({ reasoning_effort: $event.target.value || null })"
+                  >
+                    <option
+                      v-for="option in reasoningOptions"
+                      :key="option.effort"
+                      :value="option.effort"
+                    >
+                      {{ option.name }}
+                    </option>
+                  </select>
+                  <select
+                    v-if="speedOptions.length"
+                    class="control composer-control composer-param-control"
+                    :value="session?.service_tier ?? ''"
+                    :disabled="branchesOpen || Boolean(editingMessageNode)"
+                    aria-label="Service speed"
+                    title="Service speed"
+                    @change="updateModel({ service_tier: $event.target.value || null })"
+                  >
+                    <option value="">standard</option>
+                    <option v-for="tier in speedOptions" :key="tier.id" :value="tier.id">
+                      {{ tier.name.toLowerCase() }}
+                    </option>
+                  </select>
+                </div>
                 <canvas
                   v-show="recording"
                   ref="waveformCanvas"

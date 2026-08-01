@@ -30,7 +30,6 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("provider", "Add, select, or remove a provider profile"),
     ("goal", "Start a persistent goal"),
     ("goals", "Browse and manage persistent goals"),
-    ("clear", "Clear the conversation context"),
     ("quit", "Save the session and exit"),
 ];
 
@@ -977,6 +976,11 @@ mod tests {
             menu.items
                 .iter()
                 .any(|item| item.kind == CompletionKind::Command && item.name == "goals")
+        );
+        assert!(
+            menu.items
+                .iter()
+                .all(|item| item.kind != CompletionKind::Command || item.name != "clear")
         );
 
         let input = "Please /";

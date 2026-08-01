@@ -173,13 +173,6 @@ impl ConversationTree {
         Ok(id)
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.nodes.clear();
-        self.active_leaf_id = None;
-        self.active_node_ids.clear();
-        self.active_messages.clear();
-    }
-
     pub(crate) fn is_ancestor(&self, ancestor: Uuid, descendant: Uuid) -> bool {
         let parents = self
             .nodes
@@ -459,10 +452,6 @@ impl Session {
         let sequence = self.next_event_sequence;
         self.next_event_sequence = self.next_event_sequence.saturating_add(1);
         sequence
-    }
-
-    pub(crate) fn reset_event_sequence(&mut self) {
-        self.next_event_sequence = 0;
     }
 
     pub(crate) fn start_turn(

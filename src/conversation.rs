@@ -250,9 +250,6 @@ enum ConversationCommand {
         selection: ModelSelection,
         reply: oneshot::Sender<Result<ConversationSnapshot>>,
     },
-    Clear {
-        reply: oneshot::Sender<Result<ConversationSnapshot>>,
-    },
     SelectBranch {
         node_id: Uuid,
         reply: oneshot::Sender<Result<ConversationSnapshot>>,
@@ -547,12 +544,6 @@ impl ConversationHandle {
         let (reply, response) = oneshot::channel();
         self.send(ConversationCommand::SetModel { selection, reply })?;
         receive(response, "setting the conversation model").await?
-    }
-
-    pub(crate) async fn clear(&self) -> Result<ConversationSnapshot> {
-        let (reply, response) = oneshot::channel();
-        self.send(ConversationCommand::Clear { reply })?;
-        receive(response, "clearing the conversation").await?
     }
 
     pub(crate) async fn add_attachment(
@@ -878,16 +869,6 @@ async fn run_worker(
             ConversationCommand::SetModel { selection, reply } => {
                 agent.set_model_selection(selection);
                 reply_snapshot(&agent, &registry, &snapshots, reply);
-                false
-            }
-            ConversationCommand::Clear { reply } => {
-                let result = agent
-                    .clear()
-                    .and_then(|()| persist(&agent, &registry).map(|()| snapshot(&agent)));
-                if let Ok(current) = &result {
-                    let _ = snapshots.send(current.clone());
-                }
-                let _ = reply.send(result);
                 false
             }
             ConversationCommand::SelectBranch { node_id, reply } => {

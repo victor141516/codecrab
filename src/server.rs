@@ -547,7 +547,6 @@ fn server_app(state: ServerState) -> Router {
                 .route("/providers", post(save_provider))
                 .route("/providers/use", post(use_provider))
                 .route("/providers/delete", post(delete_provider))
-                .route("/session/clear", post(clear_session))
                 .route("/branches/preview", post(preview_branch))
                 .route("/branches/select", post(select_branch))
                 .route("/sessions", post(new_session))
@@ -1606,24 +1605,6 @@ async fn delete_provider(
         *state.inner.config.write().unwrap() = config;
     }
     Ok(Json(snapshot(&state).await?))
-}
-
-async fn clear_session(
-    State(state): State<ServerState>,
-    Json(request): Json<ConversationRequest>,
-) -> ApiResult<StateResponse> {
-    let conversation = selected_conversation(&state, request.session_id)
-        .await
-        .ok_or_else(|| {
-            ApiError::message(
-                StatusCode::CONFLICT,
-                "create or resume a session before clearing it",
-            )
-        })?;
-    conversation.clear().await?;
-    Ok(Json(
-        snapshot_for(&state, Some(conversation.snapshot().session.id)).await?,
-    ))
 }
 
 async fn preview_branch(

@@ -385,15 +385,6 @@ impl TerminalManager {
         Ok(())
     }
 
-    pub(crate) fn clear(&self) -> Result<()> {
-        self.close_all()?;
-        let mut state = self.inner.lock().expect("terminal manager mutex poisoned");
-        state.actors.clear();
-        state.records.clear();
-        state.next_id = 1;
-        Ok(())
-    }
-
     fn start(&self, command: &str) -> Result<Arc<TerminalActor>> {
         let shell = detect_shell(self.configured_shell.as_deref())?;
         let id = {
