@@ -104,7 +104,7 @@ codecrab -C path/to/project
 
 ## Choose your interface
 
-All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists are grouped by project and ordered by creation time, newest first; activity updates do not move an existing session. The terminal and web pickers show both creation (`C`) and last-update (`U`) times, and `codecrab sessions` prints `CREATED` and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
+All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists are grouped by project and ordered by creation time, newest first; activity updates do not move an existing session. The terminal picker shows creation (`C`) and last-update (`U`) times, while the denser web sidebar keeps each session to one title row. `codecrab sessions` prints `CREATED` and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
 
 ### Interactive terminal
 
@@ -192,7 +192,7 @@ codecrab resume
 codecrab resume <session-id-or-prefix>
 ```
 
-The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
+The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. The web composer keeps model, reasoning, and speed selection beside its attachment, dictation, and send actions. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
 
 Web session URLs use `/sessions/<id>`, so a clean reload or shared URL resolves the correct registered project without relying on browser storage. Unsent composer drafts remain browser-local and isolated by project and session.
 
@@ -221,7 +221,6 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | `/provider` | Add, select, or remove a provider profile |
 | `/goal <objective>` | Start a persistent goal |
 | `/goals` | Browse and manage goals |
-| `/clear` | Clear the current conversation context |
 | `/quit` | Save and exit |
 
 A built-in command runs only when it is the entire input. Text such as `Explain /help` is sent to the agent unchanged.
@@ -406,7 +405,6 @@ With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription 
 | `POST` | `/api/providers` | Add or replace a provider profile |
 | `POST` | `/api/providers/use` | Select the provider for new sessions |
 | `POST` | `/api/providers/delete` | Delete an inactive provider profile |
-| `POST` | `/api/session/clear` | Clear one session |
 | `POST` | `/api/branches/preview` | Preview a conversation path without persistence |
 | `POST` | `/api/branches/select` | Select and persist a conversation path |
 | `POST` | `/api/sessions` | Create and select a session in a project |

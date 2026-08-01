@@ -3206,12 +3206,6 @@ impl App {
             "/sessions" => self.open_session_picker().await?,
             "/branches" => self.open_branch_navigator(),
             "/goals" => self.open_goal_picker(),
-            "/clear" => {
-                let snapshot = self.conversation.clear().await?;
-                self.apply_snapshot(snapshot);
-                self.live_messages.clear();
-                self.error = None;
-            }
             _ => self.error = Some(format!("Unknown command: {command}")),
         }
         Ok(())
@@ -4905,7 +4899,6 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             "Commands",
             Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  /clear     clear conversation context"),
         Line::from("  /branches  browse conversation branches"),
         Line::from("  /goal ...  start a persistent goal"),
         Line::from("  /goals     manage persistent goals"),

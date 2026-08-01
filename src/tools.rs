@@ -60,10 +60,6 @@ impl ToolBox {
         self.terminals.close_all()
     }
 
-    pub(crate) fn clear_terminals(&self) -> Result<()> {
-        self.terminals.clear()
-    }
-
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }

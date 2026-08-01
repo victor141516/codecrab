@@ -181,23 +181,6 @@ impl Agent {
         self.session.finish_latest_turn(outcome, Utc::now());
     }
 
-    pub(crate) fn clear(&mut self) -> Result<()> {
-        self.tools.clear_terminals()?;
-        self.session.pause_active_goal();
-        self.session.messages.clear();
-        self.session.activities.clear();
-        self.session.reset_event_sequence();
-        self.session.turns.clear();
-        self.session.compaction_checkpoints.clear();
-        self.session.latest_request_usage = None;
-        self.session.next_terminal_id = 1;
-        self.session.terminals.clear();
-        self.compaction_debounce_tokens = None;
-        self.session.title = "New session".into();
-        self.session.updated_at = Utc::now();
-        Ok(())
-    }
-
     pub(crate) fn shutdown(&mut self) -> Result<()> {
         self.tools.close_terminals()?;
         self.sync_terminal_state();

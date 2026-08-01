@@ -10,8 +10,24 @@ test("sidebar renders every project with nested sessions and exact project actio
   assert.match(appSource, /v-for="item in project\.sessions"/);
   assert.match(appSource, /newSession\(project\.root\)/);
   assert.match(appSource, /resumeSession\(project\.root, item\.id\)/);
-  assert.match(appSource, /C \{\{ formatTime\(item\.created_at\) \}\}/);
-  assert.match(appSource, /U \{\{ formatTime\(item\.updated_at\) \}\}/);
+  assert.doesNotMatch(appSource, /formatTime\(item\.(created_at|updated_at)\)/);
+  assert.match(appSource, /current-session-dot/);
+  assert.match(appSource, /sidebar-session-list/);
+});
+
+test("model controls live inside the composer instead of the header", () => {
+  const composerIndex = appSource.indexOf('<div class="composer-shell">');
+  const modelControlIndex = appSource.indexOf(
+    'class="control composer-control composer-model-control"'
+  );
+  assert.ok(composerIndex >= 0);
+  assert.ok(modelControlIndex > composerIndex);
+});
+
+test("web does not expose conversation clearing", () => {
+  assert.doesNotMatch(appSource, /Clear conversation/);
+  assert.doesNotMatch(appSource, /clearSession/);
+  assert.doesNotMatch(appSource, /\/api\/session\/clear/);
 });
 
 test("server project picker remains usable in compact and wide viewports", () => {
