@@ -699,10 +699,13 @@ impl Session {
 #[derive(Clone, Serialize)]
 pub(crate) struct SessionSummary {
     pub id: Uuid,
+    pub parent_session_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub title: String,
     pub model: String,
+    pub depth: usize,
+    pub descendant_count: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -782,10 +785,13 @@ impl SessionStore {
             let session = self.read(&path)?;
             sessions.push(SessionSummary {
                 id: session.id,
+                parent_session_id: session.parent_session_id,
                 created_at: session.created_at,
                 updated_at: session.updated_at,
                 title: session.title,
                 model: session.model,
+                depth: 0,
+                descendant_count: 0,
             });
         }
         sessions.sort_by_key(|session| std::cmp::Reverse((session.created_at, session.id)));
@@ -908,7 +914,96 @@ pub(crate) fn list_session_projects(
         let sessions = store.list()?;
         projects.push(SessionProject { root, sessions });
     }
+    arrange_session_projects(&mut projects);
     Ok(projects)
+}
+
+pub(crate) fn arrange_session_projects(projects: &mut [SessionProject]) {
+    for project in projects {
+        arrange_session_tree(&mut project.sessions);
+    }
+}
+
+fn arrange_session_tree(sessions: &mut Vec<SessionSummary>) {
+    let source = std::mem::take(sessions);
+    let indexes = source
+        .iter()
+        .enumerate()
+        .map(|(index, session)| (session.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut cyclic = HashSet::new();
+
+    for start in 0..source.len() {
+        let mut positions = HashMap::new();
+        let mut path = Vec::new();
+        let mut current = start;
+        loop {
+            if let Some(cycle_start) = positions.insert(current, path.len()) {
+                cyclic.extend(path[cycle_start..].iter().copied());
+                break;
+            }
+            path.push(current);
+            let Some(parent) = source[current]
+                .parent_session_id
+                .and_then(|id| indexes.get(&id))
+                .copied()
+            else {
+                break;
+            };
+            current = parent;
+        }
+    }
+
+    let mut roots = Vec::new();
+    let mut children = vec![Vec::new(); source.len()];
+    for (index, session) in source.iter().enumerate() {
+        let parent = session
+            .parent_session_id
+            .and_then(|id| indexes.get(&id))
+            .copied();
+        if cyclic.contains(&index) || parent.is_none() {
+            roots.push(index);
+        } else if let Some(parent) = parent {
+            children[parent].push(index);
+        }
+    }
+
+    let newest_first = |left: &usize, right: &usize| {
+        (source[*right].created_at, source[*right].id)
+            .cmp(&(source[*left].created_at, source[*left].id))
+    };
+    roots.sort_by(newest_first);
+    for siblings in &mut children {
+        siblings.sort_by(newest_first);
+    }
+
+    fn descendant_count(index: usize, children: &[Vec<usize>]) -> usize {
+        children[index]
+            .iter()
+            .map(|child| 1 + descendant_count(*child, children))
+            .sum()
+    }
+
+    fn append_tree(
+        index: usize,
+        depth: usize,
+        source: &[SessionSummary],
+        children: &[Vec<usize>],
+        output: &mut Vec<SessionSummary>,
+    ) {
+        let mut session = source[index].clone();
+        session.depth = depth;
+        session.descendant_count = descendant_count(index, children);
+        output.push(session);
+        for child in &children[index] {
+            append_tree(*child, depth + 1, source, children, output);
+        }
+    }
+
+    sessions.reserve(source.len());
+    for root in roots {
+        append_tree(root, 0, &source, &children, sessions);
+    }
 }
 
 pub(crate) fn resolve_global_session(
@@ -1513,6 +1608,27 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_parent_preserves_child_lineage_and_promotes_it_to_a_root() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let parent = store.create("model".into()).unwrap();
+        let mut child = store.create("model".into()).unwrap();
+        child.parent_session_id = Some(parent.id);
+        store.save(&parent).unwrap();
+        store.save(&child).unwrap();
+
+        store.delete(&parent.id.to_string()).unwrap();
+
+        let persisted_child = store.load(Some(&child.id.to_string())).unwrap();
+        assert_eq!(persisted_child.parent_session_id, Some(parent.id));
+        let registry = SessionRegistry::at(root.path().join("config.toml"));
+        let projects = list_session_projects(root.path(), &registry).unwrap();
+        assert_eq!(projects[0].sessions.len(), 1);
+        assert_eq!(projects[0].sessions[0].id, child.id);
+        assert_eq!(projects[0].sessions[0].depth, 0);
+    }
+
+    #[test]
     fn goals_are_persisted_with_only_one_active_at_a_time() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
@@ -1585,5 +1701,84 @@ mod tests {
             resolve_global_session(&projects, Some(&other_session.id.to_string()[..8])).unwrap();
         assert!(paths_equal(&root, &other));
         assert_eq!(id, other_session.id);
+    }
+
+    #[test]
+    fn session_hierarchy_is_recursive_ordered_and_cycle_safe() {
+        fn summary(id: u128, parent: Option<u128>, created_at: i64) -> SessionSummary {
+            SessionSummary {
+                id: Uuid::from_u128(id),
+                parent_session_id: parent.map(Uuid::from_u128),
+                created_at: DateTime::from_timestamp(created_at, 0).unwrap(),
+                updated_at: DateTime::from_timestamp(created_at, 0).unwrap(),
+                title: format!("session-{id}"),
+                model: "model".into(),
+                depth: 99,
+                descendant_count: 99,
+            }
+        }
+
+        let mut projects = vec![
+            SessionProject {
+                root: PathBuf::from("first"),
+                sessions: vec![
+                    summary(1, None, 1),
+                    summary(2, None, 10),
+                    summary(3, Some(1), 5),
+                    summary(4, Some(3), 6),
+                    summary(5, Some(999), 9),
+                    summary(6, Some(7), 7),
+                    summary(7, Some(6), 4),
+                ],
+            },
+            SessionProject {
+                root: PathBuf::from("second"),
+                sessions: vec![summary(8, Some(1), 8)],
+            },
+        ];
+
+        arrange_session_projects(&mut projects);
+
+        assert_eq!(
+            projects[0]
+                .sessions
+                .iter()
+                .map(|session| session.id.as_u128())
+                .collect::<Vec<_>>(),
+            [2, 5, 6, 7, 1, 3, 4]
+        );
+        let by_id = projects[0]
+            .sessions
+            .iter()
+            .map(|session| (session.id.as_u128(), session))
+            .collect::<HashMap<_, _>>();
+        assert_eq!((by_id[&1].depth, by_id[&1].descendant_count), (0, 2));
+        assert_eq!((by_id[&3].depth, by_id[&3].descendant_count), (1, 1));
+        assert_eq!((by_id[&4].depth, by_id[&4].descendant_count), (2, 0));
+        assert_eq!(by_id[&5].depth, 0, "missing parents become roots");
+        assert_eq!(by_id[&6].depth, 0, "cycle members become roots");
+        assert_eq!(by_id[&7].depth, 0, "cycle members become roots");
+        assert_eq!(
+            projects[1].sessions[0].depth, 0,
+            "cross-project parents become roots"
+        );
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.sessions.len())
+                .sum::<usize>(),
+            8
+        );
+        let projection = serde_json::to_value(&projects).unwrap();
+        assert_eq!(
+            projection[0]["sessions"][0]["parent_session_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            projection[0]["sessions"][5]["parent_session_id"],
+            Uuid::from_u128(1).to_string()
+        );
+        assert_eq!(projection[0]["sessions"][5]["depth"], 1);
+        assert_eq!(projection[0]["sessions"][4]["descendant_count"], 2);
     }
 }

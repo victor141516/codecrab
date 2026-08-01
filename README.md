@@ -104,7 +104,7 @@ codecrab -C path/to/project
 
 ## Choose your interface
 
-All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists are grouped by project and ordered by creation time, newest first; activity updates do not move an existing session. The terminal picker shows creation (`C`) and last-update (`U`) times, while the denser web sidebar keeps each session to one title row. `codecrab sessions` prints `CREATED` and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
+All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists are grouped by project and arranged as trees: roots and siblings are ordered by creation time, newest first, while children stay beneath their parent. Activity updates do not move an existing session. The terminal picker shows creation (`C`) and last-update (`U`) times, while the denser web sidebar keeps each session to one title row. `codecrab sessions` prints `PARENT`, `CREATED`, and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
 
 ### Interactive terminal
 
@@ -192,7 +192,9 @@ codecrab resume
 codecrab resume <session-id-or-prefix>
 ```
 
-The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. The web composer keeps model, reasoning, and speed selection beside its attachment, dictation, and send actions. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
+The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact `child of` hint. Deleting a parent does not delete or rewrite its descendants.
+
+The web composer keeps model, reasoning, and speed selection beside its attachment, dictation, and send actions. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
 
 Web session URLs use `/sessions/<id>`, so a clean reload or shared URL resolves the correct registered project without relying on browser storage. Unsent composer drafts remain browser-local and isolated by project and session.
 
@@ -243,7 +245,9 @@ Use `/goals` to pause, resume, edit, inspect, or delete historical goals. Normal
 
 ### Agent delegation
 
-When you explicitly request another agent, parallel work, delegation, or independent validation, CodeCrab can start persistent child sessions. Each child has isolated model context, tools, skills, goals, activity, and project instructions; it does not inherit the parent's transcript.
+When you explicitly request another agent, parallel work, delegation, or independent validation, CodeCrab can start persistent sessions through the `session_create` model tool. Agent-created sessions are children by default: CodeCrab persists the calling session as `parent_session_id` even when the model omits the relationship argument. `relationship: "independent"` creates a project-level root with no parent and is reserved for an explicit request for a separate, detached, non-child, or user-like session.
+
+Each child has isolated model context, tools, skills, goals, activity, and project instructions; it does not inherit or summarize the parent's transcript. Its runtime context contains only minimal lineage metadata identifying the parent session. That lineage does not imply a sandbox, worktree, permission boundary, or ownership restriction.
 
 Children appear immediately in the terminal session picker and web sidebar. You can open a child while it runs to see streamed messages and tool activity while the parent continues updating independently. The parent can inspect status or messages, send follow-ups, wait efficiently, or stop exactly one child turn.
 

@@ -118,6 +118,7 @@ struct ModelPicker {
 struct SessionPicker {
     projects: Vec<SessionProjectView>,
     selected: usize,
+    collapsed_sessions: HashSet<Uuid>,
 }
 
 struct GoalPicker {
@@ -147,7 +148,7 @@ struct SessionProjectView {
     expanded: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionPickerRow {
     Project(usize),
     Session(usize, usize),
@@ -670,11 +671,20 @@ impl SessionPicker {
         for (project_index, project) in self.projects.iter().enumerate() {
             rows.push(SessionPickerRow::Project(project_index));
             if project.expanded {
-                rows.extend(
-                    (0..project.project.sessions.len()).map(|session_index| {
-                        SessionPickerRow::Session(project_index, session_index)
-                    }),
-                );
+                let mut hidden_below_depth = None;
+                for (session_index, session) in project.project.sessions.iter().enumerate() {
+                    if let Some(depth) = hidden_below_depth {
+                        if session.depth > depth {
+                            continue;
+                        }
+                        hidden_below_depth = None;
+                    }
+                    rows.push(SessionPickerRow::Session(project_index, session_index));
+                    if session.descendant_count > 0 && self.collapsed_sessions.contains(&session.id)
+                    {
+                        hidden_below_depth = Some(session.depth);
+                    }
+                }
             }
         }
         rows
@@ -688,6 +698,19 @@ impl SessionPicker {
         if let Some(index) = self.rows().iter().position(
             |row| matches!(row, SessionPickerRow::Project(index) if *index == project_index),
         ) {
+            self.selected = index;
+        }
+    }
+
+    fn select_session(&mut self, project_index: usize, session_id: Uuid) {
+        if let Some(index) = self.rows().iter().position(|row| {
+            matches!(
+                row,
+                SessionPickerRow::Session(project, session)
+                    if *project == project_index
+                        && self.projects[*project].project.sessions[*session].id == session_id
+            )
+        }) {
             self.selected = index;
         }
     }
@@ -2181,6 +2204,7 @@ impl App {
         let mut picker = SessionPicker {
             projects,
             selected: 0,
+            collapsed_sessions: HashSet::new(),
         };
         if let Some(selected) = picker.rows().iter().position(|row| {
             matches!(
@@ -2215,7 +2239,22 @@ impl App {
             return;
         };
         match picker.selected_row() {
-            Some(SessionPickerRow::Session(project, _)) => picker.select_project(project),
+            Some(SessionPickerRow::Session(project, session_index)) => {
+                let session = &picker.projects[project].project.sessions[session_index];
+                let id = session.id;
+                let parent = session.parent_session_id;
+                let depth = session.depth;
+                if session.descendant_count > 0 && !picker.collapsed_sessions.contains(&id) {
+                    picker.collapsed_sessions.insert(id);
+                    picker.select_session(project, id);
+                } else if depth > 0 {
+                    if let Some(parent) = parent {
+                        picker.select_session(project, parent);
+                    }
+                } else {
+                    picker.select_project(project);
+                }
+            }
             Some(SessionPickerRow::Project(project)) if picker.projects[project].expanded => {
                 picker.projects[project].expanded = false;
                 picker.select_project(project);
@@ -2228,11 +2267,18 @@ impl App {
         let Some(picker) = &mut self.session_picker else {
             return;
         };
-        if let Some(SessionPickerRow::Project(project)) = picker.selected_row()
-            && !picker.projects[project].expanded
-        {
-            picker.projects[project].expanded = true;
-            picker.select_project(project);
+        match picker.selected_row() {
+            Some(SessionPickerRow::Project(project)) if !picker.projects[project].expanded => {
+                picker.projects[project].expanded = true;
+                picker.select_project(project);
+            }
+            Some(SessionPickerRow::Session(project, session_index)) => {
+                let id = picker.projects[project].project.sessions[session_index].id;
+                if picker.collapsed_sessions.remove(&id) {
+                    picker.select_session(project, id);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2410,6 +2456,11 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let collapsed_sessions = self
+            .session_picker
+            .as_ref()
+            .map(|picker| picker.collapsed_sessions.clone())
+            .unwrap_or_default();
         let mut picker = SessionPicker {
             projects: projects
                 .into_iter()
@@ -2419,6 +2470,7 @@ impl App {
                 })
                 .collect(),
             selected: 0,
+            collapsed_sessions,
         };
         picker.selected = selected.min(picker.rows().len().saturating_sub(1));
         self.session_picker = Some(picker);
@@ -5158,6 +5210,7 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
             }
             SessionPickerRow::Session(project_index, session_index) => {
                 let session = &picker.projects[project_index].project.sessions[session_index];
+                let collapsed = picker.collapsed_sessions.contains(&session.id);
                 let active = Some(session.id) == current_id
                     && paths_equal(
                         &picker.projects[project_index].project.root,
@@ -5178,8 +5231,19 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 };
                 Line::from(vec![
                     Span::styled(
-                        if selected { " ›     " } else { "       " },
+                        if selected { " › " } else { "   " },
                         Style::default().fg(AQUA),
+                    ),
+                    Span::raw("  ".repeat(session.depth)),
+                    Span::styled(
+                        if session.descendant_count == 0 {
+                            "  "
+                        } else if collapsed {
+                            "▸ "
+                        } else {
+                            "▾ "
+                        },
+                        Style::default().fg(CRAB),
                     ),
                     Span::styled(if active { "● " } else { "  " }, Style::default().fg(AQUA)),
                     Span::styled(
@@ -5187,6 +5251,20 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         Style::default()
                             .fg(if selected { Color::White } else { AQUA })
                             .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if collapsed {
+                            format!(" +{} ", session.descendant_count)
+                        } else if session.depth == 0 {
+                            session
+                                .parent_session_id
+                                .map_or_else(String::new, |parent| {
+                                    format!(" child of {} ", &parent.to_string()[..8])
+                                })
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(CRAB),
                     ),
                     Span::styled(
                         format!(
@@ -5655,16 +5733,22 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
         }
         println!("\n{}", project.root.display());
         println!(
-            "  {:<10}  {:<20}  {:<20}  {:<18}  TITLE",
-            "ID", "CREATED", "UPDATED", "MODEL"
+            "  {:<10}  {:<10}  {:<20}  {:<20}  {:<18}  TITLE",
+            "ID", "PARENT", "CREATED", "UPDATED", "MODEL"
         );
         for session in &project.sessions {
+            let parent = session
+                .parent_session_id
+                .map(|id| id.to_string()[..8].to_owned())
+                .unwrap_or_else(|| "-".into());
             println!(
-                "  {:<10}  {:<20}  {:<20}  {:<18}  {}",
+                "  {:<10}  {:<10}  {:<20}  {:<20}  {:<18}  {}{}",
                 &session.id.to_string()[..8],
+                parent,
                 session.created_at.format("%Y-%m-%d %H:%M"),
                 session.updated_at.format("%Y-%m-%d %H:%M"),
                 session.model,
+                "  ".repeat(session.depth),
                 session.title
             );
         }
@@ -8003,6 +8087,14 @@ mod tests {
             .messages
             .push(Message::text(Role::User, "Remember this"));
         other_store.save(&saved).unwrap();
+        let mut child = other_store.create("restored-model".into()).unwrap();
+        child.parent_session_id = Some(saved.id);
+        child.title = "Child session".into();
+        other_store.save(&child).unwrap();
+        let mut grandchild = other_store.create("restored-model".into()).unwrap();
+        grandchild.parent_session_id = Some(child.id);
+        grandchild.title = "Grandchild session".into();
+        other_store.save(&grandchild).unwrap();
         registry.register(&other_root).unwrap();
 
         app.open_session_picker().await.unwrap();
@@ -8033,6 +8125,38 @@ mod tests {
             app.session_picker.as_ref().unwrap().selected_row(),
             Some(SessionPickerRow::Session(1, _))
         ));
+        let picker = app.session_picker.as_ref().unwrap();
+        let selected = picker.selected_row().unwrap();
+        let SessionPickerRow::Session(_, selected_index) = selected else {
+            unreachable!();
+        };
+        assert_eq!(
+            picker.projects[1].project.sessions[selected_index].id,
+            saved.id
+        );
+        assert_eq!(
+            picker.projects[1].project.sessions[selected_index].descendant_count,
+            2
+        );
+
+        app.move_session_left();
+        assert!(
+            app.session_picker
+                .as_ref()
+                .unwrap()
+                .collapsed_sessions
+                .contains(&saved.id)
+        );
+        assert_eq!(
+            app.session_picker
+                .as_ref()
+                .unwrap()
+                .rows()
+                .iter()
+                .filter(|row| matches!(row, SessionPickerRow::Session(1, _)))
+                .count(),
+            1
+        );
 
         let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -8046,9 +8170,47 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("other-project"));
         assert!(text.contains("Saved conversation"));
+        assert!(text.contains("+2"));
         assert!(text.contains(" C "));
         assert!(text.contains(" U "));
         assert!(text.contains("Del delete"));
+
+        let compact_backend = TestBackend::new(58, 18);
+        let mut compact_terminal = Terminal::new(compact_backend).unwrap();
+        compact_terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let compact_text = compact_terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(compact_text.contains("Saved conversation"));
+        assert!(compact_text.contains("+2"));
+
+        app.move_session_right();
+        app.move_session_selection(1);
+        assert!(matches!(
+            app.session_picker.as_ref().unwrap().selected_row(),
+            Some(SessionPickerRow::Session(1, session))
+                if app.session_picker.as_ref().unwrap().projects[1].project.sessions[session].id == child.id
+        ));
+        app.move_session_left();
+        assert!(
+            app.session_picker
+                .as_ref()
+                .unwrap()
+                .collapsed_sessions
+                .contains(&child.id)
+        );
+        app.move_session_left();
+        assert!(matches!(
+            app.session_picker.as_ref().unwrap().selected_row(),
+            Some(SessionPickerRow::Session(1, session))
+                if app.session_picker.as_ref().unwrap().projects[1].project.sessions[session].id == saved.id
+        ));
 
         app.accept_session_selection().await.unwrap();
         assert!(paths_equal(&app.project_root, &other_root));

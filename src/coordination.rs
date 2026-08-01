@@ -138,13 +138,21 @@ impl SessionCoordinator {
         self.install(agent)
     }
 
-    async fn create_child(
+    async fn create_session_from_tool(
         &self,
         caller_session_id: Uuid,
         caller_root: &Path,
         args: &Value,
     ) -> Result<Value> {
         let prompt = required_nonempty(args, "prompt")?;
+        let relationship = match args.get("relationship") {
+            None => "child",
+            Some(Value::String(value)) if value == "child" => "child",
+            Some(Value::String(value)) if value == "independent" => "independent",
+            Some(other) => anyhow::bail!(
+                "invalid session relationship {other}; expected \"child\" or \"independent\""
+            ),
+        };
         let root = match args.get("project").and_then(Value::as_str) {
             Some(project) => {
                 let root = normalized_root(&caller_root.join(project));
@@ -156,8 +164,9 @@ impl SessionCoordinator {
             None => normalized_root(caller_root),
         };
         let mut session = self.create_session(&root)?;
-        session.parent_session_id = Some(caller_session_id);
+        session.parent_session_id = (relationship == "child").then_some(caller_session_id);
         let session_id = session.id;
+        let parent_session_id = session.parent_session_id;
         let agent = self.build_agent(&root, session)?;
         SessionStore::new(&root)?.save(agent.session())?;
         self.inner.registry.register(&root)?;
@@ -166,6 +175,8 @@ impl SessionCoordinator {
         let observation = handle.observation();
         Ok(json!({
             "session_id": session_id,
+            "relationship": relationship,
+            "parent_session_id": parent_session_id,
             "project_root": root,
             "lifecycle": observation.lifecycle,
             "observation_revision": observation.revision,
@@ -228,6 +239,8 @@ impl SessionCoordinator {
                     "title": title,
                     "project_root": project.root,
                     "parent_session_id": session.parent_session_id,
+                    "depth": summary.depth,
+                    "descendant_count": summary.descendant_count,
                     "live": live.is_some(),
                     "lifecycle": lifecycle,
                     "observation_revision": revision,
@@ -399,12 +412,18 @@ impl SessionControl {
         vec![
             tool(
                 "session_create",
-                "Create a fresh persistent CodeCrab session with an isolated context and start its first turn asynchronously.",
+                "Create a fresh persistent CodeCrab session with an isolated context and start its first turn asynchronously. Normal agent-created sessions must use the default child relationship. Use independent only when the user explicitly asks for a separate, detached, non-child, or user-like session.",
                 json!({
                     "type": "object",
                     "properties": {
                         "prompt": {"type": "string"},
-                        "project": {"type": "string", "description": "Existing project directory; defaults to the caller's project"}
+                        "project": {"type": "string", "description": "Existing project directory; defaults to the caller's project"},
+                        "relationship": {
+                            "type": "string",
+                            "enum": ["child", "independent"],
+                            "default": "child",
+                            "description": "child links to the calling session and is the default. independent has no parent and may be used only when the user explicitly requests a detached or user-like session."
+                        }
                     },
                     "required": ["prompt"]
                 }),
@@ -507,7 +526,11 @@ impl SessionControl {
         match name {
             "session_create" => {
                 coordinator
-                    .create_child(self.caller_session_id, &self.caller_project_root, args)
+                    .create_session_from_tool(
+                        self.caller_session_id,
+                        &self.caller_project_root,
+                        args,
+                    )
                     .await
             }
             "session_list" => {
@@ -774,6 +797,21 @@ mod tests {
                 "session_wait",
             ]
         );
+        let create = &definitions[0]["function"];
+        assert_eq!(
+            create["parameters"]["properties"]["relationship"]["enum"],
+            json!(["child", "independent"])
+        );
+        assert_eq!(
+            create["parameters"]["properties"]["relationship"]["default"],
+            "child"
+        );
+        assert!(
+            create["description"]
+                .as_str()
+                .unwrap()
+                .contains("only when the user explicitly asks")
+        );
     }
 
     #[tokio::test]
@@ -830,10 +868,12 @@ mod tests {
         let mut live_events = coordinator.manager().subscribe_live();
         let caller = Uuid::new_v4();
         let created = coordinator
-            .create_child(caller, &root, &json!({"prompt": "isolated task"}))
+            .create_session_from_tool(caller, &root, &json!({"prompt": "isolated task"}))
             .await
             .unwrap();
         let child = Uuid::parse_str(created["session_id"].as_str().unwrap()).unwrap();
+        assert_eq!(created["relationship"], "child");
+        assert_eq!(created["parent_session_id"], caller.to_string());
 
         if tokio::time::timeout(Duration::from_secs(2), first_delta.notified())
             .await
@@ -986,5 +1026,52 @@ mod tests {
 
         coordinator.manager().shutdown_all().await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_independent_creation_has_no_parent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            crate::test_support::read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n",
+                )
+                .await
+                .unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let (coordinator, _) = test_coordinator(&root, config);
+        let caller = Uuid::new_v4();
+
+        let created = coordinator
+            .create_session_from_tool(
+                caller,
+                &root,
+                &json!({"prompt": "detached task", "relationship": "independent"}),
+            )
+            .await
+            .unwrap();
+        let id = Uuid::parse_str(created["session_id"].as_str().unwrap()).unwrap();
+        assert_eq!(created["relationship"], "independent");
+        assert_eq!(created["parent_session_id"], Value::Null);
+        assert_eq!(
+            SessionStore::new(&root)
+                .unwrap()
+                .load(Some(&id.to_string()))
+                .unwrap()
+                .parent_session_id,
+            None
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator.manager().shutdown_all().await.unwrap();
     }
 }
