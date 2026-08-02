@@ -310,6 +310,36 @@ fn activity_labels(tool: &str) -> (ActivityKind, &'static str, &'static str, &'s
             "Observed session change",
             "Failed while waiting for sessions",
         ),
+        "cron_list" | "cron_preview" => (
+            ActivityKind::Read,
+            "Inspecting scheduled tasks",
+            "Inspected scheduled tasks",
+            "Failed to inspect scheduled tasks",
+        ),
+        "cron_schedule" => (
+            ActivityKind::Other,
+            "Scheduling or waiting for agent task",
+            "Scheduled agent task",
+            "Failed to schedule agent task",
+        ),
+        "cron_delete" => (
+            ActivityKind::Write,
+            "Deleting scheduled task",
+            "Deleted scheduled task",
+            "Failed to delete scheduled task",
+        ),
+        "cron_set_enabled" => (
+            ActivityKind::Write,
+            "Updating scheduled task",
+            "Updated scheduled task",
+            "Failed to update scheduled task",
+        ),
+        "cron_run" => (
+            ActivityKind::Other,
+            "Queueing scheduled task",
+            "Queued scheduled task",
+            "Failed to queue scheduled task",
+        ),
         _ => (
             ActivityKind::Other,
             "Using tool",
@@ -356,6 +386,27 @@ fn activity_detail(tool: &str, arguments: &str) -> String {
             .and_then(Value::as_array)
             .map(|targets| format!("{} session(s)", targets.len()))
             .unwrap_or_else(|| tool.to_owned()),
+        "cron_schedule" => {
+            let mode = crate::cron::CronStore::default()
+                .and_then(|store| store.daemon_status())
+                .map_or(
+                    "scheduler status unavailable".to_owned(),
+                    |status| match status {
+                        crate::cron::CronDaemonStatus::Running => {
+                            "persistent daemon execution".to_owned()
+                        }
+                        crate::cron::CronDaemonStatus::Stopped => {
+                            "daemon stopped; waiting in this turn (closing or stopping cancels)"
+                                .to_owned()
+                        }
+                    },
+                );
+            format!("{} · {mode}", string_arg(&arguments, "id").unwrap_or(tool))
+        }
+        "cron_preview" | "cron_delete" | "cron_set_enabled" | "cron_run" => {
+            string_arg(&arguments, "id").unwrap_or(tool).to_owned()
+        }
+        "cron_list" => "default cron.json".into(),
         _ => ["path", "name", "query", "command"]
             .into_iter()
             .find_map(|key| string_arg(&arguments, key))

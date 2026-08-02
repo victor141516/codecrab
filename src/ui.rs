@@ -50,6 +50,7 @@ use crate::{
         ConversationTurn,
     },
     coordination::SessionCoordinator,
+    cron::{CronDaemonStatus, CronJob, CronStore},
     diagnostics::{DebugOutput, DiagnosticLog},
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{AttachmentBinding, Message, MessagePart, ModelCatalogEntry, ModelSelection, Role},
@@ -3064,6 +3065,12 @@ impl App {
             self.close_completion();
             return self.provider_command(&prompt);
         }
+        if prompt == "/cron" || prompt.starts_with("/cron ") {
+            self.clear_composer_text();
+            self.preferred_column = None;
+            self.close_completion();
+            return self.cron_command(&prompt).await;
+        }
         if self.is_running() {
             self.clear_composer_text();
             self.preferred_column = None;
@@ -3242,6 +3249,120 @@ impl App {
             _ => {
                 self.error = Some(
                     "Usage: /providers | /provider use NAME | /provider remove NAME | /provider add NAME BASE_URL MODEL AUTH API_KEY"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn cron_command(&mut self, command: &str) -> Result<()> {
+        if self.is_running() {
+            self.error = Some("Wait for the active turn before managing scheduled tasks.".into());
+            return Ok(());
+        }
+        let store = CronStore::default()?;
+        let (verb, rest) = command
+            .strip_prefix("/cron")
+            .unwrap_or_default()
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(verb, rest)| (verb, rest.trim()))
+            .unwrap_or_else(|| {
+                let verb = command.strip_prefix("/cron").unwrap_or_default().trim();
+                (verb, "")
+            });
+        match verb {
+            "" | "list" => {
+                let snapshot = store.snapshot(chrono::Utc::now())?;
+                let mut lines = vec![format!(
+                    "Cron {} · {}",
+                    match snapshot.daemon {
+                        CronDaemonStatus::Running => "running",
+                        CronDaemonStatus::Stopped => "stopped",
+                    },
+                    snapshot.path.display()
+                )];
+                for job in snapshot.jobs {
+                    let status = job
+                        .state
+                        .occurrences
+                        .last()
+                        .map(|run| format!("{:?}", run.status).to_ascii_lowercase())
+                        .unwrap_or_else(|| "never run".into());
+                    let next = job
+                        .next_occurrences
+                        .first()
+                        .map(chrono::DateTime::to_rfc3339)
+                        .unwrap_or_else(|| "none".into());
+                    lines.push(format!(
+                        "{}{} · {} · next {} · {}",
+                        if job.job.enabled { "" } else { "[paused] " },
+                        job.id,
+                        job.description,
+                        next,
+                        status
+                    ));
+                }
+                lines.push(
+                    "Commands: /cron show ID | run ID | pause ID | resume ID | delete ID | upsert ID {JSON} | timezone IANA_ZONE"
+                        .into(),
+                );
+                self.error = Some(lines.join("\n"));
+            }
+            "show" => {
+                let snapshot = store.snapshot(chrono::Utc::now())?;
+                let job = snapshot
+                    .jobs
+                    .into_iter()
+                    .find(|job| job.id == rest)
+                    .with_context(|| format!("cron job {rest:?} does not exist"))?;
+                self.error = Some(serde_json::to_string_pretty(&job)?);
+            }
+            "run" => {
+                store.run_now(rest, self.coordinator.clone()).await?;
+                self.error = Some(format!("Cron job {rest:?} queued to run now."));
+            }
+            "pause" => {
+                store.set_enabled(rest, false).await?;
+                self.error = Some(format!("Cron job {rest:?} paused."));
+            }
+            "resume" => {
+                store.set_enabled(rest, true).await?;
+                self.error = Some(format!("Cron job {rest:?} resumed."));
+            }
+            "delete" => {
+                if !store.delete(rest).await? {
+                    anyhow::bail!("cron job {rest:?} does not exist");
+                }
+                self.error = Some(format!("Cron job {rest:?} deleted."));
+            }
+            "install" => {
+                let view = store.install()?;
+                self.error = Some(format!("Cron autostart: {:?}.", view.status));
+            }
+            "uninstall" => {
+                let view = store.uninstall()?;
+                self.error = Some(format!("Cron autostart: {:?}.", view.status));
+            }
+            "timezone" => {
+                let mut document = store.load_or_create()?;
+                document.timezone = rest.to_owned();
+                store.save_document(&document).await?;
+                self.error = Some(format!("Cron default timezone changed to {rest:?}."));
+            }
+            "upsert" => {
+                let (id, json) = rest
+                    .split_once(char::is_whitespace)
+                    .context("usage: /cron upsert ID {JSON}")?;
+                let job: CronJob =
+                    serde_json::from_str(json.trim()).context("the cron job is not valid JSON")?;
+                store.upsert(id, job).await?;
+                self.error = Some(format!("Cron job {id:?} saved."));
+            }
+            _ => {
+                self.error = Some(
+                    "Usage: /cron [list|show ID|run ID|pause ID|resume ID|delete ID|upsert ID {JSON}|timezone IANA_ZONE|install|uninstall]"
                         .into(),
                 );
             }
@@ -4952,6 +5073,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
         )),
         Line::from("  /branches  browse conversation branches"),
+        Line::from("  /cron      manage scheduled agent tasks"),
         Line::from("  /goal ...  start a persistent goal"),
         Line::from("  /goals     manage persistent goals"),
         Line::from("  /model     choose model, thinking, and speed"),
@@ -5229,6 +5351,11 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Some(ConversationLifecycle::Idle) => "idle",
                     _ => "",
                 };
+                let session_title = if session.scheduled_run.is_some() {
+                    format!("[cron] {}", session.title)
+                } else {
+                    session.title.clone()
+                };
                 Line::from(vec![
                     Span::styled(
                         if selected { " › " } else { "   " },
@@ -5247,7 +5374,7 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ),
                     Span::styled(if active { "● " } else { "  " }, Style::default().fg(AQUA)),
                     Span::styled(
-                        format!("{:<20}", compact_text(&session.title, 19)),
+                        format!("{:<20}", compact_text(&session_title, 19)),
                         Style::default()
                             .fg(if selected { Color::White } else { AQUA })
                             .add_modifier(Modifier::BOLD),
@@ -5749,7 +5876,11 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
                 session.updated_at.format("%Y-%m-%d %H:%M"),
                 session.model,
                 "  ".repeat(session.depth),
-                session.title
+                if session.scheduled_run.is_some() {
+                    format!("[cron] {}", session.title)
+                } else {
+                    session.title.clone()
+                }
             );
         }
     }

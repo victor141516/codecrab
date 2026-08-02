@@ -51,6 +51,7 @@ use crate::{
         ConversationManager, ConversationObservation, ConversationStatus,
     },
     coordination::SessionCoordinator,
+    cron::{CronDocument, CronJob, CronSnapshot, CronStore},
     diagnostics::{DebugOutput, DiagnosticLog},
     events::{AgentActivity, AgentEvent},
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
@@ -104,6 +105,7 @@ struct ServerInner {
     workspace: Mutex<ServerWorkspace>,
     conversations: ConversationManager,
     catalogs: RwLock<HashMap<Uuid, CatalogState>>,
+    cron: CronStore,
 }
 
 struct ServerWorkspace {
@@ -130,6 +132,9 @@ struct StateResponse {
     dictation_available: bool,
     providers: Vec<ProviderSummary>,
     workers: Vec<ConversationStatus>,
+    cron: Option<CronSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cron_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -319,6 +324,23 @@ struct GoalRequest {
 }
 
 #[derive(Deserialize)]
+struct CronJobRequest {
+    id: String,
+    job: CronJob,
+}
+
+#[derive(Deserialize)]
+struct CronJobIdRequest {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct CronEnabledRequest {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
 struct ProviderRequest {
     name: String,
     model: Option<String>,
@@ -418,14 +440,14 @@ enum SessionStreamMessage {
     },
     Session {
         revision: u64,
-        session: SessionLiveView,
+        session: Box<SessionLiveView>,
     },
     Event {
         revision: u64,
         session_id: Uuid,
         project_root: PathBuf,
         observation_revision: u64,
-        event: ChatStreamMessage,
+        event: Box<ChatStreamMessage>,
     },
 }
 
@@ -484,6 +506,7 @@ pub(crate) async fn serve(
                     error: catalog_error,
                 },
             )])),
+            cron: CronStore::default()?,
         }),
     };
     let app = server_app(state.clone());
@@ -561,6 +584,13 @@ fn server_app(state: ServerState) -> Router {
                 .route("/goals/activate", post(activate_goal))
                 .route("/goals/pause", post(pause_goal))
                 .route("/goals/delete", post(delete_goal))
+                .route("/cron", get(get_cron).put(replace_cron))
+                .route("/cron/jobs", post(upsert_cron_job))
+                .route("/cron/jobs/delete", post(delete_cron_job))
+                .route("/cron/jobs/enabled", put(set_cron_job_enabled))
+                .route("/cron/jobs/run", post(run_cron_job))
+                .route("/cron/install", post(install_cron))
+                .route("/cron/uninstall", post(uninstall_cron))
                 .fallback(api_not_found),
         )
         .fallback(index)
@@ -769,6 +799,7 @@ fn live_session_projects(
         let summary = SessionSummary {
             id: session.id,
             parent_session_id: session.parent_session_id,
+            scheduled_run: session.scheduled_run.clone(),
             created_at: session.created_at,
             updated_at: live.observation.latest_event_at,
             title: live.observation.title,
@@ -857,6 +888,10 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         .unwrap_or(false)
     });
     let providers = config.summaries();
+    let (cron, cron_error) = match state.inner.cron.snapshot(chrono::Utc::now()) {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     Ok(StateResponse {
         live_revision,
         project,
@@ -878,6 +913,8 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         dictation_available,
         providers,
         workers: state.inner.conversations.statuses(),
+        cron,
+        cron_error,
     })
 }
 
@@ -900,6 +937,76 @@ async fn get_state(
         conversation.persist_if_idle().await?;
     }
     Ok(Json(snapshot_for(&state, request.session_id).await?))
+}
+
+async fn get_cron(State(state): State<ServerState>) -> ApiResult<CronSnapshot> {
+    Ok(Json(state.inner.cron.snapshot(chrono::Utc::now())?))
+}
+
+async fn replace_cron(
+    State(state): State<ServerState>,
+    Json(document): Json<CronDocument>,
+) -> ApiResult<CronSnapshot> {
+    state.inner.cron.save_document(&document).await?;
+    Ok(Json(state.inner.cron.snapshot(chrono::Utc::now())?))
+}
+
+async fn upsert_cron_job(
+    State(state): State<ServerState>,
+    Json(request): Json<CronJobRequest>,
+) -> ApiResult<CronSnapshot> {
+    Ok(Json(
+        state.inner.cron.upsert(&request.id, request.job).await?,
+    ))
+}
+
+async fn delete_cron_job(
+    State(state): State<ServerState>,
+    Json(request): Json<CronJobIdRequest>,
+) -> ApiResult<CronSnapshot> {
+    if !state.inner.cron.delete(&request.id).await? {
+        return Err(ApiError::message(
+            StatusCode::NOT_FOUND,
+            "cron job does not exist",
+        ));
+    }
+    Ok(Json(state.inner.cron.snapshot(chrono::Utc::now())?))
+}
+
+async fn set_cron_job_enabled(
+    State(state): State<ServerState>,
+    Json(request): Json<CronEnabledRequest>,
+) -> ApiResult<CronSnapshot> {
+    Ok(Json(
+        state
+            .inner
+            .cron
+            .set_enabled(&request.id, request.enabled)
+            .await?,
+    ))
+}
+
+async fn run_cron_job(
+    State(state): State<ServerState>,
+    Json(request): Json<CronJobIdRequest>,
+) -> ApiResult<CronSnapshot> {
+    Ok(Json(
+        state
+            .inner
+            .cron
+            .run_now(&request.id, state.inner.coordinator.clone())
+            .await?,
+    ))
+}
+
+async fn install_cron(State(state): State<ServerState>) -> ApiResult<CronSnapshot> {
+    state.inner.cron.install()?;
+    Ok(Json(state.inner.cron.snapshot(chrono::Utc::now())?))
+}
+
+async fn uninstall_cron(State(state): State<ServerState>) -> ApiResult<CronSnapshot> {
+    state.inner.cron.uninstall()?;
+    Ok(Json(state.inner.cron.snapshot(chrono::Utc::now())?))
 }
 
 async fn completions(
@@ -1331,7 +1438,7 @@ async fn session_stream(State(state): State<ServerState>) -> Response {
                         session_id: envelope.session_id,
                         project_root: envelope.project_root,
                         observation_revision: envelope.observation_revision,
-                        event: chat_stream_event(event),
+                        event: Box::new(chat_stream_event(event)),
                     };
                     if !send_ndjson(&output_tx, &message).await {
                         break;
@@ -1343,7 +1450,7 @@ async fn session_stream(State(state): State<ServerState>) -> Response {
                     };
                     let message = SessionStreamMessage::Session {
                         revision: envelope.revision,
-                        session: handle.live_state().into(),
+                        session: Box::new(handle.live_state().into()),
                     };
                     if !send_ndjson(&output_tx, &message).await {
                         break;
@@ -1362,7 +1469,7 @@ async fn session_stream(State(state): State<ServerState>) -> Response {
                     };
                     let message = SessionStreamMessage::Session {
                         revision: envelope.revision,
-                        session: handle.live_state().into(),
+                        session: Box::new(handle.live_state().into()),
                     };
                     if !send_ndjson(&output_tx, &message).await {
                         break;
@@ -2086,6 +2193,8 @@ async fn shutdown_signal() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use super::*;
     use crate::{
         config::paths_equal,
@@ -2252,12 +2361,16 @@ mod tests {
                 oauth_logged_in,
                 workspace_transition: Mutex::new(()),
                 workspace: Mutex::new(ServerWorkspace {
-                    root,
+                    root: root.clone(),
                     selected_session: Some(session_id),
                     conversation: Some(conversation.clone()),
                 }),
                 conversations: ConversationManager::with_handle(registry, conversation),
                 catalogs: RwLock::new(HashMap::new()),
+                cron: CronStore::at(
+                    root.join("test-cron.json"),
+                    root.join(".test-global-config").join("cron-runtime"),
+                ),
             }),
         }
     }
@@ -2267,6 +2380,88 @@ mod tests {
         assert!(INDEX_HTML.starts_with(b"<!doctype html>"));
         assert!(APP_JS.len() > 1_000);
         assert!(APP_CSS.len() > 1_000);
+    }
+
+    #[tokio::test]
+    async fn cron_api_crud_uses_the_shared_validated_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("test-model", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "test-model".into())
+            .unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+        let job = CronJob {
+            schedule: "@daily".into(),
+            enabled: true,
+            project: root,
+            prompt: "Run tests".into(),
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning: None,
+            speed: None,
+            timezone: Some("UTC".into()),
+            overlap: crate::cron::OverlapPolicy::Skip,
+            timeout_seconds: None,
+            source_session_id: None,
+        };
+
+        let created = upsert_cron_job(
+            State(state.clone()),
+            Json(CronJobRequest {
+                id: "daily-tests".into(),
+                job,
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.error))
+        .0;
+        assert_eq!(created.jobs[0].id, "daily-tests");
+
+        let paused = set_cron_job_enabled(
+            State(state.clone()),
+            Json(CronEnabledRequest {
+                id: "daily-tests".into(),
+                enabled: false,
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.error))
+        .0;
+        assert!(!paused.document.jobs["daily-tests"].enabled);
+
+        let deleted = delete_cron_job(
+            State(state),
+            Json(CronJobIdRequest {
+                id: "daily-tests".into(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.error))
+        .0;
+        assert!(deleted.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_cron_json_does_not_break_the_rest_of_web_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("test-model", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "test-model".into())
+            .unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+        fs::write(root.join("test-cron.json"), b"{invalid").unwrap();
+
+        let response = snapshot(&state).await.unwrap();
+
+        assert!(response.cron.is_none());
+        assert!(response.cron_error.unwrap().contains("not valid cron JSON"));
+        assert!(paths_equal(Path::new(&response.project), &root));
     }
 
     #[test]

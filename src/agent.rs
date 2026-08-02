@@ -1450,13 +1450,18 @@ fn tool_batch_rejections(root: &Path, calls: &[ToolCall]) -> Vec<Option<String>>
     let wait_calls = calls
         .iter()
         .enumerate()
-        .filter(|(_, call)| call.function.name == "session_wait")
+        .filter(|(_, call)| {
+            matches!(
+                call.function.name.as_str(),
+                "session_wait" | "cron_schedule"
+            )
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if !wait_calls.is_empty() && (calls.len() != 1 || wait_calls.len() != 1) {
         for rejection in &mut rejections {
             *rejection = Some(
-                "deferred because session_wait is a response barrier; request exactly one wait \
+                "deferred because this wait or scheduling operation is a response barrier; request exactly one \
                  call and no unrelated tools in the same response"
                     .into(),
             );
@@ -1591,6 +1596,7 @@ Work autonomously toward the user's request:
 - You may also group write_file and replace_in_file calls only when every call targets a different file. Never modify the same resolved path twice in one response.
 - Shell is a response barrier, as are all terminal operations: emit at most one shell, shell_noninteractive, terminal_input, terminal_read, terminal_close, or terminal_list call in a response and do not emit any other tool call with it. Wait for its result before deciding or requesting the next operation.
 - session_wait is also a response barrier: emit at most one wait call and no unrelated tool calls in the same response.
+- cron_schedule is a response barrier. Use only the cron tools for schedules, show their deterministic preview, and require the returned confirmation token after explicit approval. Persistent jobs use a self-contained prompt in a fresh session; without a daemon, one-time jobs wait in this turn.
 - Other sessions are fresh, isolated agent contexts that share this process and filesystem. Use session_create, session_list, session_status, session_messages, session_send, session_stop, and session_wait when the user or loaded project instructions explicitly request delegation, another agent/session/conversation, parallel work, or independent validation. session_create defaults to a child of the calling session; use relationship independent only when the user explicitly asks for a separate, detached, non-child, or user-like session. Do not create sessions aggressively for ordinary tasks. Put all required context in the delegated prompt because the child does not inherit this transcript. Delegate disjoint writes or coordinate them explicitly. Do not recursively fan out without user/project instructions or a concrete benefit.
 - Briefly explain the result when finished. Mention verification and any remaining limitation.
 
@@ -3267,7 +3273,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("entry.txt"), "small project entry").unwrap();
-        for index in 0..12 {
+        for index in 0..20 {
             fs::write(
                 temp.path().join(format!("project-source-{index}.rs")),
                 "fn placeholder() {}",
@@ -3299,7 +3305,7 @@ mod tests {
         )
         .unwrap();
         agent.compaction_tuning = CompactionTuning {
-            fallback_context_window_tokens: 4_250,
+            fallback_context_window_tokens: 4_600,
             safety_reserve_tokens: 100,
             minimum_output_reserve_tokens: 100,
             recent_tail_tokens: 20,
