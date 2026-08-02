@@ -13,9 +13,11 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
 cpal = "0.16"
 crossterm = "0.29"
+croner = "3"
 directories = "6"
 rand = "0.9"
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
@@ -40,6 +42,7 @@ yaml_serde = "0.10"
 unicode-width = "0.2"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+iana-time-zone = "0.1"
 kamadak-exif = "0.6"
 
 [dev-dependencies]
@@ -51,6 +54,7 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

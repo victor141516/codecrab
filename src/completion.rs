@@ -30,6 +30,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("provider", "Add, select, or remove a provider profile"),
     ("goal", "Start a persistent goal"),
     ("goals", "Browse and manage persistent goals"),
+    ("cron", "Manage scheduled agent tasks"),
     ("quit", "Save the session and exit"),
 ];
 

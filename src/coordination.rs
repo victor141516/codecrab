@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::SecondsFormat;
+use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ use crate::{
     conversation::{
         ConversationHandle, ConversationLifecycle, ConversationManager, ConversationObservation,
     },
+    cron::{CronDaemonStatus, CronJob, CronStore, OverlapPolicy, action_token, proposal_token},
     diagnostics::{DebugOutput, DiagnosticLog},
     provider::{OpenAiCompatible, Role},
     session::{Session, SessionStore, TurnOutcome, list_session_projects},
@@ -405,6 +406,141 @@ impl SessionCoordinator {
             }
         }
     }
+
+    fn cron_job(
+        &self,
+        caller_session_id: Uuid,
+        caller_root: &Path,
+        args: &Value,
+    ) -> Result<(String, CronJob)> {
+        let id = required_nonempty(args, "id")?.to_owned();
+        let (_, session) = self.locate_session(caller_session_id, caller_root)?;
+        let project = args
+            .get("project")
+            .and_then(Value::as_str)
+            .map(|project| normalized_root(&caller_root.join(project)))
+            .unwrap_or_else(|| normalized_root(caller_root));
+        if !project.is_dir() {
+            anyhow::bail!("project directory does not exist: {}", project.display());
+        }
+        let overlap = match args.get("overlap").and_then(Value::as_str) {
+            None | Some("skip") => OverlapPolicy::Skip,
+            Some("queue") => OverlapPolicy::Queue,
+            Some(other) => anyhow::bail!("invalid overlap policy {other:?}"),
+        };
+        let provider = args
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or(session.provider);
+        self.inner.config.read().unwrap().provider(&provider)?;
+        let job = CronJob {
+            schedule: required_nonempty(args, "schedule")?.to_owned(),
+            enabled: args.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            project,
+            prompt: required_nonempty(args, "prompt")?.to_owned(),
+            provider,
+            model: args
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or(session.model),
+            reasoning: args
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(session.reasoning_effort),
+            speed: args
+                .get("speed")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(session.service_tier),
+            timezone: args
+                .get("timezone")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            overlap,
+            timeout_seconds: args.get("timeout_seconds").and_then(Value::as_u64),
+            source_session_id: Some(caller_session_id),
+        };
+        let store = CronStore::default()?;
+        let timezone = store.load_or_create()?.timezone;
+        job.validate(&timezone)?;
+        Ok((id, job))
+    }
+
+    fn cron_preview(
+        &self,
+        caller_session_id: Uuid,
+        caller_root: &Path,
+        args: &Value,
+    ) -> Result<Value> {
+        let (id, job) = self.cron_job(caller_session_id, caller_root, args)?;
+        let store = CronStore::default()?;
+        let document = store.load_or_create()?;
+        let token = proposal_token(&id, &job, document.jobs.get(&id))?;
+        let preview = crate::cron::next_occurrences(
+            &job,
+            &document.timezone,
+            Utc::now(),
+            crate::cron::NEXT_OCCURRENCE_PREVIEW_COUNT,
+        )?;
+        Ok(json!({
+            "id": id,
+            "job": job,
+            "description": job.description(&document.timezone)?,
+            "next_occurrences": preview,
+            "daemon": store.daemon_status()?,
+            "confirmation_token": token,
+            "requires_user_confirmation": true,
+        }))
+    }
+
+    async fn cron_schedule(
+        &self,
+        caller_session_id: Uuid,
+        caller_root: &Path,
+        args: &Value,
+    ) -> Result<Value> {
+        let (id, job) = self.cron_job(caller_session_id, caller_root, args)?;
+        let supplied = required_nonempty(args, "confirmation_token")?;
+        let store = CronStore::default()?;
+        let document = store.load_or_create()?;
+        let expected = proposal_token(&id, &job, document.jobs.get(&id))?;
+        if supplied != expected {
+            anyhow::bail!(
+                "the schedule changed after preview; call cron_preview again and obtain explicit user confirmation"
+            );
+        }
+        match store.daemon_status()? {
+            CronDaemonStatus::Running => {
+                let snapshot = store.upsert_confirmed(&id, job, supplied).await?;
+                Ok(json!({"mode": "persistent", "snapshot": snapshot}))
+            }
+            CronDaemonStatus::Stopped => {
+                let Some(at) = job.one_time_at()? else {
+                    anyhow::bail!(
+                        "the CodeCrab cron daemon is not running; install or start it before creating recurring tasks"
+                    );
+                };
+                let remaining = at.signed_duration_since(Utc::now());
+                if remaining <= chrono::Duration::zero() {
+                    anyhow::bail!("the requested one-time execution is already in the past");
+                }
+                let duration = remaining
+                    .to_std()
+                    .context("the requested delay is too large")?;
+                tokio::time::sleep(duration).await;
+                Ok(json!({
+                    "mode": "local_wait_completed",
+                    "persistent": false,
+                    "execute_prompt_now_in_this_turn": true,
+                    "warning": "The cron daemon was not running, so CodeCrab waited inside this active turn. Closing or stopping the process would have cancelled the wait.",
+                    "prompt": job.prompt,
+                }))
+            }
+        }
+    }
 }
 
 impl SessionControl {
@@ -514,6 +650,55 @@ impl SessionControl {
                     "required": ["targets"]
                 }),
             ),
+            tool(
+                "cron_list",
+                "List the default CodeCrab schedule file, daemon status, jobs, recent executions, next five computed occurrences, and exact confirmation tokens for pause, resume, or delete proposals.",
+                json!({"type": "object", "properties": {}}),
+            ),
+            tool(
+                "cron_preview",
+                "Validate and preview a proposed recurring or one-time agent task without changing persistent state. Always call this before cron_schedule and show its description, next occurrences, prompt, project, and model to the user for explicit confirmation.",
+                cron_job_parameters(false),
+            ),
+            tool(
+                "cron_schedule",
+                "Activate the exact schedule previously returned by cron_preview, only after the user explicitly confirms it. This is a response barrier. If the daemon is stopped, a one-time @at task waits locally and then instructs you to perform its prompt in this active turn; recurring tasks fail with installation guidance.",
+                cron_job_parameters(true),
+            ),
+            tool(
+                "cron_delete",
+                "Delete a scheduled agent task only after the user explicitly confirms the deletion.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "confirmation_token": {"type": "string", "description": "Exact delete token returned by cron_list"}
+                    },
+                    "required": ["id", "confirmation_token"]
+                }),
+            ),
+            tool(
+                "cron_set_enabled",
+                "Pause or resume a scheduled agent task only after explicit user confirmation.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "confirmation_token": {"type": "string", "description": "Exact pause or resume token returned by cron_list"}
+                    },
+                    "required": ["id", "enabled", "confirmation_token"]
+                }),
+            ),
+            tool(
+                "cron_run",
+                "Start an immediate manual execution of an existing job. A running daemon accepts the request; otherwise the current CodeCrab process owns the execution until it finishes.",
+                json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"]
+                }),
+            ),
         ]
     }
 
@@ -549,9 +734,91 @@ impl SessionControl {
                     .wait(self.caller_session_id, &self.caller_project_root, args)
                     .await
             }
+            "cron_list" => {
+                let snapshot = CronStore::default()?.snapshot(Utc::now())?;
+                let confirmation_tokens = snapshot
+                    .document
+                    .jobs
+                    .iter()
+                    .map(|(id, job)| {
+                        Ok((
+                            id.clone(),
+                            json!({
+                                "delete": action_token("delete", id, job)?,
+                                "pause": action_token("enabled:false", id, job)?,
+                                "resume": action_token("enabled:true", id, job)?,
+                            }),
+                        ))
+                    })
+                    .collect::<Result<serde_json::Map<String, Value>>>()?;
+                Ok(json!({
+                    "snapshot": snapshot,
+                    "confirmation_tokens": confirmation_tokens,
+                    "requires_user_confirmation_for_mutations": true,
+                }))
+            }
+            "cron_preview" => {
+                coordinator.cron_preview(self.caller_session_id, &self.caller_project_root, args)
+            }
+            "cron_schedule" => {
+                coordinator
+                    .cron_schedule(self.caller_session_id, &self.caller_project_root, args)
+                    .await
+            }
+            "cron_delete" => {
+                let id = required_nonempty(args, "id")?;
+                let supplied = required_nonempty(args, "confirmation_token")?;
+                let store = CronStore::default()?;
+                Ok(json!({"deleted": store.delete_confirmed(id, supplied).await?}))
+            }
+            "cron_set_enabled" => {
+                let id = required_nonempty(args, "id")?;
+                let enabled = args
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .context("missing boolean argument \"enabled\"")?;
+                let supplied = required_nonempty(args, "confirmation_token")?;
+                let store = CronStore::default()?;
+                Ok(serde_json::to_value(
+                    store.set_enabled_confirmed(id, enabled, supplied).await?,
+                )?)
+            }
+            "cron_run" => {
+                let id = required_nonempty(args, "id")?;
+                let store = CronStore::default()?;
+                Ok(serde_json::to_value(
+                    store.run_now(id, coordinator.clone()).await?,
+                )?)
+            }
             _ => anyhow::bail!("unknown session control tool {name:?}"),
         }
     }
+}
+
+fn cron_job_parameters(with_confirmation: bool) -> Value {
+    let mut required = vec!["id", "schedule", "prompt"];
+    if with_confirmation {
+        required.push("confirmation_token");
+    }
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Stable ID using letters, numbers, '-' or '_'"},
+            "schedule": {"type": "string", "description": "Five-field cron, a supported @alias, or @at followed by an RFC 3339 timestamp"},
+            "prompt": {"type": "string", "description": "Self-contained prompt for the future session"},
+            "project": {"type": "string", "description": "Existing project directory; defaults to the caller's project"},
+            "provider": {"type": "string", "description": "Configured provider; defaults to the caller's provider"},
+            "model": {"type": "string", "description": "Concrete provider model; defaults to the caller's model"},
+            "reasoning": {"type": "string", "description": "Provider reasoning option; defaults to the caller's selection"},
+            "speed": {"type": "string", "description": "Provider service-tier option; defaults to the caller's selection"},
+            "timezone": {"type": "string", "description": "IANA timezone; defaults to the document timezone"},
+            "overlap": {"type": "string", "enum": ["skip", "queue"]},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "enabled": {"type": "boolean"},
+            "confirmation_token": {"type": "string", "description": "Exact token returned by cron_preview"}
+        },
+        "required": required
+    })
 }
 
 fn status_value(
@@ -795,6 +1062,12 @@ mod tests {
                 "session_send",
                 "session_stop",
                 "session_wait",
+                "cron_list",
+                "cron_preview",
+                "cron_schedule",
+                "cron_delete",
+                "cron_set_enabled",
+                "cron_run",
             ]
         );
         let create = &definitions[0]["function"];
@@ -811,6 +1084,20 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("only when the user explicitly asks")
+        );
+        let preview = &definitions[8]["function"];
+        let schedule = &definitions[9]["function"];
+        assert_eq!(
+            preview["parameters"]["required"],
+            json!(["id", "schedule", "prompt"])
+        );
+        assert_eq!(
+            schedule["parameters"]["required"],
+            json!(["id", "schedule", "prompt", "confirmation_token"])
+        );
+        assert_eq!(
+            definitions[10]["function"]["parameters"]["required"],
+            json!(["id", "confirmation_token"])
         );
     }
 

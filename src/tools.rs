@@ -219,10 +219,12 @@ impl ToolBox {
             "terminal_read" => self.terminal_read(&parsed).await,
             "terminal_close" => self.terminal_close(&parsed),
             "terminal_list" => Ok(self.terminals.list()),
-            name if name.starts_with("session_") => match &self.session_control {
-                Some(control) => control.execute(name, &parsed).await,
-                None => Err(anyhow::anyhow!("session control is unavailable")),
-            },
+            name if name.starts_with("session_") || name.starts_with("cron_") => {
+                match &self.session_control {
+                    Some(control) => control.execute(name, &parsed).await,
+                    None => Err(anyhow::anyhow!("session control is unavailable")),
+                }
+            }
             _ => Err(anyhow::anyhow!("unknown tool {name:?}")),
         };
         match result {

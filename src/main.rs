@@ -9,6 +9,7 @@ mod completion;
 mod config;
 mod conversation;
 mod coordination;
+mod cron;
 mod diagnostics;
 mod events;
 mod http_debug;
@@ -102,6 +103,26 @@ enum Command {
     Skills,
     /// Print the effective configuration (secrets are omitted).
     Config,
+    /// Run or inspect CodeCrab's persistent agent-task scheduler.
+    Cron {
+        /// Schedule JSON file. Defaults to the global CodeCrab cron.json.
+        file: Option<PathBuf>,
+        /// Validate the schedule file and print each interpreted schedule.
+        #[arg(long, conflicts_with_all = ["status", "list", "install", "uninstall"])]
+        check: bool,
+        /// Report whether a daemon currently owns this schedule file.
+        #[arg(long, conflicts_with_all = ["check", "list", "install", "uninstall"])]
+        status: bool,
+        /// Print the jobs, execution state, and next occurrences as JSON.
+        #[arg(long, conflicts_with_all = ["check", "status", "install", "uninstall"])]
+        list: bool,
+        /// Install per-user operating-system autostart for this schedule file.
+        #[arg(long, conflicts_with_all = ["check", "status", "list", "uninstall"])]
+        install: bool,
+        /// Remove CodeCrab-owned autostart artifacts for this schedule file.
+        #[arg(long, conflicts_with_all = ["check", "status", "list", "install"])]
+        uninstall: bool,
+    },
     /// Serve the embedded web application and agent API.
     Serve {
         /// Interface to listen on.
@@ -242,6 +263,47 @@ async fn main() -> Result<()> {
         Some(Command::Config) => {
             let contents = toml::to_string_pretty(&config.public_view())?;
             println!("{}", format_config_output(&Config::file_path()?, &contents));
+            return Ok(());
+        }
+        Some(Command::Cron {
+            file,
+            check,
+            status,
+            list,
+            install,
+            uninstall,
+        }) => {
+            let store = match file {
+                Some(path) => crate::cron::CronStore::new(path)?,
+                None => crate::cron::CronStore::default()?,
+            };
+            if install {
+                println!("{}", serde_json::to_string_pretty(&store.install()?)?);
+            } else if uninstall {
+                println!("{}", serde_json::to_string_pretty(&store.uninstall()?)?);
+            } else if check {
+                let snapshot = store.snapshot(chrono::Utc::now())?;
+                println!("{} is valid.", snapshot.path.display());
+                for job in snapshot.jobs {
+                    println!("{}: {}", job.id, job.description);
+                }
+            } else if status {
+                println!(
+                    "{}: {}",
+                    store.path().display(),
+                    match store.daemon_status()? {
+                        crate::cron::CronDaemonStatus::Running => "running",
+                        crate::cron::CronDaemonStatus::Stopped => "stopped",
+                    }
+                );
+            } else if list {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&store.snapshot(chrono::Utc::now())?)?
+                );
+            } else {
+                crate::cron::run_daemon(store, config, registry, debug_openai).await?;
+            }
             return Ok(());
         }
         Some(Command::Serve {
@@ -538,5 +600,24 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn cron_accepts_an_optional_file_and_exclusive_management_actions() {
+        let cli = Cli::try_parse_from(["codecrab", "cron", "team.json", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Cron {
+                file: Some(ref file),
+                check: true,
+                ..
+            }) if file == Path::new("team.json")
+        ));
+
+        let error = match Cli::try_parse_from(["codecrab", "cron", "--install", "--list"]) {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting cron actions must be rejected"),
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

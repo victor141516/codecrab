@@ -17,6 +17,7 @@ CodeCrab turns a plain-language request into real repository work: it can inspec
 - 💾 **Persistent sessions** — resume conversations with their messages, tool history, model settings, terminals, goals, and project context intact.
 - 🌿 **Conversation branches** — edit an earlier prompt, preview alternate paths, and switch branches without losing history.
 - 🎯 **Long-running goals** — give CodeCrab an objective and let it continue across turns until it verifies completion or reports a blocker.
+- 🗓️ **Scheduled agent tasks** — run recurring or delayed prompts through a persistent, hot-reloaded cron daemon, with execution history in both clients.
 - 🧩 **Agent Skills** — discover reusable `SKILL.md` workflows and invoke them explicitly with `/skill-name` or let the model select one.
 - 👥 **Agent delegation** — create isolated child sessions for parallel work or independent validation, then inspect and steer them live.
 - 📎 **Project-aware input** — shared `/command`, skill, and fuzzy `@path` autocomplete in both terminal and web clients.
@@ -218,6 +219,7 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | `/model` | Choose a provider-returned model, reasoning level, and speed |
 | `/skills` | Browse installed Agent Skills |
 | `/sessions` | Browse, resume, or delete sessions across projects |
+| `/cron` | Browse, run, pause, edit, or delete scheduled agent tasks |
 | `/branches` | Preview and select conversation branches |
 | `/providers` | List configured provider profiles |
 | `/provider` | Add, select, or remove a provider profile |
@@ -226,6 +228,59 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | `/quit` | Save and exit |
 
 A built-in command runs only when it is the entire input. Text such as `Explain /help` is sent to the agent unchanged.
+
+### Scheduled agent tasks
+
+Run a scheduler for the platform-global `cron.json` (stored beside CodeCrab's global configuration), or pass another file explicitly:
+
+```bash
+codecrab cron
+codecrab cron ./team-cron.json
+codecrab cron --check
+codecrab cron --list
+codecrab cron --status
+```
+
+The process keeps running, hot-reloads valid file changes, and pauses scheduling without discarding the last good runtime state when JSON is invalid. Only one process can own a schedule file. CodeCrab uses an operating-system file lock on a separate stable lock file because the JSON itself is replaced atomically when edited; the mere presence of that lock file never means a daemon is alive.
+
+The versioned JSON document uses job IDs as keys:
+
+```json
+{
+  "version": 1,
+  "timezone": "Europe/Madrid",
+  "jobs": {
+    "weekly-tests": {
+      "schedule": "0 3 * * 2",
+      "enabled": true,
+      "project": "/absolute/path/to/project",
+      "prompt": "Run the complete test suite, diagnose failures, and report the result.",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "reasoning": "high",
+      "speed": "fast",
+      "timezone": "Europe/Madrid",
+      "overlap": "queue",
+      "timeout_seconds": 7200
+    }
+  }
+}
+```
+
+Schedules accept standard five-field cron syntax, common aliases such as `@daily`, `@reboot` for one run when the daemon starts, and one-time RFC 3339 instants such as `@at 2026-08-03T15:00:00+02:00`. Every time-based job uses a named IANA timezone, previews its next five computed occurrences, and starts in a fresh persistent session with the captured project, provider, model, reasoning, and speed. Recurring runs never inherit context from earlier runs. `timeout_seconds` is optional and there is no total timeout by default.
+
+The terminal `/cron` command and the web calendar control expose the same definitions, next occurrences, recent execution status, last response, and full linked session. A manual **Run now** also works while the daemon is stopped as long as that CodeCrab process remains open. Missed recurring occurrences are not replayed. An overdue one-time job becomes `expired` and can be started manually. Overlap defaults to `skip`; `queue` retains only the newest pending occurrence and records the superseded occurrence as skipped.
+
+The agent can preview, create, pause, resume, delete, and run jobs. Mutating a definition requires an exact deterministic preview and explicit user confirmation. If no daemon is running, recurring creation is rejected; a one-time request waits inside the current turn and CodeCrab displays that closing or stopping the process cancels the wait.
+
+Install conservative per-user autostart, or remove every CodeCrab-owned artifact, with:
+
+```bash
+codecrab cron --install
+codecrab cron --uninstall
+```
+
+CodeCrab preflights and verifies Windows Task Scheduler, Linux `systemd --user`, or a macOS LaunchAgent. A failed installation rolls back its artifacts. Installation state is derived from the actual operating-system registration and the live lock, not stored as a configuration boolean.
 
 ### Branches
 
@@ -418,6 +473,14 @@ With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription 
 | `GET` | `/api/directories` | Browse directories on the backend host |
 | `POST` | `/api/directories` | Create a directory on the backend host |
 | `POST` | `/api/projects/open` | Open and register an existing directory |
+| `GET` | `/api/cron` | Inspect the schedule document, daemon, installation, history, and previews |
+| `PUT` | `/api/cron` | Replace the validated schedule document |
+| `POST` | `/api/cron/jobs` | Create or replace one validated job |
+| `POST` | `/api/cron/jobs/delete` | Delete one job |
+| `PUT` | `/api/cron/jobs/enabled` | Pause or resume one job |
+| `POST` | `/api/cron/jobs/run` | Run one job now |
+| `POST` | `/api/cron/install` | Install per-user scheduler autostart |
+| `POST` | `/api/cron/uninstall` | Remove CodeCrab-owned autostart artifacts |
 | `POST` | `/api/goals/create` | Create and activate a goal |
 | `PUT` | `/api/goals/edit` | Replace a goal objective |
 | `POST` | `/api/goals/activate` | Activate a saved goal |
@@ -468,6 +531,7 @@ The main implementation areas are:
 - `src/agent.rs` — model/tool loop, progress policy, goals, and instruction loading.
 - `src/compaction/` — context projection and automatic structured compaction.
 - `src/conversation.rs` — persistent Tokio workers, commands, snapshots, and cancellation.
+- `src/cron.rs` — schedule schema, previews, runtime history, daemon locking, execution, and OS autostart.
 - `src/coordination.rs` — shared agent construction and session delegation.
 - `src/provider.rs` — ChatGPT Responses and compatible Chat Completions protocols.
 - `src/attachments.rs` — session attachment storage, hashing, image processing, and model renditions.

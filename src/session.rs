@@ -403,11 +403,20 @@ pub(crate) struct RequestUsage {
     pub usage: TokenUsage,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ScheduledRun {
+    pub job_id: String,
+    pub occurrence: u64,
+    pub scheduled_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Session {
     pub id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_run: Option<ScheduledRun>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default = "default_provider")]
@@ -700,6 +709,8 @@ impl Session {
 pub(crate) struct SessionSummary {
     pub id: Uuid,
     pub parent_session_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_run: Option<ScheduledRun>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub title: String,
@@ -737,6 +748,7 @@ impl SessionStore {
         Ok(Session {
             id: Uuid::new_v4(),
             parent_session_id: None,
+            scheduled_run: None,
             created_at: now,
             updated_at: now,
             provider,
@@ -786,6 +798,7 @@ impl SessionStore {
             sessions.push(SessionSummary {
                 id: session.id,
                 parent_session_id: session.parent_session_id,
+                scheduled_run: session.scheduled_run.clone(),
                 created_at: session.created_at,
                 updated_at: session.updated_at,
                 title: session.title,
@@ -1351,6 +1364,24 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_run_lineage_is_persisted_and_exposed_in_session_lists() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        session.scheduled_run = Some(ScheduledRun {
+            job_id: "nightly".into(),
+            occurrence: 7,
+            scheduled_at: Utc::now(),
+        });
+        store.save(&session).unwrap();
+
+        let loaded = store.load(Some(&session.id.to_string())).unwrap();
+        assert_eq!(loaded.scheduled_run.as_ref().unwrap().job_id, "nightly");
+        let summary = store.list().unwrap().pop().unwrap();
+        assert_eq!(summary.scheduled_run.unwrap().occurrence, 7);
+    }
+
+    #[test]
     fn created_at_is_persisted_and_does_not_follow_updates() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
@@ -1709,6 +1740,7 @@ mod tests {
             SessionSummary {
                 id: Uuid::from_u128(id),
                 parent_session_id: parent.map(Uuid::from_u128),
+                scheduled_run: None,
                 created_at: DateTime::from_timestamp(created_at, 0).unwrap(),
                 updated_at: DateTime::from_timestamp(created_at, 0).unwrap(),
                 title: format!("session-{id}"),

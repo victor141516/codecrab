@@ -10,6 +10,7 @@ import {
 } from "vue";
 import {
   ArrowUp,
+  CalendarClock,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -125,6 +126,11 @@ const overflowingActivityKeys = ref(new Set());
 const expandedTurnKeys = ref(new Set());
 const goalsOpen = ref(false);
 const providersOpen = ref(false);
+const cronOpen = ref(false);
+const cronDraft = ref(null);
+const cronDraftId = ref("");
+const cronDraftOriginalId = ref("");
+let cronRefreshTimer = null;
 const providerDraft = ref(null);
 const describedGoal = ref(null);
 const editingGoal = ref(null);
@@ -338,6 +344,8 @@ const dictationAvailable = computed(
   () => state.value?.dictation_available ?? false
 );
 const providers = computed(() => state.value?.providers ?? []);
+const cron = computed(() => state.value?.cron ?? null);
+const cronJobs = computed(() => cron.value?.jobs ?? []);
 const goals = computed(() => session.value?.goals ?? []);
 const goalHistory = computed(() =>
   [...goals.value].sort(
@@ -641,6 +649,131 @@ async function deleteProvider(provider) {
       body: JSON.stringify({ name: provider.name })
     })
   );
+}
+
+async function refreshCron() {
+  const snapshot = await api("/api/cron");
+  if (state.value) state.value = { ...state.value, cron: snapshot };
+  return snapshot;
+}
+
+async function openCron() {
+  error.value = "";
+  try {
+    await refreshCron();
+    cronOpen.value = true;
+  } catch (cause) {
+    error.value = cause.message;
+  }
+}
+
+watch(cronOpen, (open) => {
+  if (cronRefreshTimer !== null) {
+    window.clearInterval(cronRefreshTimer);
+    cronRefreshTimer = null;
+  }
+  if (open) {
+    cronRefreshTimer = window.setInterval(() => {
+      refreshCron().catch(() => {});
+    }, 1000);
+  }
+});
+
+function editCronJob(view = null) {
+  cronDraftId.value = view?.id ?? "";
+  cronDraftOriginalId.value = view?.id ?? "";
+  cronDraft.value = view
+    ? JSON.parse(JSON.stringify(view.job))
+    : {
+        schedule: "0 9 * * *",
+        enabled: true,
+        project: state.value?.project ?? "",
+        prompt: "",
+        provider: session.value?.provider ?? state.value?.providers?.find((item) => item.active)?.name ?? "openai",
+        model: session.value?.model ?? "",
+        reasoning: session.value?.reasoning_effort ?? null,
+        speed: session.value?.service_tier ?? null,
+        timezone: cron.value?.document?.timezone ?? "UTC",
+        overlap: "skip",
+        timeout_seconds: null,
+        source_session_id: session.value?.id ?? null
+      };
+}
+
+async function saveCronJob() {
+  if (!cronDraftId.value.trim() || !cronDraft.value?.prompt?.trim()) return;
+  error.value = "";
+  try {
+    const job = JSON.parse(JSON.stringify(cronDraft.value));
+    for (const key of ["reasoning", "speed", "timezone", "source_session_id"]) {
+      if (typeof job[key] === "string" && !job[key].trim()) job[key] = null;
+    }
+    if (!job.timeout_seconds) job.timeout_seconds = null;
+    const snapshot = await api("/api/cron/jobs", {
+      method: "POST",
+      body: JSON.stringify({ id: cronDraftId.value.trim(), job })
+    });
+    state.value = { ...state.value, cron: snapshot };
+    cronDraft.value = null;
+    cronDraftOriginalId.value = "";
+  } catch (cause) {
+    error.value = cause.message;
+  }
+}
+
+async function mutateCron(path, body, method = "POST") {
+  error.value = "";
+  try {
+    const snapshot = await api(path, { method, body: JSON.stringify(body) });
+    state.value = { ...state.value, cron: snapshot };
+  } catch (cause) {
+    error.value = cause.message;
+  }
+}
+
+function toggleCronJob(view) {
+  return mutateCron("/api/cron/jobs/enabled", {
+    id: view.id,
+    enabled: !view.job.enabled
+  }, "PUT");
+}
+
+function deleteCronJob(view) {
+  if (!window.confirm(`Delete scheduled task "${view.id}"?`)) return;
+  return mutateCron("/api/cron/jobs/delete", { id: view.id });
+}
+
+function runCronJob(view) {
+  return mutateCron("/api/cron/jobs/run", { id: view.id });
+}
+
+function installCron() {
+  return mutateCron("/api/cron/install", {});
+}
+
+function uninstallCron() {
+  if (!window.confirm("Uninstall the CodeCrab cron service?")) return;
+  return mutateCron("/api/cron/uninstall", {});
+}
+
+function formatCronTime(value) {
+  return value ? new Date(value).toLocaleString() : "—";
+}
+
+async function setCronTimezone(value) {
+  const document = JSON.parse(JSON.stringify(cron.value?.document ?? {}));
+  if (!value.trim() || !document.version) return;
+  document.timezone = value.trim();
+  error.value = "";
+  try {
+    const snapshot = await api("/api/cron", {
+      method: "PUT",
+      body: JSON.stringify(document)
+    });
+    state.value = { ...state.value, cron: snapshot };
+  } catch (cause) {
+    error.value = cause.message;
+  }
 }
 
 async function loadState({ resumeGoal = false } = {}) {
@@ -2063,6 +2196,12 @@ async function sendPrompt() {
     goalsOpen.value = true;
     return;
   }
+  if (prompt === "/cron") {
+    await clearComposer();
+    closeAutocomplete();
+    await openCron();
+    return;
+  }
   if (prompt === "/branches") {
     await clearComposer();
     openBranchNavigator();
@@ -2393,6 +2532,16 @@ function handleGlobalKeydown(event) {
   if (goalsOpen.value) {
     event.preventDefault();
     goalsOpen.value = false;
+    return;
+  }
+  if (cronDraft.value) {
+    event.preventDefault();
+    cronDraft.value = null;
+    return;
+  }
+  if (cronOpen.value) {
+    event.preventDefault();
+    cronOpen.value = false;
     return;
   }
   if (!sending.value) return;
@@ -3124,6 +3273,7 @@ onMounted(() => {
   void loadState({ resumeGoal: true }).then(() => connectSessionStream());
 });
 onBeforeUnmount(() => {
+  if (cronRefreshTimer !== null) window.clearInterval(cronRefreshTimer);
   saveVirtualSessionView();
   disconnectTimelineRows();
   timelineResizeObserver?.disconnect();
@@ -3154,6 +3304,89 @@ onBeforeUnmount(() => {
       class="fixed inset-0 z-30 bg-black/60 backdrop-blur-sm lg:hidden"
       @click="sidebarOpen = false"
     />
+
+    <div
+      v-if="cronOpen"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
+      @click.self="cronOpen = false"
+    >
+      <section class="flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-amber-400/20 bg-[#15131a] shadow-2xl shadow-black/60">
+        <header class="flex items-center gap-3 border-b border-white/7 px-4 py-3">
+          <CalendarClock class="size-4 text-amber-300" aria-hidden="true" />
+          <div class="min-w-0 flex-1">
+            <h2 class="text-sm font-semibold text-zinc-100">Scheduled agent tasks</h2>
+            <p class="mt-0.5 truncate font-mono text-[9px] text-zinc-600">{{ cron?.path }}</p>
+          </div>
+          <span class="rounded px-2 py-1 text-[9px] font-semibold uppercase" :class="cron?.daemon === 'running' ? 'bg-emerald-400/10 text-emerald-300' : 'bg-amber-400/10 text-amber-300'">{{ cron?.daemon }}</span>
+          <button v-if="cron?.installation?.status === 'not_installed'" class="rounded-md px-3 py-1.5 text-xs text-emerald-300 hover:bg-emerald-400/10" @click="installCron">Install service</button>
+          <button v-else-if="!['running_unmanaged'].includes(cron?.installation?.status)" class="rounded-md px-3 py-1.5 text-xs text-zinc-500 hover:bg-red-500/10 hover:text-red-300" @click="uninstallCron">Uninstall service</button>
+          <button class="rounded-md px-3 py-1.5 text-xs text-amber-300 hover:bg-amber-400/10" @click="editCronJob()">Add</button>
+          <button class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-white/5 hover:text-zinc-200" aria-label="Close scheduled tasks" @click="cronOpen = false"><X class="size-4" /></button>
+        </header>
+        <div class="min-h-0 space-y-2 overflow-y-auto p-3">
+          <label class="flex items-center gap-2 rounded-lg border border-white/7 bg-white/[0.02] px-3 py-2 text-[10px] text-zinc-500">
+            Default timezone
+            <input :value="cron?.document?.timezone" class="control min-w-0 flex-1 font-mono" @change="setCronTimezone($event.target.value)" />
+          </label>
+          <p v-if="!cronJobs.length" class="px-3 py-10 text-center text-xs text-zinc-600">No scheduled tasks. Add one here or ask an agent to propose one.</p>
+          <article v-for="view in cronJobs" :key="view.id" class="rounded-lg border border-white/7 bg-white/[0.02] p-3">
+            <div class="flex items-start gap-3">
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="font-mono text-xs font-semibold text-amber-200">{{ view.id }}</span>
+                  <span v-if="!view.job.enabled" class="rounded bg-zinc-500/10 px-1.5 py-0.5 text-[8px] uppercase text-zinc-500">paused</span>
+                  <span v-if="view.state.one_time_status" class="rounded bg-white/5 px-1.5 py-0.5 text-[8px] uppercase text-zinc-400">{{ view.state.one_time_status }}</span>
+                </div>
+                <p class="mt-1 text-[10px] text-zinc-500">{{ view.description }}</p>
+                <p class="mt-1 truncate text-[10px] text-zinc-400">{{ view.job.prompt }}</p>
+                <p class="mt-1 truncate font-mono text-[9px] text-zinc-650">{{ view.job.project }} · {{ view.job.model }} · {{ view.job.overlap }}</p>
+              </div>
+              <button class="grid size-7 place-items-center rounded-md text-zinc-500 hover:bg-emerald-400/10 hover:text-emerald-300" title="Run now" @click="runCronJob(view)"><Play class="size-3.5" /></button>
+              <button class="grid size-7 place-items-center rounded-md text-zinc-500 hover:bg-amber-400/10 hover:text-amber-300" :title="view.job.enabled ? 'Pause' : 'Resume'" @click="toggleCronJob(view)"><Pause v-if="view.job.enabled" class="size-3.5" /><Play v-else class="size-3.5" /></button>
+              <button class="grid size-7 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-zinc-200" title="Edit" @click="editCronJob(view)"><Pencil class="size-3.5" /></button>
+              <button class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-red-500/10 hover:text-red-300" title="Delete" @click="deleteCronJob(view)"><Trash2 class="size-3.5" /></button>
+            </div>
+            <div v-if="view.next_occurrences.length" class="mt-3 flex flex-wrap gap-1.5">
+              <span v-for="next in view.next_occurrences" :key="next" class="rounded bg-amber-400/5 px-2 py-1 font-mono text-[8px] text-amber-200/70">{{ formatCronTime(next) }}</span>
+            </div>
+            <div v-if="view.state.occurrences.length" class="mt-3 space-y-1 border-t border-white/5 pt-2">
+              <button v-for="run in [...view.state.occurrences].reverse().slice(0, 8)" :key="run.sequence" class="flex w-full items-center gap-2 rounded px-2 py-1 text-left hover:bg-white/3" :disabled="!run.session_id" @click="run.session_id && (cronOpen = false, resumeSession(view.job.project, run.session_id))">
+                <span class="w-8 font-mono text-[9px] text-zinc-600">#{{ run.sequence }}</span>
+                <span class="w-28 text-[9px] font-semibold uppercase" :class="{'text-emerald-300': run.status === 'completed', 'text-red-300': ['failed', 'timed_out'].includes(run.status), 'text-amber-300': ['queued', 'running'].includes(run.status), 'text-zinc-500': run.status === 'skipped_overlap'}">{{ run.status }}</span>
+                <span class="min-w-0 flex-1 truncate text-[10px] text-zinc-400">{{ run.last_message || run.error || 'No result yet' }}</span>
+                <span class="font-mono text-[8px] text-zinc-650">{{ formatCronTime(run.scheduled_at) }}</span>
+              </button>
+            </div>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div
+      v-if="cronDraft"
+      class="fixed inset-0 z-[60] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"
+      @click.self="cronDraft = null"
+    >
+      <section class="max-h-[90vh] w-full max-w-2xl space-y-3 overflow-y-auto rounded-xl border border-amber-400/20 bg-[#15131a] p-4">
+        <h2 class="text-sm font-semibold text-amber-200">Scheduled task</h2>
+        <div class="grid gap-3 sm:grid-cols-2">
+          <label class="block text-[10px] text-zinc-500">ID<input v-model="cronDraftId" :disabled="Boolean(cronDraftOriginalId)" class="control mt-1 w-full disabled:opacity-50" /></label>
+          <label class="block text-[10px] text-zinc-500">Schedule<input v-model="cronDraft.schedule" placeholder="0 9 * * * or @at 2030-01-02T03:04:05+01:00" class="control mt-1 w-full font-mono" /></label>
+          <label class="block text-[10px] text-zinc-500 sm:col-span-2">Project<input v-model="cronDraft.project" class="control mt-1 w-full font-mono" /></label>
+          <label class="block text-[10px] text-zinc-500">Provider<input v-model="cronDraft.provider" class="control mt-1 w-full" /></label>
+          <label class="block text-[10px] text-zinc-500">Model<input v-model="cronDraft.model" class="control mt-1 w-full" /></label>
+          <label class="block text-[10px] text-zinc-500">Reasoning<input v-model="cronDraft.reasoning" class="control mt-1 w-full" /></label>
+          <label class="block text-[10px] text-zinc-500">Speed/service tier<input v-model="cronDraft.speed" class="control mt-1 w-full" /></label>
+          <label class="block text-[10px] text-zinc-500">Timezone<input v-model="cronDraft.timezone" class="control mt-1 w-full" /></label>
+          <label class="block text-[10px] text-zinc-500">Overlap<select v-model="cronDraft.overlap" class="control mt-1 w-full"><option value="skip">skip</option><option value="queue">queue latest</option></select></label>
+          <label class="block text-[10px] text-zinc-500">Timeout seconds<input v-model.number="cronDraft.timeout_seconds" type="number" min="1" placeholder="No timeout" class="control mt-1 w-full" /></label>
+          <label class="flex items-end gap-2 pb-2 text-[10px] text-zinc-500"><input v-model="cronDraft.enabled" type="checkbox" /> Enabled</label>
+          <label class="block text-[10px] text-zinc-500 sm:col-span-2">Source session ID<input v-model="cronDraft.source_session_id" placeholder="Optional lineage link" class="control mt-1 w-full font-mono" /></label>
+          <label class="block text-[10px] text-zinc-500 sm:col-span-2">Prompt<textarea v-model="cronDraft.prompt" rows="6" class="control mt-1 w-full resize-y"></textarea></label>
+        </div>
+        <div class="flex justify-end gap-2 pt-2"><button class="rounded px-3 py-1.5 text-xs text-zinc-500 hover:bg-white/5" @click="cronDraft = null">Cancel</button><button class="rounded bg-amber-300 px-3 py-1.5 text-xs font-semibold text-amber-950" @click="saveCronJob">Save</button></div>
+      </section>
+    </div>
 
     <div
       v-if="providersOpen"
@@ -3583,6 +3816,12 @@ onBeforeUnmount(() => {
                   class="current-session-dot absolute left-0 size-1.5 rounded-full bg-coral"
                   aria-hidden="true"
                 />
+                <CalendarClock
+                  v-if="item.scheduled_run"
+                  class="size-3.5 shrink-0 text-amber-400"
+                  :title="`Scheduled run ${item.scheduled_run.job_id} #${item.scheduled_run.occurrence}`"
+                  aria-label="Scheduled run"
+                />
                 <span class="min-w-0 flex-1 truncate text-[13px] text-zinc-300 group-hover/session:text-white">
                   {{ item.title || "New session" }}
                 </span>
@@ -3662,6 +3901,7 @@ onBeforeUnmount(() => {
           >
             <GitBranch class="size-4" aria-hidden="true" />
           </button>
+          <button class="grid size-8 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-amber-300" title="Scheduled tasks" aria-label="Manage scheduled tasks" @click="openCron"><CalendarClock class="size-4" /></button>
           <button class="grid size-8 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200" title="Providers" aria-label="Manage providers" @click="providersOpen = true"><Settings class="size-4" /></button>
         </div>
       </header>
