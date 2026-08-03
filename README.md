@@ -4,6 +4,8 @@
 
 CodeCrab turns a plain-language request into real repository work: it can inspect code, edit files, run commands, verify the result, and keep going until the task is finished. The same autonomous agent powers a compact terminal UI, one-shot CLI commands, and an embedded web app.
 
+CodeCrab keeps final responses concise by default while adapting when the user requests more detail.
+
 > [!IMPORTANT]
 > CodeCrab is intentionally autonomous. It runs file changes and commands without approval prompts, has the same filesystem access as your operating-system account, and is not confined to the selected project. Use it only where you are comfortable granting that access.
 
