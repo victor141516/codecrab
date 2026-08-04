@@ -189,7 +189,7 @@ codecrab serve --open-browser app
 codecrab serve --open-browser app-http
 ```
 
-Without a value, `--open-browser` opens HTTPS in the operating system's default browser. `http` opens the HTTP URL instead. The `app` and `app-http` modes launch Google Chrome with its `--app=<url>` flag for a standalone, PWA-like window, using HTTPS and HTTP respectively; they report an error when Chrome is not installed. Omitting `--open-browser` keeps the previous behavior and does not open anything. Automatically selected port values are resolved before the URL is opened.
+Without a value, `--open-browser` opens HTTPS in the operating system's default browser. `http` opens the HTTP URL instead. The `app` and `app-http` modes make a best-effort launch of the default HTTPS or HTTP browser, respectively, with its `--app=<url>` flag for a standalone, PWA-like window. CodeCrab passes that flag to the selected browser without checking its brand or engine, so a browser that does not support app windows may ignore or reject it. If the default handler cannot be resolved or launched, CodeCrab reports an error suggesting the matching non-app mode instead of silently choosing another browser. Omitting `--open-browser` keeps the previous behavior and does not open anything. Automatically selected port values are resolved before the URL is opened.
 
 The frontend is embedded in the Rust executable and calls relative `/api` URLs, so it works from the same origin and behind a reverse proxy. HTTP and HTTPS stream assistant deltas, activity, cancellation, and session updates rather than waiting for a final response.
 
