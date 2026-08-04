@@ -4,6 +4,7 @@ mod agent;
 mod attachments;
 mod audio;
 mod auth;
+mod browser;
 mod compaction;
 mod completion;
 mod config;
@@ -134,6 +135,15 @@ enum Command {
         /// HTTPS TCP port. Use 0 to select an available port.
         #[arg(long, default_value_t = 4097)]
         https_port: u16,
+        /// Open the web UI: https (default), http, app, or app-http.
+        #[arg(
+            long,
+            value_enum,
+            num_args = 0..=1,
+            default_missing_value = "https",
+            value_name = "MODE"
+        )]
+        open_browser: Option<browser::OpenBrowserMode>,
     },
 }
 
@@ -310,8 +320,18 @@ async fn main() -> Result<()> {
             host,
             port,
             https_port,
+            open_browser,
         }) => {
-            server::serve(root, config, host, port, https_port, debug_openai).await?;
+            server::serve(
+                root,
+                config,
+                host,
+                port,
+                https_port,
+                open_browser,
+                debug_openai,
+            )
+            .await?;
             return Ok(());
         }
         Some(Command::Auth { .. } | Command::Provider { .. }) => {
@@ -600,6 +620,57 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn serve_open_browser_has_an_optional_mode_with_https_as_the_missing_value() {
+        for (arguments, expected) in [
+            (
+                vec!["codecrab", "serve", "--open-browser"],
+                browser::OpenBrowserMode::Https,
+            ),
+            (
+                vec!["codecrab", "serve", "--open-browser", "https"],
+                browser::OpenBrowserMode::Https,
+            ),
+            (
+                vec!["codecrab", "serve", "--open-browser", "http"],
+                browser::OpenBrowserMode::Http,
+            ),
+            (
+                vec!["codecrab", "serve", "--open-browser", "app"],
+                browser::OpenBrowserMode::App,
+            ),
+            (
+                vec!["codecrab", "serve", "--open-browser", "app-http"],
+                browser::OpenBrowserMode::AppHttp,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Serve {
+                    open_browser: Some(mode),
+                    ..
+                }) if mode == expected
+            ));
+        }
+
+        let cli = Cli::try_parse_from(["codecrab", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve {
+                open_browser: None,
+                ..
+            })
+        ));
+
+        let error =
+            match Cli::try_parse_from(["codecrab", "serve", "--open-browser", "unsupported"]) {
+                Err(error) => error,
+                Ok(_) => panic!("unsupported browser modes must be rejected"),
+            };
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # CodeCrab 🦀
 
+<p align="center">
+  <img src="assets/codecrab-agent.png" alt="CodeCrab secret-agent crab mascot" width="320">
+</p>
+
 **A small, auditable coding agent for your terminal and browser, written in Rust.**
 
 CodeCrab turns a plain-language request into real repository work: it can inspect code, edit files, run commands, verify the result, and keep going until the task is finished. The same autonomous agent powers a compact terminal UI, one-shot CLI commands, and an embedded web app.
@@ -62,7 +66,7 @@ In short, both cover the core local coding-agent workflow: autonomous turns, rep
 
 ### 1. Install
 
-Download a binary for Windows, macOS, or Linux from the [latest GitHub Release](https://github.com/victor141516/codecrab/releases/latest), rename it to `codecrab` (`codecrab.exe` on Windows), and put it on your `PATH`.
+Download a binary for Windows, macOS, or Linux from the [latest GitHub Release](https://github.com/victor141516/codecrab/releases/latest), rename it to `codecrab` (`codecrab.exe` on Windows), and put it on your `PATH`. The Windows executable embeds the CodeCrab mascot as its application icon.
 
 On macOS or Linux, make the downloaded file executable:
 
@@ -176,7 +180,20 @@ codecrab serve --host 0.0.0.0 --port 8080 --https-port 8443
 codecrab serve --port 0 --https-port 0
 ```
 
+Open the web UI automatically with an optional launch mode:
+
+```bash
+codecrab serve --open-browser
+codecrab serve --open-browser http
+codecrab serve --open-browser app
+codecrab serve --open-browser app-http
+```
+
+Without a value, `--open-browser` opens HTTPS in the operating system's default browser. `http` opens the HTTP URL instead. The `app` and `app-http` modes launch Google Chrome with its `--app=<url>` flag for a standalone, PWA-like window, using HTTPS and HTTP respectively; they report an error when Chrome is not installed. Omitting `--open-browser` keeps the previous behavior and does not open anything. Automatically selected port values are resolved before the URL is opened.
+
 The frontend is embedded in the Rust executable and calls relative `/api` URLs, so it works from the same origin and behind a reverse proxy. HTTP and HTTPS stream assistant deltas, activity, cancellation, and session updates rather than waiting for a final response.
+
+The web UI is also an installable PWA. Open it from localhost or a trusted HTTPS origin, then use the browser's **Install CodeCrab** action. Its application shell is cached so the installed window can start without a connection, but conversations, sessions, and every `/api` operation still require the CodeCrab server to be running; API responses are never cached by the service worker.
 
 > [!WARNING]
 > The server has **no built-in HTTP authentication**. Keep it on localhost or place it behind an authenticated gateway before exposing it to a network. HTTPS encrypts traffic but does not authenticate users; its fresh in-memory certificate is self-signed and changes on every startup.

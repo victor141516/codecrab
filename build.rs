@@ -6,6 +6,9 @@ use std::{
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    println!("cargo:rerun-if-changed=assets/codecrab.ico");
+    embed_windows_resources();
+
     let web = manifest.join("web");
     for path in [
         "package.json",
@@ -14,8 +17,14 @@ fn main() {
         "vite.config.js",
         "src/App.vue",
         "src/main.js",
+        "src/pwa.js",
         "src/markdown.js",
         "src/style.css",
+        "pwa/manifest.webmanifest",
+        "pwa/service-worker.js",
+        "pwa/icon-32.png",
+        "pwa/icon-192.png",
+        "pwa/icon-512.png",
     ] {
         println!("cargo:rerun-if-changed=web/{path}");
     }
@@ -36,6 +45,16 @@ fn main() {
         }
         fs::copy(&source, embedded.join(file)).expect("copy embedded web asset");
     }
+    for file in [
+        "manifest.webmanifest",
+        "service-worker.js",
+        "icon-32.png",
+        "icon-192.png",
+        "icon-512.png",
+    ] {
+        let source = web.join("pwa").join(file);
+        fs::copy(&source, embedded.join(file)).expect("copy embedded PWA asset");
+    }
 
     let mut produced = fs::read_dir(&dist)
         .expect("read web build output")
@@ -51,6 +70,17 @@ fn main() {
         expected,
         "the web build must contain exactly one HTML, one JavaScript, and one CSS file"
     );
+}
+
+fn embed_windows_resources() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    winresource::WindowsResource::new()
+        .set_icon("assets/codecrab.ico")
+        .compile()
+        .expect("compile Windows application resources");
 }
 
 fn run_npm(directory: &Path, args: &[&str]) {

@@ -38,6 +38,7 @@ use crate::{
     agent::{Agent, turn_was_cancelled},
     attachments::{Attachment, AttachmentStore, MAX_ATTACHMENT_BYTES, validate_sha256},
     auth::OAuthStore,
+    browser::{self, OpenBrowserMode},
     completion::{
         CompletionItem, complete as complete_input, file_completion_context,
         recursive_file_completion_available, start_file_completion_search,
@@ -67,6 +68,11 @@ use crate::{
 const INDEX_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/index.html"));
 const APP_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/app.js"));
 const APP_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/app.css"));
+const WEB_MANIFEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/manifest.webmanifest"));
+const SERVICE_WORKER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/service-worker.js"));
+const APP_ICON_32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/icon-32.png"));
+const APP_ICON_192: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/icon-192.png"));
+const APP_ICON_512: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/icon-512.png"));
 const SHUTDOWN_WARNING_DELAY: Duration = Duration::from_millis(100);
 const SHUTDOWN_WAITING_MESSAGE: &str = "CodeCrab is still shutting down because active HTTP/HTTPS \
 requests or open connections have not finished. Press Ctrl+C again to force exit.";
@@ -457,6 +463,7 @@ pub(crate) async fn serve(
     host: String,
     port: u16,
     https_port: u16,
+    open_browser: Option<OpenBrowserMode>,
     debug_openai: DebugOutput,
 ) -> Result<()> {
     let store = SessionStore::new(&root)?;
@@ -519,6 +526,10 @@ pub(crate) async fn serve(
     println!("HTTP Web: {http_origin}/");
     println!("HTTPS API: {https_origin}/api");
     println!("HTTPS Web: {https_origin}/");
+    if let Some(mode) = open_browser {
+        let url = browser::open(mode, &http_origin, &https_origin)?;
+        println!("Opened browser: {url}");
+    }
 
     let outcome = serve_until_shutdown(
         listeners,
@@ -551,6 +562,11 @@ fn server_app(state: ServerState) -> Router {
         .route("/", get(index))
         .route("/app.js", get(javascript))
         .route("/app.css", get(stylesheet))
+        .route("/manifest.webmanifest", get(web_manifest))
+        .route("/service-worker.js", get(service_worker))
+        .route("/icon-32.png", get(app_icon_32))
+        .route("/icon-192.png", get(app_icon_192))
+        .route("/icon-512.png", get(app_icon_512))
         .nest(
             "/api",
             Router::new()
@@ -2060,6 +2076,34 @@ async fn stylesheet() -> Response {
     asset(APP_CSS, "text/css; charset=utf-8", "no-cache")
 }
 
+async fn web_manifest() -> Response {
+    asset(
+        WEB_MANIFEST,
+        "application/manifest+json; charset=utf-8",
+        "no-cache",
+    )
+}
+
+async fn service_worker() -> Response {
+    let mut response = asset(SERVICE_WORKER, "text/javascript; charset=utf-8", "no-cache");
+    response
+        .headers_mut()
+        .insert("service-worker-allowed", HeaderValue::from_static("/"));
+    response
+}
+
+async fn app_icon_32() -> Response {
+    asset(APP_ICON_32, "image/png", "public, max-age=86400")
+}
+
+async fn app_icon_192() -> Response {
+    asset(APP_ICON_192, "image/png", "public, max-age=86400")
+}
+
+async fn app_icon_512() -> Response {
+    asset(APP_ICON_512, "image/png", "public, max-age=86400")
+}
+
 fn asset(bytes: &'static [u8], content_type: &'static str, cache: &'static str) -> Response {
     let mut response = bytes.into_response();
     response
@@ -2210,6 +2254,71 @@ mod tests {
     fn test_conversation(agent: Agent) -> ConversationHandle {
         let registry = SessionRegistry::at(agent.project_root().join("test-global-config.toml"));
         ConversationHandle::spawn(agent, registry).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pwa_assets_have_installable_metadata_and_safe_cache_headers() {
+        let manifest_response = web_manifest().await;
+        assert_eq!(manifest_response.status(), StatusCode::OK);
+        assert_eq!(
+            manifest_response.headers()[CONTENT_TYPE],
+            "application/manifest+json; charset=utf-8"
+        );
+        let manifest_body = axum::body::to_bytes(manifest_response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_body).unwrap();
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["start_url"], "/");
+        assert_eq!(manifest["icons"].as_array().unwrap().len(), 2);
+        assert_eq!(manifest["icons"][0]["sizes"], "192x192");
+        assert_eq!(manifest["icons"][1]["sizes"], "512x512");
+        assert!(
+            std::str::from_utf8(INDEX_HTML)
+                .unwrap()
+                .contains("href=\"/icon-32.png\"")
+        );
+
+        for (icon_response, expected_size) in [
+            (app_icon_32().await, 32),
+            (app_icon_192().await, 192),
+            (app_icon_512().await, 512),
+        ] {
+            assert_eq!(icon_response.headers()[CONTENT_TYPE], "image/png");
+            let icon = axum::body::to_bytes(icon_response.into_body(), 512 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(&icon[..8], b"\x89PNG\r\n\x1a\n");
+            assert_eq!(
+                u32::from_be_bytes(icon[16..20].try_into().unwrap()),
+                expected_size
+            );
+            assert_eq!(
+                u32::from_be_bytes(icon[20..24].try_into().unwrap()),
+                expected_size
+            );
+            let decoded = image::load_from_memory(&icon).unwrap().to_rgba8();
+            for corner in [
+                (0, 0),
+                (expected_size - 1, 0),
+                (0, expected_size - 1),
+                (expected_size - 1, expected_size - 1),
+            ] {
+                assert_eq!(decoded.get_pixel(corner.0, corner.1).0[3], 0);
+            }
+        }
+
+        let worker_response = service_worker().await;
+        assert_eq!(worker_response.status(), StatusCode::OK);
+        assert_eq!(worker_response.headers()[CACHE_CONTROL], "no-cache");
+        assert_eq!(worker_response.headers()["service-worker-allowed"], "/");
+        let worker_body = axum::body::to_bytes(worker_response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let worker = std::str::from_utf8(&worker_body).unwrap();
+        assert!(worker.contains("url.pathname.startsWith(\"/api/\")"));
+        assert!(worker.contains("\"/icon-32.png\""));
+        assert!(!worker.contains("icon.svg"));
     }
 
     #[test]
