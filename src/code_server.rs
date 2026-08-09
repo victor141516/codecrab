@@ -545,7 +545,6 @@ fn remove_obsolete_markers(path: &Path) -> Result<()> {
     publish(path, &serde_json::to_string(&obsolete)?)
 }
 
-#[cfg(not(windows))]
 fn editor_path(id: Uuid, project: &Path) -> String {
     let query = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("folder", &project.to_string_lossy())
