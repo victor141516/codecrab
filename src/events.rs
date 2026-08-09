@@ -56,6 +56,10 @@ pub(crate) struct AgentActivity {
     pub status: ActivityStatus,
     pub title: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_change_id: Option<Uuid>,
 }
 
 impl AgentActivity {
@@ -80,6 +84,8 @@ impl AgentActivity {
             status: ActivityStatus::Running,
             title: running.to_owned(),
             detail: activity_detail(tool, arguments),
+            change_id: None,
+            live_change_id: None,
         }
     }
 
@@ -115,6 +121,8 @@ impl AgentActivity {
             status: ActivityStatus::Completed,
             title: format!("Retrying model request ({retry}/{max_retries})"),
             detail: error,
+            change_id: None,
+            live_change_id: None,
         }
     }
 
@@ -137,6 +145,8 @@ impl AgentActivity {
             status: ActivityStatus::Failed,
             title: "Model request failed".into(),
             detail: error,
+            change_id: None,
+            live_change_id: None,
         }
     }
 
@@ -159,6 +169,8 @@ impl AgentActivity {
             status: ActivityStatus::Running,
             title: "Context compaction started".into(),
             detail: format!("Estimated active context: {estimated_tokens} tokens"),
+            change_id: None,
+            live_change_id: None,
         }
     }
 
@@ -183,6 +195,8 @@ impl AgentActivity {
             status: ActivityStatus::Completed,
             title: format!("Retrying context compaction ({retry}/{max_retries})"),
             detail: error,
+            change_id: None,
+            live_change_id: None,
         }
     }
 

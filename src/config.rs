@@ -102,6 +102,8 @@ pub(crate) struct Config {
     pub request_timeout_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_server_path: Option<PathBuf>,
     pub session_directories: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chatgpt_oauth: Option<ChatGptOAuthConfig>,
@@ -114,6 +116,7 @@ impl Default for Config {
             providers: BTreeMap::from([(DEFAULT_PROVIDER.into(), ProviderConfig::default())]),
             request_timeout_seconds: 180,
             shell: None,
+            code_server_path: None,
             session_directories: Vec::new(),
             chatgpt_oauth: None,
         }
@@ -127,6 +130,8 @@ pub(crate) struct PublicConfig<'a> {
     pub request_timeout_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_server_path: Option<&'a Path>,
     pub session_directories: &'a [PathBuf],
 }
 
@@ -256,6 +261,13 @@ impl Config {
         {
             anyhow::bail!("shell cannot be empty");
         }
+        if self
+            .code_server_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().to_string_lossy().trim().is_empty())
+        {
+            anyhow::bail!("code_server_path cannot be empty");
+        }
         validate_provider_name(&self.active_provider)?;
         self.provider(&self.active_provider)?;
         if self.providers.is_empty() {
@@ -309,6 +321,7 @@ impl Config {
                 .collect(),
             request_timeout_seconds: self.request_timeout_seconds,
             shell: self.shell.as_deref(),
+            code_server_path: self.code_server_path.as_deref(),
             session_directories: &self.session_directories,
         }
     }
@@ -732,6 +745,32 @@ mod tests {
         assert_eq!(
             config.validate().unwrap_err().to_string(),
             "shell cannot be empty"
+        );
+    }
+
+    #[test]
+    fn configured_code_server_path_round_trips_and_rejects_blank_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let mut config = Config {
+            code_server_path: Some(PathBuf::from("/opt/code-server/bin/code-server")),
+            ..Config::default()
+        };
+
+        config.validate().unwrap();
+        store.save(&config).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded.code_server_path, config.code_server_path);
+        assert_eq!(
+            loaded.public_view().code_server_path,
+            config.code_server_path.as_deref()
+        );
+
+        config.code_server_path = Some(PathBuf::from(" \t"));
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "code_server_path cannot be empty"
         );
     }
 

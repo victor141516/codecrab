@@ -13,13 +13,13 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE},
     },
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{any, get, post, put},
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use rcgen::{CertificateParams, KeyPair};
@@ -39,6 +39,8 @@ use crate::{
     attachments::{Attachment, AttachmentStore, MAX_ATTACHMENT_BYTES, validate_sha256},
     auth::OAuthStore,
     browser::{self, OpenBrowserMode},
+    changes::ChangeStore,
+    code_server::{CodeServerManager, EditorStatus, ExtensionAction, ExtensionDiffFile},
     completion::{
         CompletionItem, complete as complete_input, file_completion_context,
         recursive_file_completion_available, start_file_completion_search,
@@ -97,11 +99,11 @@ struct BoundListeners {
 }
 
 #[derive(Clone)]
-struct ServerState {
-    inner: Arc<ServerInner>,
+pub(crate) struct ServerState {
+    pub(crate) inner: Arc<ServerInner>,
 }
 
-struct ServerInner {
+pub(crate) struct ServerInner {
     coordinator: SessionCoordinator,
     config: RwLock<Config>,
     registry: SessionRegistry,
@@ -112,6 +114,7 @@ struct ServerInner {
     conversations: ConversationManager,
     catalogs: RwLock<HashMap<Uuid, CatalogState>>,
     cron: CronStore,
+    pub(crate) code_server: CodeServerManager,
 }
 
 struct ServerWorkspace {
@@ -492,6 +495,7 @@ pub(crate) async fn serve(
     let initial_handle = coordinator.install(agent)?;
     let initial_id = initial_handle.snapshot().session.id;
     let manager = coordinator.manager();
+    let code_server_path = config.code_server_path.clone();
     let state = ServerState {
         inner: Arc::new(ServerInner {
             coordinator,
@@ -514,6 +518,7 @@ pub(crate) async fn serve(
                 },
             )])),
             cron: CronStore::default()?,
+            code_server: CodeServerManager::new(code_server_path)?,
         }),
     };
     let app = server_app(state.clone());
@@ -522,6 +527,10 @@ pub(crate) async fn serve(
     let listeners = bind_listeners(&host, port, https_port).await?;
     let http_origin = display_origin("http", listeners.http_address);
     let https_origin = display_origin("https", listeners.https_address);
+    state
+        .inner
+        .code_server
+        .set_control_origin(http_origin.clone());
     println!("HTTP API: {http_origin}/api");
     println!("HTTP Web: {http_origin}/");
     println!("HTTPS API: {https_origin}/api");
@@ -531,18 +540,27 @@ pub(crate) async fn serve(
         println!("Opened browser: {url}");
     }
 
+    let shutdown_code_server = state.inner.code_server.clone();
+    let graceful_shutdown = async move {
+        shutdown_signal().await?;
+        shutdown_code_server.shutdown().await;
+        Ok(())
+    };
     let outcome = serve_until_shutdown(
         listeners,
         tls_config,
         app,
-        shutdown_signal(),
+        graceful_shutdown,
         shutdown_signal(),
     )
-    .await?;
-    if outcome == ShutdownOutcome::Forced {
+    .await;
+    if matches!(outcome, Ok(ShutdownOutcome::Forced)) {
         eprintln!("Forcing CodeCrab to exit immediately.");
         std::process::exit(130);
     }
+    state.inner.code_server.shutdown().await;
+    let outcome = outcome?;
+    debug_assert_eq!(outcome, ShutdownOutcome::Graceful);
     state.inner.conversations.cancel_all();
     while state
         .inner
@@ -567,6 +585,14 @@ fn server_app(state: ServerState) -> Router {
         .route("/icon-32.png", get(app_icon_32))
         .route("/icon-192.png", get(app_icon_192))
         .route("/icon-512.png", get(app_icon_512))
+        .route(
+            "/code-server/{instance_id}/",
+            any(crate::code_server_proxy::proxy_root),
+        )
+        .route(
+            "/code-server/{instance_id}/{*tail}",
+            any(crate::code_server_proxy::proxy),
+        )
         .nest(
             "/api",
             Router::new()
@@ -595,6 +621,18 @@ fn server_app(state: ServerState) -> Router {
                 .route("/directories", post(make_directory))
                 .route("/projects/open", post(open_project))
                 .route("/sessions/resume", post(resume_session))
+                .route("/code-server/status", get(code_server_status))
+                .route("/code-server/start", post(start_code_server))
+                .route("/code-server/restart", post(restart_code_server))
+                .route("/code-server/open-change", post(open_file_change))
+                .route(
+                    "/code-server/extension/{instance_id}/handshake",
+                    post(code_server_extension_handshake),
+                )
+                .route(
+                    "/code-server/extension/{instance_id}/commands",
+                    get(code_server_extension_commands),
+                )
                 .route("/goals/create", post(create_goal))
                 .route("/goals/edit", put(edit_goal))
                 .route("/goals/activate", post(activate_goal))
@@ -2115,6 +2153,204 @@ fn asset(bytes: &'static [u8], content_type: &'static str, cache: &'static str) 
     response
 }
 
+#[derive(Deserialize)]
+struct CodeServerProjectRequest {
+    project: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct OpenFileChangeRequest {
+    project: PathBuf,
+    session_id: Uuid,
+    #[serde(default)]
+    change_ids: Vec<Uuid>,
+}
+
+async fn code_server_status(
+    State(state): State<ServerState>,
+    Query(request): Query<CodeServerProjectRequest>,
+) -> ApiResult<EditorStatus> {
+    Ok(Json(
+        state.inner.code_server.status_for_project(&request.project),
+    ))
+}
+
+async fn start_code_server(
+    State(state): State<ServerState>,
+    Json(request): Json<CodeServerProjectRequest>,
+) -> ApiResult<EditorStatus> {
+    Ok(Json(state.inner.code_server.start(&request.project).await))
+}
+
+async fn restart_code_server(
+    State(state): State<ServerState>,
+    Json(request): Json<CodeServerProjectRequest>,
+) -> ApiResult<EditorStatus> {
+    Ok(Json(
+        state.inner.code_server.restart(&request.project).await,
+    ))
+}
+
+async fn open_file_change(
+    State(state): State<ServerState>,
+    Json(request): Json<OpenFileChangeRequest>,
+) -> ApiResult<EditorStatus> {
+    if request.change_ids.is_empty() {
+        return Err(ApiError::message(
+            StatusCode::BAD_REQUEST,
+            "at least one file change is required",
+        ));
+    }
+    let status = state.inner.code_server.start(&request.project).await;
+    let instance_id = match status {
+        EditorStatus::Starting { instance_id, .. } | EditorStatus::Ready { instance_id, .. } => {
+            instance_id
+        }
+        EditorStatus::Unavailable { message } | EditorStatus::Failed { message, .. } => {
+            return Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: anyhow::anyhow!(message),
+            });
+        }
+        EditorStatus::Closed => {
+            return Err(ApiError::message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "code-server did not start",
+            ));
+        }
+    };
+    let store = ChangeStore::new(&request.project, request.session_id);
+    let session = state
+        .inner
+        .conversations
+        .get(request.session_id)
+        .filter(|handle| paths_equal(&handle.snapshot().project_root, &request.project))
+        .map(|handle| handle.snapshot().session)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            SessionStore::new(&request.project)?.load(Some(&request.session_id.to_string()))
+        })?;
+    let mut files = Vec::new();
+    let mut title = "Operation changes".to_owned();
+    for change_id in request.change_ids {
+        let Some(referenced_change) = session
+            .file_changes
+            .iter()
+            .find(|change| change.id == change_id)
+            .cloned()
+        else {
+            return Err(ApiError::message(
+                StatusCode::NOT_FOUND,
+                "file change is not part of this session",
+            ));
+        };
+        let change = store.load_change(change_id).unwrap_or(referenced_change);
+        let reconstructed = store.reconstruct(&change).map_err(|error| {
+            let temporary = change
+                .files
+                .iter()
+                .any(|file| matches!(file, crate::session::FileChange::Temporary(_)));
+            let external = change.files.iter().any(|file| {
+                matches!(file, crate::session::FileChange::Temporary(_))
+                    && !file.path().starts_with(&request.project)
+            });
+            ApiError {
+                status: StatusCode::GONE,
+                error: if external {
+                    anyhow::anyhow!(
+                        "Historical diffs for files outside the selected project are temporary and are no longer available."
+                    )
+                } else if temporary && !crate::changes::git_is_available() {
+                    anyhow::anyhow!(
+                        "Git is unavailable. Install Git, then initialize the selected project as a Git repository to preserve historical diffs."
+                    )
+                } else if temporary {
+                    anyhow::anyhow!(
+                        "Historical diffs require Git. Initialize the project as a Git repository to preserve changes across turns."
+                    )
+                } else {
+                    error
+                },
+            }
+        })?;
+        if reconstructed.kind == crate::session::FileChangeKind::Turn {
+            title = match change.outcome {
+                Some(crate::session::TurnOutcome::Cancelled) => "Changes before cancellation",
+                Some(crate::session::TurnOutcome::Failed) => "Changes before error",
+                _ => "Turn file changes",
+            }
+            .to_owned();
+        }
+        files.extend(reconstructed.files);
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.changed_lines));
+    state.inner.code_server.enqueue(
+        instance_id,
+        ExtensionAction::OpenDiff {
+            title,
+            files: files
+                .into_iter()
+                .map(|file| ExtensionDiffFile {
+                    path: file.path,
+                    before: file.before,
+                    after: file.after,
+                    focus_line: file.focus_line,
+                    changed_lines: file.changed_lines,
+                })
+                .collect(),
+            focus: 0,
+        },
+    )?;
+    Ok(Json(state.inner.code_server.status(instance_id)))
+}
+
+fn extension_authenticated(state: &ServerState, instance_id: Uuid, headers: &HeaderMap) -> bool {
+    headers
+        .get("x-codecrab-extension-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| state.inner.code_server.authenticate(instance_id, token))
+}
+
+async fn code_server_extension_handshake(
+    State(state): State<ServerState>,
+    AxumPath(instance_id): AxumPath<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<EditorStatus> {
+    if !extension_authenticated(&state, instance_id, &headers) {
+        return Err(ApiError::message(
+            StatusCode::UNAUTHORIZED,
+            "invalid extension token",
+        ));
+    }
+    if !state.inner.code_server.handshake(instance_id) {
+        return Err(ApiError::message(
+            StatusCode::NOT_FOUND,
+            "code-server instance not found",
+        ));
+    }
+    Ok(Json(state.inner.code_server.status(instance_id)))
+}
+
+async fn code_server_extension_commands(
+    State(state): State<ServerState>,
+    AxumPath(instance_id): AxumPath<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<crate::code_server::ExtensionCommand>> {
+    if !extension_authenticated(&state, instance_id, &headers) {
+        return Err(ApiError::message(
+            StatusCode::UNAUTHORIZED,
+            "invalid extension token",
+        ));
+    }
+    Ok(Json(
+        state
+            .inner
+            .code_server
+            .take_commands(instance_id)
+            .unwrap_or_default(),
+    ))
+}
+
 async fn api_not_found() -> ApiError {
     ApiError::message(StatusCode::NOT_FOUND, "API endpoint not found")
 }
@@ -2480,6 +2716,7 @@ mod tests {
                     root.join("test-cron.json"),
                     root.join(".test-global-config").join("cron-runtime"),
                 ),
+                code_server: CodeServerManager::new(None).unwrap(),
             }),
         }
     }
@@ -3085,6 +3322,8 @@ mod tests {
             status: ActivityStatus::Running,
             title: "Reading".into(),
             detail: "src/main.rs".into(),
+            change_id: None,
+            live_change_id: None,
         };
         assert!(send_stream_message(&sender, ChatStreamMessage::Activity { activity }).await);
         let bytes = receiver.recv().await.unwrap().unwrap();

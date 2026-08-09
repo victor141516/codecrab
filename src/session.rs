@@ -326,6 +326,63 @@ pub(crate) struct AgentTurn {
     pub completed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<TurnOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileChangeKind {
+    Operation,
+    Turn,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct FileChangeSet {
+    pub id: Uuid,
+    pub turn_message_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_id: Option<String>,
+    pub kind: FileChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TurnOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    pub files: Vec<FileChange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "storage", rename_all = "snake_case")]
+pub(crate) enum FileChange {
+    Git(GitFileChange),
+    Temporary(TemporaryFileChange),
+}
+
+impl FileChange {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Git(change) => &change.path,
+            Self::Temporary(change) => &change.path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct GitFileChange {
+    pub path: PathBuf,
+    pub commit: String,
+    pub relative_path: PathBuf,
+    pub before_patch: PathBuf,
+    pub after_patch: PathBuf,
+    pub before_sha256: String,
+    pub after_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct TemporaryFileChange {
+    pub path: PathBuf,
+    pub before: PathBuf,
+    pub after: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -446,6 +503,8 @@ pub(crate) struct Session {
     pub terminals: Vec<TerminalRecord>,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub file_changes: Vec<FileChangeSet>,
 }
 
 fn default_provider() -> String {
@@ -475,6 +534,7 @@ impl Session {
             started_at,
             completed_at: None,
             outcome: None,
+            change_id: None,
         });
     }
 
@@ -767,6 +827,7 @@ impl SessionStore {
             next_terminal_id: 1,
             terminals: Vec::new(),
             attachments: Vec::new(),
+            file_changes: Vec::new(),
         })
     }
 
@@ -1328,6 +1389,8 @@ mod tests {
             status: ActivityStatus::Completed,
             title: "Read".into(),
             detail: "original.txt".into(),
+            change_id: None,
+            live_change_id: None,
         });
         session.start_turn(original_turn, 1, Utc::now());
 
@@ -1553,6 +1616,8 @@ mod tests {
             status: ActivityStatus::Completed,
             title: "Read".into(),
             detail: "src/main.rs".into(),
+            change_id: None,
+            live_change_id: None,
         });
         session.start_turn(message_id, 0, started_at);
         session.complete_turn(message_id, completed_at);
@@ -1598,6 +1663,8 @@ mod tests {
             status: ActivityStatus::Completed,
             title: "Read".into(),
             detail: "src/main.rs".into(),
+            change_id: None,
+            live_change_id: None,
         });
         store.save(&session).unwrap();
         session.title = "Updated".into();

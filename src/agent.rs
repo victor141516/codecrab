@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     attachments::{Attachment, AttachmentKind, AttachmentStore, ImageDetail},
+    changes::ChangeTracker,
     compaction::{
         active_projection, compaction_threshold, estimate_message, estimate_messages,
         reduce_compaction_end, select_compaction_end, select_tail_start, summarizer_messages,
@@ -44,6 +45,7 @@ pub(crate) struct Agent {
     instructions: AgentInstructions,
     model_catalog: Vec<ModelCatalogEntry>,
     compaction_tuning: CompactionTuning,
+    change_tracker: ChangeTracker,
     diagnostics: DiagnosticLog,
     reported_missing_context_metadata: bool,
     compaction_debounce_tokens: Option<u64>,
@@ -112,6 +114,7 @@ impl Agent {
         });
         let instructions =
             AgentInstructions::load(tools.root(), global_instructions_path, &diagnostics)?;
+        let change_tracker = ChangeTracker::new(tools.root(), session.id);
         Ok(Self {
             provider,
             tools,
@@ -120,6 +123,7 @@ impl Agent {
             instructions,
             model_catalog: Vec::new(),
             compaction_tuning: CompactionTuning::default(),
+            change_tracker,
             diagnostics,
             reported_missing_context_metadata: false,
             compaction_debounce_tokens: None,
@@ -178,6 +182,19 @@ impl Agent {
     }
 
     pub(crate) fn record_turn_outcome(&mut self, outcome: TurnOutcome) {
+        match self.change_tracker.finish_turn(outcome) {
+            Ok(Some(change)) => {
+                let change_id = change.id;
+                self.session.file_changes.push(change);
+                if let Some(turn) = self.session.turns.last_mut() {
+                    turn.change_id = Some(change_id);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self
+                .diagnostics
+                .error(format!("cannot finalize turn changes: {error:#}")),
+        }
         self.session.finish_latest_turn(outcome, Utc::now());
     }
 
@@ -327,6 +344,8 @@ impl Agent {
         let turn_message_index = self.session.messages.len() - 1;
         self.session
             .start_turn(turn_message_id, turn_message_index, turn_started_at);
+        self.change_tracker
+            .begin_turn(turn_message_id, &self.session.file_changes);
         let before_turn_system = self.system_context(&explicit_skills);
         let before_turn_trigger = if self
             .session
@@ -638,6 +657,24 @@ impl Agent {
                     self.session.updated_at = Utc::now();
                     return Err(TurnCancelled.into());
                 }
+                let pending_change = if batch_rejection.is_none() {
+                    match self.change_tracker.before_operation(
+                        &self.tools,
+                        &call.function.name,
+                        &call.function.arguments,
+                    ) {
+                        Ok(change) => change,
+                        Err(error) => {
+                            self.diagnostics.error(format!(
+                                "cannot capture pre-change state for {}: {error:#}",
+                                activity.detail
+                            ));
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut tool_parts = Vec::new();
                 let result = if let Some(error) = batch_rejection {
                     json!({"ok": false, "error": error})
@@ -675,6 +712,34 @@ impl Agent {
                     result
                 };
                 activity.finish(result["ok"].as_bool().unwrap_or(false));
+                if let Some(pending) = pending_change {
+                    match self.change_tracker.after_operation(
+                        &call.id,
+                        turn_message_id,
+                        pending,
+                        result["ok"].as_bool().unwrap_or(false),
+                    ) {
+                        Ok(Some(change)) => {
+                            if change.unavailable_reason.is_none() {
+                                activity.live_change_id = Some(change.id);
+                            }
+                            if change.unavailable_reason.is_some()
+                                || change
+                                    .files
+                                    .iter()
+                                    .all(|file| matches!(file, crate::session::FileChange::Git(_)))
+                            {
+                                activity.change_id = Some(change.id);
+                            }
+                            self.session.file_changes.push(change);
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.diagnostics.error(format!(
+                            "cannot capture change for {}: {error:#}",
+                            activity.detail
+                        )),
+                    }
+                }
                 if call.function.name == "shell"
                     && result["result"]["state"] == "running"
                     && result["ok"] == true

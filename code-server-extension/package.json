@@ -1,0 +1,26 @@
+{
+  "name": "codecrab-integration",
+  "displayName": "CodeCrab Integration",
+  "description": "Managed bridge for CodeCrab file and diff views.",
+  "version": "1.0.0",
+  "publisher": "codecrab",
+  "engines": {
+    "vscode": "*"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codecrab.followChanges",
+        "title": "CodeCrab: Follow Changes"
+      }
+    ]
+  }
+}

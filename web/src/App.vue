@@ -17,6 +17,8 @@ import {
   ChevronRight,
   ChevronUp,
   Copy,
+  Code2,
+  FileDiff,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -28,8 +30,10 @@ import {
   Settings,
   Pause,
   Paperclip,
+  PanelRight,
   Pencil,
   Play,
+  ScanLine,
   Plus,
   Square,
   Trash2,
@@ -53,6 +57,14 @@ import {
   mergeCompletionUpdate
 } from "./completion-updates.js";
 import { isScrolledToBottom } from "./scroll.js";
+import {
+  CHAT_MIN_WIDTH,
+  DEFAULT_EDITOR_WIDTH,
+  EDITOR_MIN_WIDTH,
+  clampEditorWidth,
+  editorFollowStorageKey,
+  nextUnseenLiveChanges
+} from "./editor-panel.js";
 import {
   insertTranscriptAtSelection,
   isDictationShortcut
@@ -106,6 +118,7 @@ const recording = ref(false);
 const transcribing = ref(false);
 const error = ref("");
 const sidebarOpen = ref(false);
+const projectSidebar = ref(null);
 const composer = ref(null);
 const conversation = ref(null);
 const autoScroll = ref(true);
@@ -146,6 +159,20 @@ const recalledMessageNode = ref(null);
 const messageEditDraft = ref("");
 const messageEditAttachments = ref([]);
 const messageEditor = ref(null);
+const editorFrame = ref(null);
+const editorOpen = ref(false);
+const editorActivated = ref(false);
+const editorStatus = ref({ status: "closed" });
+const editorWidth = ref(DEFAULT_EDITOR_WIDTH);
+const editorFollowing = ref(true);
+const editorPendingChanges = ref([]);
+let editorStatusTimer = null;
+let editorFollowTimer = null;
+let editorResizeCleanup = null;
+let editorInteractionCleanup = null;
+let followedSessionId = null;
+let followedTurnMessageId = null;
+const seenLiveChanges = new Set();
 let autocompleteRequest = 0;
 let autocompleteController = null;
 let copiedMessageTimer = null;
@@ -447,6 +474,7 @@ function assistantTurnItem(key, events, turn = null) {
     completed,
     finalEvent,
     progressEvents,
+    turn,
     operationCount: progressEvents.filter(
       (event) =>
         event.type === "activity" &&
@@ -3264,9 +3292,272 @@ function shortId(id) {
   return id?.slice(0, 8) ?? "";
 }
 
+function editorFollowKey(project = state.value?.project) {
+  return editorFollowStorageKey(project);
+}
+
+function editorAvailableWidth() {
+  const sidebarWidth = window.matchMedia("(min-width: 1024px)").matches
+    ? projectSidebar.value?.getBoundingClientRect().width ?? 0
+    : 0;
+  return Math.max(
+    EDITOR_MIN_WIDTH + CHAT_MIN_WIDTH,
+    window.innerWidth - sidebarWidth
+  );
+}
+
+function clampEditorToViewport() {
+  editorWidth.value = clampEditorWidth(
+    editorWidth.value,
+    editorAvailableWidth()
+  );
+}
+
+function loadEditorPreferences() {
+  try {
+    editorWidth.value = clampEditorWidth(
+      Number(localStorage.getItem("codecrab:editor-width")) || DEFAULT_EDITOR_WIDTH,
+      editorAvailableWidth()
+    );
+    editorFollowing.value = localStorage.getItem(editorFollowKey()) !== "false";
+  } catch {
+    editorWidth.value = DEFAULT_EDITOR_WIDTH;
+    editorFollowing.value = true;
+  }
+}
+
+function persistEditorFollowing() {
+  try {
+    localStorage.setItem(editorFollowKey(), String(editorFollowing.value));
+  } catch {
+    // Browser storage must not block editor navigation.
+  }
+}
+
+function setEditorFollowing(value) {
+  editorFollowing.value = value;
+  persistEditorFollowing();
+  if (value && editorOpen.value) {
+    if (editorPendingChanges.value.length) {
+      void openFileChanges([...editorPendingChanges.value], { manual: false });
+    }
+  }
+}
+
+function suspendEditorFollowing() {
+  if (editorFollowing.value) setEditorFollowing(false);
+}
+
+function bindEditorInteraction() {
+  editorInteractionCleanup?.();
+  editorInteractionCleanup = null;
+  const frame = editorFrame.value;
+  let document;
+  try {
+    document = frame?.contentDocument;
+  } catch {
+    return;
+  }
+  if (!document) return;
+  const proxyFailure = document.body?.innerText?.trim();
+  if (proxyFailure?.startsWith("code-server proxy failed:")) {
+    editorStatus.value = {
+      ...editorStatus.value,
+      status: "failed",
+      message: proxyFailure
+    };
+    scheduleEditorStatusRefresh();
+    return;
+  }
+  const options = { capture: true, passive: true };
+  const events = ["pointerdown", "wheel", "keydown"];
+  for (const event of events) {
+    document.addEventListener(event, suspendEditorFollowing, options);
+  }
+  editorInteractionCleanup = () => {
+    for (const event of events) {
+      document.removeEventListener(event, suspendEditorFollowing, options);
+    }
+  };
+}
+
+async function editorRequest(path, options = {}) {
+  const response = await fetch(`/api/code-server/${path}`, {
+    headers: { "Content-Type": "application/json", ...(options.headers ?? {}) },
+    ...options
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `Editor request failed (${response.status})`);
+  return payload;
+}
+
+function scheduleEditorStatusRefresh() {
+  window.clearTimeout(editorStatusTimer);
+  if (
+    editorActivated.value &&
+    (editorStatus.value.status === "starting" ||
+      editorStatus.value.status === "ready")
+  ) {
+    editorStatusTimer = window.setTimeout(
+      refreshEditorStatus,
+      editorStatus.value.status === "starting" ? 600 : 2000
+    );
+  }
+}
+
+async function refreshEditorStatus() {
+  if (!state.value?.project || !editorActivated.value) return;
+  try {
+    editorStatus.value = await editorRequest(
+      `status?project=${encodeURIComponent(state.value.project)}`
+    );
+  } catch (cause) {
+    editorStatus.value = { status: "failed", message: cause.message };
+  }
+  scheduleEditorStatusRefresh();
+}
+
+async function startEditor(restart = false) {
+  if (!state.value?.project) return;
+  editorActivated.value = true;
+  editorStatus.value = { status: "starting" };
+  try {
+    editorStatus.value = await editorRequest(restart ? "restart" : "start", {
+      method: "POST",
+      body: JSON.stringify({ project: state.value.project })
+    });
+    scheduleEditorStatusRefresh();
+  } catch (cause) {
+    editorStatus.value = { status: "failed", message: cause.message };
+  }
+}
+
+async function toggleEditor() {
+  editorOpen.value = !editorOpen.value;
+  if (!editorOpen.value) return;
+  if (!editorActivated.value || editorStatus.value.status === "closed") {
+    await startEditor(false);
+  }
+  if (editorFollowing.value && editorPendingChanges.value.length) {
+    await openFileChanges([...editorPendingChanges.value], { manual: false });
+  }
+}
+
+async function openFileChange(changeId, options) {
+  return openFileChanges(changeId ? [changeId] : [], options);
+}
+
+async function openFileChanges(changeIds, { manual = true } = {}) {
+  if (!changeIds.length || !session.value?.id || !state.value?.project) return;
+  editorOpen.value = true;
+  editorActivated.value = true;
+  const previousStatus = editorStatus.value;
+  try {
+    editorStatus.value = await editorRequest("open-change", {
+      method: "POST",
+      body: JSON.stringify({
+        project: state.value.project,
+        session_id: session.value.id,
+        change_ids: changeIds
+      })
+    });
+    editorPendingChanges.value = editorPendingChanges.value.filter(
+      (pending) => !changeIds.includes(pending)
+    );
+    scheduleEditorStatusRefresh();
+  } catch (cause) {
+    error.value = `Could not open file changes: ${cause.message}`;
+    if (manual && !previousStatus.path) {
+      editorStatus.value = { status: "failed", message: cause.message };
+    }
+  }
+}
+
+function startEditorResize(event) {
+  event.preventDefault();
+  suspendEditorFollowing();
+  const startX = event.clientX;
+  const startWidth = editorWidth.value;
+  const move = (moveEvent) => {
+    editorWidth.value = clampEditorWidth(
+      startWidth + startX - moveEvent.clientX,
+      editorAvailableWidth()
+    );
+  };
+  const stop = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", stop);
+    document.body.classList.remove("editor-resizing");
+    try {
+      localStorage.setItem("codecrab:editor-width", String(editorWidth.value));
+    } catch {
+      // Storage failures do not block resizing.
+    }
+    editorResizeCleanup = null;
+  };
+  document.body.classList.add("editor-resizing");
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", stop);
+  editorResizeCleanup = stop;
+}
+
+watch(
+  () => state.value?.project,
+  () => {
+    window.clearTimeout(editorStatusTimer);
+    editorOpen.value = false;
+    editorActivated.value = false;
+    editorStatus.value = { status: "closed" };
+    editorPendingChanges.value = [];
+    seenLiveChanges.clear();
+    followedSessionId = null;
+    followedTurnMessageId = null;
+    editorInteractionCleanup?.();
+    editorInteractionCleanup = null;
+    loadEditorPreferences();
+  }
+);
+
+watch(
+  () => ({
+    sessionId: session.value?.id,
+    turnMessageId: session.value?.turns?.at(-1)?.message_id ?? null,
+    changes: (session.value?.activities ?? [])
+      .filter((activity) => activity.live_change_id)
+      .map((activity) => ({ id: activity.id, change: activity.live_change_id }))
+  }),
+  ({ sessionId, turnMessageId, changes }) => {
+    if (!sessionId) return;
+    if (followedSessionId !== sessionId) {
+      followedSessionId = sessionId;
+      followedTurnMessageId = turnMessageId;
+      seenLiveChanges.clear();
+      for (const item of changes) seenLiveChanges.add(`${item.id}:${item.change}`);
+      editorPendingChanges.value = [];
+      return;
+    }
+    if (followedTurnMessageId !== turnMessageId) {
+      followedTurnMessageId = turnMessageId;
+      editorPendingChanges.value = [];
+    }
+    const incoming = nextUnseenLiveChanges(changes, seenLiveChanges);
+    if (!incoming.length) return;
+    editorPendingChanges.value = [...editorPendingChanges.value, ...incoming];
+    if (editorActivated.value && editorOpen.value && editorFollowing.value) {
+      window.clearTimeout(editorFollowTimer);
+      editorFollowTimer = window.setTimeout(() => {
+        void openFileChanges([...editorPendingChanges.value], { manual: false });
+      }, 80);
+    }
+  },
+  { deep: true, flush: "post" }
+);
+
 onMounted(() => {
+  loadEditorPreferences();
   window.addEventListener("popstate", handleHistoryNavigation);
   window.addEventListener("keydown", handleGlobalKeydown);
+  window.addEventListener("resize", clampEditorToViewport);
   observeConversationSize();
   document.fonts?.addEventListener?.("loadingdone", handleFontMetricsChange);
   void document.fonts?.ready?.then(handleFontMetricsChange);
@@ -3288,7 +3579,12 @@ onBeforeUnmount(() => {
   window.clearTimeout(sessionStreamRetry);
   window.removeEventListener("popstate", handleHistoryNavigation);
   window.removeEventListener("keydown", handleGlobalKeydown);
+  window.removeEventListener("resize", clampEditorToViewport);
   window.clearTimeout(copiedMessageTimer);
+  window.clearTimeout(editorStatusTimer);
+  window.clearTimeout(editorFollowTimer);
+  editorResizeCleanup?.();
+  editorInteractionCleanup?.();
   for (const observer of activityDetailObservers.values()) observer.disconnect();
   discardRecording = true;
   sendAfterTranscription = false;
@@ -3699,6 +3995,7 @@ onBeforeUnmount(() => {
     </div>
 
     <aside
+      ref="projectSidebar"
       class="app-sidebar fixed inset-y-0 left-0 z-40 flex w-72 -translate-x-full flex-col border-r bg-panel transition-transform duration-200 lg:translate-x-0"
       :class="{ 'translate-x-0': sidebarOpen }"
     >
@@ -3864,7 +4161,7 @@ onBeforeUnmount(() => {
       </div>
     </aside>
 
-    <main class="flex h-full min-w-0 flex-col lg:pl-72">
+    <main class="workspace-shell flex h-full min-w-0 flex-col lg:pl-72">
       <header class="app-header flex h-14 shrink-0 items-center gap-3 border-b bg-ink/90 px-4 backdrop-blur">
         <button
           class="grid size-8 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-white lg:hidden"
@@ -3884,6 +4181,33 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="ml-auto flex items-center gap-2">
+          <button
+            v-if="session"
+            class="relative grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-cyan-300"
+            :class="editorOpen ? 'text-cyan-300' : 'text-zinc-500'"
+            :aria-pressed="editorOpen"
+            :title="editorOpen ? 'Hide code panel' : 'Show code panel'"
+            :aria-label="editorOpen ? 'Hide code panel' : 'Show code panel'"
+            @click="toggleEditor"
+          >
+            <PanelRight class="size-4" aria-hidden="true" />
+            <span
+              v-if="editorPendingChanges.length"
+              class="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-coral"
+              :title="`${editorPendingChanges.length} pending changes`"
+            />
+          </button>
+          <button
+            v-if="session"
+            class="grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-cyan-300"
+            :class="editorFollowing ? 'text-cyan-300' : 'text-zinc-600'"
+            :aria-pressed="editorFollowing"
+            :title="editorFollowing ? 'Stop following file changes' : 'Follow file changes'"
+            :aria-label="editorFollowing ? 'Stop following file changes' : 'Follow file changes'"
+            @click="setEditorFollowing(!editorFollowing)"
+          >
+            <ScanLine class="size-4" aria-hidden="true" />
+          </button>
           <button
             v-if="session"
             class="grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-30"
@@ -3906,7 +4230,7 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
-      <div class="flex min-h-0 flex-1">
+      <div class="workspace-body flex min-h-0 flex-1">
       <div
         ref="conversation"
         class="conversation-viewport min-h-0 flex-1 overflow-y-auto"
@@ -4130,6 +4454,16 @@ onBeforeUnmount(() => {
                       {{ event.activity.detail }}
                     </span>
                     <button
+                      v-if="event.activity.change_id"
+                      type="button"
+                      class="activity-diff-button"
+                      title="View diff"
+                      aria-label="View diff"
+                      @click="openFileChange(event.activity.change_id)"
+                    >
+                      <FileDiff class="size-3.5" aria-hidden="true" />
+                    </button>
+                    <button
                       v-if="
                         overflowingActivityKeys.has(event.key) ||
                         expandedActivityKeys.has(event.key)
@@ -4199,6 +4533,21 @@ onBeforeUnmount(() => {
                     </button>
                   </div>
                 </template>
+                <button
+                  v-if="item.turn?.change_id"
+                  type="button"
+                  class="turn-diff-button"
+                  @click="openFileChange(item.turn.change_id)"
+                >
+                  <FileDiff class="size-3.5" aria-hidden="true" />
+                  {{
+                    item.turn.outcome === "cancelled"
+                      ? "View changes before cancellation"
+                      : item.turn.outcome === "failed"
+                        ? "View changes before error"
+                        : "View turn changes"
+                  }}
+                </button>
                 <div
                   v-if="activeAssistantTurnKey === item.key"
                   class="thinking-indicator mt-2"
@@ -4320,6 +4669,96 @@ onBeforeUnmount(() => {
             Hover reveals its message; click previews its branch. You can edit
             visible messages directly. ✓ keeps it; Esc restores the original.
           </p>
+        </aside>
+
+        <div
+          v-if="editorOpen"
+          class="editor-divider hidden shrink-0 cursor-col-resize lg:block"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize code panel"
+          @pointerdown="startEditorResize"
+        />
+        <aside
+          v-if="editorActivated"
+          v-show="editorOpen"
+          class="editor-panel fixed inset-0 z-40 flex min-w-0 flex-col bg-[#0d1014] lg:static lg:z-auto lg:shrink-0"
+          :style="{ width: `${editorWidth}px` }"
+          aria-label="Code explorer and diffs"
+        >
+          <header class="flex h-10 shrink-0 items-center gap-2 border-b border-white/8 px-2">
+            <Code2 class="size-3.5 text-cyan-400" aria-hidden="true" />
+            <span class="min-w-0 flex-1 truncate text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
+              Code
+            </span>
+            <span class="truncate font-mono text-[9px] text-zinc-700">
+              {{ editorStatus.tested_version ? `tested ${editorStatus.tested_version}` : "" }}
+            </span>
+            <button
+              class="grid size-7 place-items-center rounded text-zinc-500 hover:bg-white/5 hover:text-cyan-300"
+              :class="editorFollowing ? 'text-cyan-300' : ''"
+              :aria-pressed="editorFollowing"
+              :title="editorFollowing ? 'Stop following changes' : 'Follow changes'"
+              @click="setEditorFollowing(!editorFollowing)"
+            >
+              <ScanLine class="size-3.5" aria-hidden="true" />
+            </button>
+            <button
+              class="grid size-7 place-items-center rounded text-zinc-500 hover:bg-white/5 hover:text-zinc-200"
+              title="Hide code panel"
+              aria-label="Hide code panel"
+              @click="editorOpen = false"
+            >
+              <X class="size-3.5" aria-hidden="true" />
+            </button>
+          </header>
+          <div class="relative min-h-0 flex-1">
+            <iframe
+              v-if="editorStatus.path"
+              ref="editorFrame"
+              class="size-full border-0"
+              :src="editorStatus.path"
+              title="Managed code-server"
+              @load="bindEditorInteraction"
+            />
+            <div
+              v-if="editorStatus.status === 'starting'"
+              class="pointer-events-none absolute inset-x-0 top-0 flex items-center gap-2 border-b border-white/8 bg-[#11151b]/95 px-3 py-2 text-[10px] text-zinc-400"
+            >
+              <LoaderCircle class="size-3 animate-spin text-cyan-400" aria-hidden="true" />
+              Starting code-server and loading the CodeCrab extension…
+            </div>
+            <div
+              v-else-if="editorStatus.status === 'unavailable' || editorStatus.status === 'failed'"
+              class="grid h-full place-items-center p-8"
+            >
+              <div class="max-w-md text-center">
+                <Code2 class="mx-auto size-7 text-zinc-700" aria-hidden="true" />
+                <p class="mt-3 text-xs leading-5 text-zinc-400">{{ editorStatus.message }}</p>
+                <p class="mt-2 text-[10px] leading-4 text-zinc-600">
+                  code-server runs with your operating-system account. This visual read-only mode is not a security boundary.
+                </p>
+                <p
+                  v-if="editorStatus.log_path"
+                  class="mt-2 break-all font-mono text-[9px] text-zinc-700"
+                >
+                  Log: {{ editorStatus.log_path }}
+                </p>
+                <button
+                  class="mt-4 rounded-md border border-cyan-400/20 bg-cyan-400/8 px-3 py-1.5 text-xs text-cyan-300 hover:bg-cyan-400/14"
+                  @click="startEditor(editorStatus.status === 'failed')"
+                >
+                  {{ editorStatus.status === "failed" ? "Restart" : "Retry" }}
+                </button>
+              </div>
+            </div>
+            <div
+              v-else-if="editorStatus.status === 'closed'"
+              class="grid h-full place-items-center text-xs text-zinc-600"
+            >
+              Open the panel to start code-server.
+            </div>
+          </div>
         </aside>
       </div>
 
