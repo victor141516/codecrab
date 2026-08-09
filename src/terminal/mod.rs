@@ -1333,25 +1333,21 @@ fn parent_shell_name() -> Option<String> {
 #[cfg(unix)]
 struct ProcessTree {
     process_group: Option<libc::pid_t>,
-    session_id: Option<libc::pid_t>,
+    root_pid: Option<libc::pid_t>,
 }
 
 #[cfg(unix)]
 impl ProcessTree {
     fn new(master: &dyn MasterPty, child: &dyn Child) -> Self {
-        let session_id = child.process_id().and_then(|pid| {
-            let session_id = unsafe { libc::getsid(pid as libc::pid_t) };
-            (session_id >= 0).then_some(session_id)
-        });
         Self {
             process_group: master.process_group_leader(),
-            session_id,
+            root_pid: child.process_id().map(|pid| pid as libc::pid_t),
         }
     }
 
     fn terminate(&self) {
-        if let Some(session_id) = self.session_id
-            && let Some(mut processes) = session_processes(session_id)
+        if let Some(root_pid) = self.root_pid
+            && let Some(mut processes) = descendant_processes(root_pid)
             && !processes.is_empty()
         {
             for process in &processes {
@@ -1359,7 +1355,7 @@ impl ProcessTree {
                     libc::kill(*process, libc::SIGSTOP);
                 }
             }
-            if let Some(late_processes) = session_processes(session_id) {
+            if let Some(late_processes) = descendant_processes(root_pid) {
                 for process in late_processes {
                     if !processes.contains(&process) {
                         unsafe {
@@ -1385,26 +1381,41 @@ impl ProcessTree {
 }
 
 #[cfg(unix)]
-fn session_processes(session_id: libc::pid_t) -> Option<Vec<libc::pid_t>> {
+fn descendant_processes(root_pid: libc::pid_t) -> Option<Vec<libc::pid_t>> {
     let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,sid="])
+        .args(["-axo", "pid=,ppid="])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let current = std::process::id() as libc::pid_t;
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                let pid = fields.next()?.parse::<libc::pid_t>().ok()?;
-                let sid = fields.next()?.parse::<libc::pid_t>().ok()?;
-                (sid == session_id && pid != current).then_some(pid)
-            })
-            .collect(),
-    )
+    let processes = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse::<libc::pid_t>().ok()?,
+                fields.next()?.parse::<libc::pid_t>().ok()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if !processes.iter().any(|(pid, _)| *pid == root_pid) {
+        return Some(Vec::new());
+    }
+
+    let mut descendants = vec![root_pid];
+    let mut parent_index = 0;
+    while parent_index < descendants.len() {
+        let parent = descendants[parent_index];
+        for (pid, parent_pid) in &processes {
+            if *parent_pid == parent && *pid != current && !descendants.contains(pid) {
+                descendants.push(*pid);
+            }
+        }
+        parent_index += 1;
+    }
+    Some(descendants)
 }
 
 #[cfg(unix)]

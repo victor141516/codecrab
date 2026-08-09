@@ -31,6 +31,8 @@ pub(crate) const INSTALL_MESSAGE: &str = "To see the changes and explore the fil
 const EXTENSION_PACKAGE: &str = include_str!("../code-server-extension/package.json");
 #[cfg(any(not(windows), test))]
 const EXTENSION_MAIN: &str = include_str!("../code-server-extension/extension.js");
+#[cfg(any(not(windows), test))]
+const EXTENSION_ID: &str = "codecrab.codecrab-integration";
 #[derive(Clone)]
 pub(crate) struct CodeServerManager {
     inner: Arc<ManagerInner>,
@@ -50,6 +52,7 @@ struct ManagerInner {
 
 struct ManagedInstance {
     token: String,
+    project: PathBuf,
     address: SocketAddr,
     child: Child,
     log_path: PathBuf,
@@ -183,6 +186,7 @@ impl CodeServerManager {
         let address = listener.local_addr()?;
         drop(listener);
         let id = Uuid::new_v4();
+        let editor_path = editor_path(id, &project);
         let token = Uuid::new_v4().to_string();
         let logs = self.inner.profile.join("logs");
         fs::create_dir_all(&logs)?;
@@ -265,6 +269,7 @@ impl CodeServerManager {
                 id,
                 ManagedInstance {
                     token,
+                    project: project.clone(),
                     address,
                     child,
                     log_path: log_path.clone(),
@@ -280,7 +285,7 @@ impl CodeServerManager {
             .insert(project, id);
         Ok(EditorStatus::Starting {
             instance_id: id,
-            path: format!("/code-server/{id}/"),
+            path: editor_path,
             log_path,
             tested_version: TESTED_CODE_SERVER_VERSION,
         })
@@ -335,13 +340,13 @@ impl CodeServerManager {
             }
             Ok(None) if instance.extension_ready => EditorStatus::Ready {
                 instance_id: id,
-                path: format!("/code-server/{id}/"),
+                path: editor_path(id, &instance.project),
                 log_path: instance.log_path.clone(),
                 tested_version: TESTED_CODE_SERVER_VERSION,
             },
             Ok(None) => EditorStatus::Starting {
                 instance_id: id,
-                path: format!("/code-server/{id}/"),
+                path: editor_path(id, &instance.project),
                 log_path: instance.log_path.clone(),
                 tested_version: TESTED_CODE_SERVER_VERSION,
             },
@@ -468,22 +473,84 @@ impl CodeServerManager {
 #[cfg(any(not(windows), test))]
 fn install_extension(profile: &Path) -> Result<()> {
     let extensions = profile.join("extensions");
-    let current_name = format!(
-        "codecrab.codecrab-integration-{}",
-        env!("CARGO_PKG_VERSION")
-    );
+    let version = extension_version()?;
+    let current_name = format!("{EXTENSION_ID}-{version}");
     fs::create_dir_all(&extensions)?;
+    let extension = extensions.join(&current_name);
+    fs::create_dir_all(&extension)?;
+    publish(&extension.join("package.json"), EXTENSION_PACKAGE)?;
+    publish(&extension.join("extension.js"), EXTENSION_MAIN)?;
     for entry in fs::read_dir(&extensions)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("codecrab.codecrab-integration-") && name != current_name {
+        if name.starts_with(&format!("{EXTENSION_ID}-")) && name != current_name {
             fs::remove_dir_all(entry.path())?;
         }
     }
-    let extension = extensions.join(current_name);
-    fs::create_dir_all(&extension)?;
-    publish(&extension.join("package.json"), EXTENSION_PACKAGE)?;
-    publish(&extension.join("extension.js"), EXTENSION_MAIN)
+    register_extension(
+        &extensions.join("extensions.json"),
+        &extension,
+        &current_name,
+        &version,
+    )?;
+    remove_obsolete_markers(&extensions.join(".obsolete"))
+}
+
+#[cfg(any(not(windows), test))]
+fn extension_version() -> Result<String> {
+    let manifest: serde_json::Value = serde_json::from_str(EXTENSION_PACKAGE)
+        .context("cannot parse the embedded CodeCrab extension manifest")?;
+    manifest["version"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .context("the embedded CodeCrab extension has no version")
+}
+
+#[cfg(any(not(windows), test))]
+fn register_extension(
+    path: &Path,
+    extension: &Path,
+    relative_name: &str,
+    version: &str,
+) -> Result<()> {
+    let mut registry: Vec<serde_json::Value> = if path.exists() {
+        serde_json::from_str(&fs::read_to_string(path)?)
+            .with_context(|| format!("cannot parse {}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    registry.retain(|entry| entry["identifier"]["id"].as_str() != Some(EXTENSION_ID));
+    registry.push(serde_json::json!({
+        "identifier": { "id": EXTENSION_ID },
+        "version": version,
+        "location": {
+            "$mid": 1,
+            "path": extension.to_string_lossy(),
+            "scheme": "file"
+        },
+        "relativeLocation": relative_name
+    }));
+    publish(path, &serde_json::to_string(&registry)?)
+}
+
+#[cfg(any(not(windows), test))]
+fn remove_obsolete_markers(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut obsolete: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(path)?)
+            .with_context(|| format!("cannot parse {}", path.display()))?;
+    obsolete.retain(|name, _| !name.starts_with(&format!("{EXTENSION_ID}-")));
+    publish(path, &serde_json::to_string(&obsolete)?)
+}
+
+#[cfg(not(windows))]
+fn editor_path(id: Uuid, project: &Path) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("folder", &project.to_string_lossy())
+        .finish();
+    format!("/code-server/{id}/?{query}")
 }
 
 #[cfg(any(not(windows), test))]
@@ -555,11 +622,71 @@ mod tests {
         assert!(!old.exists());
         assert!(
             temp.path()
-                .join(format!(
-                    "extensions/codecrab.codecrab-integration-{}/extension.js",
-                    env!("CARGO_PKG_VERSION")
-                ))
+                .join("extensions/codecrab.codecrab-integration-1.0.1/extension.js")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn extension_install_repairs_stale_persistent_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let extensions = temp.path().join("extensions");
+        fs::create_dir_all(&extensions).unwrap();
+        fs::write(
+            extensions.join("extensions.json"),
+            serde_json::json!([
+                {
+                    "identifier": { "id": EXTENSION_ID },
+                    "version": "1.0.0",
+                    "relativeLocation": "codecrab.codecrab-integration-1.10.1"
+                },
+                {
+                    "identifier": { "id": "other.extension" },
+                    "version": "2.0.0"
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            extensions.join(".obsolete"),
+            serde_json::json!({
+                "codecrab.codecrab-integration-1.0.1": true,
+                "other.extension-2.0.0": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        install_extension(temp.path()).unwrap();
+
+        let registry: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(extensions.join("extensions.json")).unwrap())
+                .unwrap();
+        assert_eq!(registry.as_array().unwrap().len(), 2);
+        assert_eq!(registry[0]["identifier"]["id"], "other.extension");
+        assert_eq!(registry[1]["identifier"]["id"], EXTENSION_ID);
+        assert_eq!(registry[1]["version"], "1.0.1");
+        assert_eq!(
+            registry[1]["relativeLocation"],
+            "codecrab.codecrab-integration-1.0.1"
+        );
+        let obsolete: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(extensions.join(".obsolete")).unwrap())
+                .unwrap();
+        assert_eq!(
+            obsolete,
+            serde_json::json!({ "other.extension-2.0.0": true })
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn editor_path_selects_the_managed_project_explicitly() {
+        let id = Uuid::nil();
+        assert_eq!(
+            editor_path(id, Path::new("/tmp/Code Crab")),
+            "/code-server/00000000-0000-0000-0000-000000000000/?folder=%2Ftmp%2FCode+Crab"
         );
     }
 
@@ -599,6 +726,7 @@ mod tests {
             id,
             ManagedInstance {
                 token: token.clone(),
+                project: temp.path().to_path_buf(),
                 address: "127.0.0.1:9".parse().unwrap(),
                 child,
                 log_path: temp.path().join("instance.log"),

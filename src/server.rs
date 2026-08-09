@@ -2220,11 +2220,16 @@ async fn open_file_change(
         }
     };
     let store = ChangeStore::new(&request.project, request.session_id);
-    let session = state
+    let conversation = state
         .inner
         .conversations
         .get(request.session_id)
-        .filter(|handle| paths_equal(&handle.snapshot().project_root, &request.project))
+        .filter(|handle| paths_equal(&handle.snapshot().project_root, &request.project));
+    let live_activities = conversation
+        .as_ref()
+        .map(|handle| handle.observation().activities)
+        .unwrap_or_default();
+    let session = conversation
         .map(|handle| handle.snapshot().session)
         .map(Ok)
         .unwrap_or_else(|| {
@@ -2233,18 +2238,26 @@ async fn open_file_change(
     let mut files = Vec::new();
     let mut title = "Operation changes".to_owned();
     for change_id in request.change_ids {
-        let Some(referenced_change) = session
+        let referenced_change = session
             .file_changes
             .iter()
             .find(|change| change.id == change_id)
-            .cloned()
-        else {
+            .cloned();
+        if referenced_change.is_none()
+            && !activities_reference_change(&session.activities, change_id)
+            && !activities_reference_change(&live_activities, change_id)
+        {
             return Err(ApiError::message(
                 StatusCode::NOT_FOUND,
                 "file change is not part of this session",
             ));
+        }
+        let change = match store.load_change(change_id) {
+            Ok(change) => change,
+            Err(_) => referenced_change.ok_or_else(|| {
+                ApiError::message(StatusCode::NOT_FOUND, "file change is not available yet")
+            })?,
         };
-        let change = store.load_change(change_id).unwrap_or(referenced_change);
         let reconstructed = store.reconstruct(&change).map_err(|error| {
             let temporary = change
                 .files
@@ -2302,6 +2315,12 @@ async fn open_file_change(
         },
     )?;
     Ok(Json(state.inner.code_server.status(instance_id)))
+}
+
+fn activities_reference_change(activities: &[AgentActivity], change_id: Uuid) -> bool {
+    activities.iter().any(|activity| {
+        activity.live_change_id == Some(change_id) || activity.change_id == Some(change_id)
+    })
 }
 
 fn extension_authenticated(state: &ServerState, instance_id: Uuid, headers: &HeaderMap) -> bool {
@@ -2719,6 +2738,31 @@ mod tests {
                 code_server: CodeServerManager::new(None).unwrap(),
             }),
         }
+    }
+
+    #[test]
+    fn observed_activity_authorizes_its_change_before_the_turn_snapshot_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create("test-model".into())
+            .unwrap();
+        let change_id = Uuid::new_v4();
+        let mut activity = AgentActivity::started(
+            "call-write".into(),
+            Uuid::new_v4(),
+            0,
+            0,
+            "write_file",
+            r#"{"path":"note.txt","content":"updated"}"#,
+        );
+        activity.live_change_id = Some(change_id);
+
+        assert!(session.file_changes.is_empty());
+        assert!(session.activities.is_empty());
+        assert!(activities_reference_change(&[activity], change_id));
+        assert!(!activities_reference_change(&[], change_id));
     }
 
     #[test]

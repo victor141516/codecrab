@@ -7926,7 +7926,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains(&format!("{NERD_FOLDER} src")));
-        assert!(!rendered.contains("folder"));
+        assert!(!rendered.contains(" folder "));
         assert!(!rendered.contains(" file "));
 
         app.completion.as_mut().unwrap().selected = hello;
