@@ -39,7 +39,7 @@ use crate::{
     audio::AudioRecording,
     completion::{
         CompletionKind, CompletionMenu, CompletionSearch, builtin_command_from_input,
-        complete_progressive, goal_objective_from_input,
+        complete_progressive, goal_objective_from_input, slash_completion_range,
     },
     config::{
         Config, ConfigStore, ProviderConfig, SessionRegistry, normalized_root, paths_equal,
@@ -868,6 +868,7 @@ struct App {
     completion: Option<CompletionMenu>,
     completion_search: Option<CompletionSearch>,
     completion_request_id: u64,
+    slash_completion_open: bool,
     model_catalog: Vec<ModelCatalogEntry>,
     model_picker: Option<ModelPicker>,
     session_picker: Option<SessionPicker>,
@@ -991,6 +992,7 @@ impl App {
             completion: None,
             completion_search: None,
             completion_request_id: 0,
+            slash_completion_open: false,
             model_catalog,
             model_picker: None,
             session_picker: None,
@@ -1210,6 +1212,22 @@ impl App {
         self.insert(value.encode_utf8(&mut text));
     }
 
+    fn refresh_skills(&mut self) {
+        match self.conversation.queue_skill_refresh_once(Uuid::new_v4()) {
+            Ok(skills) => {
+                self.skills = skills
+                    .into_iter()
+                    .map(|skill| SkillView {
+                        name: skill.name,
+                        description: skill.description,
+                        scope: skill.scope,
+                    })
+                    .collect();
+            }
+            Err(error) => self.error = Some(format!("Could not refresh skills: {error:#}")),
+        }
+    }
+
     fn insert_transcript(&mut self, transcript: &str) -> bool {
         let transcript = transcript.trim();
         if transcript.is_empty() {
@@ -1410,6 +1428,11 @@ impl App {
     fn refresh_completion(&mut self) {
         self.completion_search = None;
         self.completion_request_id = self.completion_request_id.wrapping_add(1);
+        let slash_completion_open = slash_completion_range(&self.input, self.cursor).is_some();
+        if slash_completion_open && !self.slash_completion_open {
+            self.refresh_skills();
+        }
+        self.slash_completion_open = slash_completion_open;
         let (menu, search) = complete_progressive(
             &self.input,
             self.cursor,
@@ -1473,6 +1496,7 @@ impl App {
         self.completion = None;
         self.completion_search = None;
         self.completion_request_id = self.completion_request_id.wrapping_add(1);
+        self.slash_completion_open = false;
     }
 
     fn move_completion(&mut self, delta: isize) {
@@ -2936,7 +2960,9 @@ impl App {
         let editing_id = self.queued_prompt_edit.as_ref().map(|edit| edit.id);
         let handle = self.running.take().expect("checked above");
         let turn = handle.await.context("conversation turn task failed")??;
+        let current_skills = std::mem::take(&mut self.skills);
         self.apply_snapshot(turn.snapshot);
+        self.skills = current_skills;
         self.event_rx = None;
         self.last_escape = None;
         self.live_messages.clear();
@@ -5888,7 +5914,10 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use super::*;
     use ratatui::backend::TestBackend;
@@ -7261,11 +7290,22 @@ mod tests {
         });
     }
 
+    fn write_test_skill(root: &Path) -> PathBuf {
+        let skill = root.join(".agents/skills/review-rust");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review-rust\ndescription: Review Rust changes.\n---\nReview the code.",
+        )
+        .unwrap();
+        skill
+    }
+
     #[test]
     fn slash_menu_combines_commands_and_skills_only_at_the_start() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
-        add_test_skill(&mut app);
+        write_test_skill(root.path());
 
         app.insert("/");
         let menu = app.completion.as_ref().unwrap();
@@ -7280,9 +7320,8 @@ mod tests {
                 .any(|item| item.kind == CompletionKind::Skill && item.name == "review-rust")
         );
 
-        app.input.clear();
-        app.cursor = 0;
-        app.completion = None;
+        app.clear_composer_text();
+        app.close_completion();
         app.insert("Review this /");
         let menu = app.completion.as_ref().unwrap();
         assert!(
@@ -7292,11 +7331,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opening_slash_completion_refreshes_terminal_skills_once_for_that_menu() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let skill = write_test_skill(root.path());
+
+        assert!(app.handle_paste("Please /"));
+        assert!(app.skills.iter().any(|skill| skill.name == "review-rust"));
+        assert!(
+            app.completion
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.name == "review-rust")
+        );
+
+        std::fs::remove_file(skill.join("SKILL.md")).unwrap();
+        app.insert_char('r');
+        assert!(app.skills.iter().any(|skill| skill.name == "review-rust"));
+
+        app.close_completion();
+        app.move_left();
+        assert!(app.skills.iter().all(|skill| skill.name != "review-rust"));
+    }
+
     #[tokio::test]
     async fn accepting_a_skill_completion_inserts_a_slash_mention() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
-        add_test_skill(&mut app);
+        write_test_skill(root.path());
         app.insert("Please /rev");
 
         assert!(app.accept_completion().await);
@@ -7729,23 +7794,25 @@ mod tests {
     #[test]
     fn renders_contextual_slash_menu() {
         let root = tempfile::tempdir().unwrap();
-        let mut app = test_app(root.path());
-        add_test_skill(&mut app);
-        app.insert("/");
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        write_test_skill(root.path());
+        for width in [100, 36] {
+            let mut app = test_app(root.path());
+            app.insert("/");
+            let backend = TestBackend::new(width, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
 
-        assert!(text.contains("Slash menu"));
-        assert!(text.contains("/help"));
-        assert!(text.contains("/review-rust"));
+            assert!(text.contains("Slash menu"), "missing menu at {width}");
+            assert!(text.contains("/help"), "missing command at {width}");
+            assert!(text.contains("/review-rust"), "missing skill at {width}");
+        }
     }
 
     #[test]

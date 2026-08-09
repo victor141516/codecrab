@@ -944,6 +944,10 @@ fn slash_completion_context(input: &str, cursor: usize) -> Option<SlashCompletio
     })
 }
 
+pub(crate) fn slash_completion_range(input: &str, cursor: usize) -> Option<(usize, usize)> {
+    slash_completion_context(input, cursor).map(|context| (context.start, context.end))
+}
+
 fn is_completion_name_byte(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
 }

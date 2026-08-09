@@ -55,7 +55,9 @@ import {
 import { recalledMessageForComposer } from "./composer-recall.js";
 import {
   consumeCompletionNdjson,
-  mergeCompletionUpdate
+  mergeCompletionUpdate,
+  SerialCompletionQueue,
+  SlashCompletionOpening
 } from "./completion-updates.js";
 import { isScrolledToBottom } from "./scroll.js";
 import {
@@ -181,6 +183,8 @@ let followedTurnMessageId = null;
 const seenLiveChanges = new Set();
 let autocompleteRequest = 0;
 let autocompleteController = null;
+const autocompleteQueue = new SerialCompletionQueue();
+const slashCompletionOpening = new SlashCompletionOpening();
 let copiedMessageTimer = null;
 const activityDetailElements = new Map();
 const activityDetailObservers = new Map();
@@ -2590,53 +2594,68 @@ function handleGlobalKeydown(event) {
 }
 
 function closeAutocomplete() {
+  autocompleteQueue.invalidate();
   autocompleteController?.abort();
   autocompleteController = null;
   autocompleteRequest += 1;
   autocomplete.value = null;
   autocompleteSelection.value = 0;
+  slashCompletionOpening.close();
 }
 
-async function refreshAutocomplete(element = composer.value) {
+async function refreshAutocomplete(
+  element = composer.value,
+  forceNewSkillOpening = false
+) {
   if (!element || sending.value) {
     closeAutocomplete();
     return;
   }
-  autocompleteController?.abort();
-  const controller = new AbortController();
-  autocompleteController = controller;
   const cursor = element.selectionStart ?? draft.value.length;
   const request = ++autocompleteRequest;
+  const beforeCursor = draft.value.slice(0, cursor);
+  const afterCursor = draft.value.slice(cursor);
   autocomplete.value = null;
   autocompleteSelection.value = 0;
-  const payload = {
-    request_id: request,
-    session_id: session.value?.id,
-    before_cursor: draft.value.slice(0, cursor),
-    after_cursor: draft.value.slice(cursor)
-  };
-  try {
-    const result = await api("/api/completions", {
-      method: "POST",
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-    if (request !== autocompleteRequest || controller.signal.aborted) return;
-    if (!result) {
-      autocomplete.value = null;
-      return;
+
+  return autocompleteQueue.enqueue(async () => {
+    autocompleteController?.abort();
+    const controller = new AbortController();
+    autocompleteController = controller;
+    const payload = {
+      request_id: request,
+      session_id: session.value?.id,
+      before_cursor: beforeCursor,
+      after_cursor: afterCursor,
+      skill_refresh_id:
+        slashCompletionOpening.refreshId(forceNewSkillOpening)
+    };
+    try {
+      const result = await api("/api/completions", {
+        method: "POST",
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      if (controller.signal.aborted) return;
+      slashCompletionOpening.update(result);
+      if (request !== autocompleteRequest) return;
+      if (!result) {
+        autocomplete.value = null;
+        return;
+      }
+      applyAutocompleteUpdate(result, request);
+      if (result.recursive) {
+        void streamRecursiveCompletions(payload, request, controller);
+      }
+    } catch (cause) {
+      if (cause.name === "AbortError") return;
+      slashCompletionOpening.update(null);
+      if (request === autocompleteRequest) {
+        autocomplete.value = null;
+        autocompleteSelection.value = 0;
+      }
     }
-    applyAutocompleteUpdate(result, request);
-    if (result.recursive) {
-      void streamRecursiveCompletions(payload, request, controller);
-    }
-  } catch (cause) {
-    if (cause.name === "AbortError") return;
-    if (request === autocompleteRequest) {
-      autocomplete.value = null;
-      autocompleteSelection.value = 0;
-    }
-  }
+  });
 }
 
 function applyAutocompleteUpdate(update, request) {
@@ -2687,7 +2706,10 @@ async function streamRecursiveCompletions(payload, request, controller) {
 
 function handleComposerInput(event) {
   resizeComposer();
-  refreshAutocomplete(event.target);
+  refreshAutocomplete(
+    event.target,
+    typeof event.data === "string" && event.data.includes("/")
+  );
 }
 
 function moveAutocomplete(delta) {

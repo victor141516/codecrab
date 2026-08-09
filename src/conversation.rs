@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
@@ -23,6 +23,7 @@ use crate::{
     events::{ActivityStatus, AgentActivity, AgentEvent},
     provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection, Role},
     session::{GoalStatus, Session, SessionStore, TurnOutcome},
+    skills::{Skill, SkillRegistry},
 };
 
 #[derive(Clone)]
@@ -229,6 +230,13 @@ pub(crate) struct ConversationHandle {
     session_id: Uuid,
     project_root: PathBuf,
     live_hub: ConversationLiveHub,
+    skill_refresh: Arc<Mutex<SkillRefreshCache>>,
+}
+
+const RECENT_SKILL_REFRESH_IDS: usize = 64;
+
+struct SkillRefreshCache {
+    recent: VecDeque<(Uuid, Vec<ConversationSkill>)>,
 }
 
 enum ConversationCommand {
@@ -249,6 +257,10 @@ enum ConversationCommand {
     SetModel {
         selection: ModelSelection,
         reply: oneshot::Sender<Result<ConversationSnapshot>>,
+    },
+    ReplaceSkills {
+        skills: SkillRegistry,
+        reply: Option<oneshot::Sender<ConversationSnapshot>>,
     },
     SelectBranch {
         node_id: Uuid,
@@ -329,6 +341,9 @@ impl ConversationHandle {
             ConversationLifecycle::Idle,
             0,
         )));
+        let skill_refresh = Arc::new(Mutex::new(SkillRefreshCache {
+            recent: VecDeque::new(),
+        }));
         spawn_worker(run_worker(
             agent,
             command_rx,
@@ -358,6 +373,7 @@ impl ConversationHandle {
             session_id,
             project_root,
             live_hub,
+            skill_refresh,
         })
     }
 
@@ -544,6 +560,47 @@ impl ConversationHandle {
         let (reply, response) = oneshot::channel();
         self.send(ConversationCommand::SetModel { selection, reply })?;
         receive(response, "setting the conversation model").await?
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn refresh_skills(&self) -> Result<Vec<ConversationSkill>> {
+        let (skills, view) = self.discover_skills();
+        let (reply, response) = oneshot::channel();
+        self.send(ConversationCommand::ReplaceSkills {
+            skills,
+            reply: Some(reply),
+        })?;
+        receive(response, "refreshing conversation skills").await?;
+        Ok(view)
+    }
+
+    pub(crate) fn queue_skill_refresh_once(
+        &self,
+        refresh_id: Uuid,
+    ) -> Result<Vec<ConversationSkill>> {
+        let mut cache = self
+            .skill_refresh
+            .lock()
+            .expect("conversation skill refresh mutex poisoned");
+        if let Some((_, skills)) = cache.recent.iter().find(|(id, _)| *id == refresh_id) {
+            return Ok(skills.clone());
+        }
+        let (skills, view) = self.discover_skills();
+        self.send(ConversationCommand::ReplaceSkills {
+            skills,
+            reply: None,
+        })?;
+        if cache.recent.len() == RECENT_SKILL_REFRESH_IDS {
+            cache.recent.pop_front();
+        }
+        cache.recent.push_back((refresh_id, view.clone()));
+        Ok(view)
+    }
+
+    fn discover_skills(&self) -> (SkillRegistry, Vec<ConversationSkill>) {
+        let skills = SkillRegistry::discover(&self.project_root);
+        let view = conversation_skills(skills.skills());
+        (skills, view)
     }
 
     pub(crate) async fn add_attachment(
@@ -869,6 +926,15 @@ async fn run_worker(
             ConversationCommand::SetModel { selection, reply } => {
                 agent.set_model_selection(selection);
                 reply_snapshot(&agent, &registry, &snapshots, reply);
+                false
+            }
+            ConversationCommand::ReplaceSkills { skills, reply } => {
+                agent.replace_skills(skills);
+                let current = snapshot(&agent);
+                let _ = snapshots.send(current.clone());
+                if let Some(reply) = reply {
+                    let _ = reply.send(current);
+                }
                 false
             }
             ConversationCommand::SelectBranch { node_id, reply } => {
@@ -1452,17 +1518,20 @@ fn snapshot(agent: &Agent) -> ConversationSnapshot {
     ConversationSnapshot {
         project_root: agent.project_root().to_path_buf(),
         session: agent.session().clone(),
-        skills: agent
-            .skills()
-            .iter()
-            .map(|skill| ConversationSkill {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                scope: skill.scope.label(),
-            })
-            .collect(),
+        skills: conversation_skills(agent.skills()),
         model_catalog: agent.model_catalog().to_vec(),
     }
+}
+
+fn conversation_skills(skills: &[Skill]) -> Vec<ConversationSkill> {
+    skills
+        .iter()
+        .map(|skill| ConversationSkill {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            scope: skill.scope.label(),
+        })
+        .collect()
 }
 
 fn persist(agent: &Agent, registry: &SessionRegistry) -> Result<()> {
@@ -1501,6 +1570,9 @@ fn test_runtime() -> &'static tokio::runtime::Runtime {
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
+
+    use serde_json::json;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use super::*;
     use crate::{
@@ -1618,6 +1690,138 @@ mod tests {
             .unwrap();
         assert_eq!(saved.goals[0].objective, "Ship it");
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshing_skills_replaces_the_active_worker_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let handle = test_handle(root.path());
+        assert!(handle.snapshot().skills.is_empty());
+
+        let skill = root.path().join(".agents/skills/review-rust");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review-rust\ndescription: Review Rust changes.\n---\nReview the code.",
+        )
+        .unwrap();
+
+        let refreshed = handle.refresh_skills().await.unwrap();
+        let refreshed_skill = refreshed
+            .iter()
+            .find(|skill| skill.name == "review-rust")
+            .unwrap();
+        assert_eq!(refreshed_skill.description, "Review Rust changes.");
+
+        let snapshot = handle.snapshot();
+        assert!(
+            snapshot
+                .skills
+                .iter()
+                .any(|skill| skill.name == "review-rust")
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshed_skill_lifecycle_controls_the_next_turn() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = crate::test_support::read_http_request(&mut socket).await;
+                request_tx.send(request).unwrap();
+                let body = json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "Done."}
+                    }]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join(".agents/skills/issue-62-review");
+        fs::create_dir_all(&skill).unwrap();
+        let config = Config::test("model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let session = SessionStore::new(root.path())
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "model".into())
+            .unwrap();
+        let agent = Agent::new(
+            provider,
+            ToolBox::new(root.path().to_path_buf()),
+            SkillRegistry::discover(root.path()),
+            session,
+            root.path().join(".test-global-config/AGENTS.md"),
+            crate::diagnostics::DiagnosticLog::default(),
+        )
+        .unwrap();
+        let handle = ConversationHandle::spawn(
+            agent,
+            SessionRegistry::at(root.path().join("test-global-config.toml")),
+        )
+        .unwrap();
+
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: issue-62-review\ndescription: Review the new change.\n---\nADDED_SKILL_INSTRUCTIONS",
+        )
+        .unwrap();
+        handle.refresh_skills().await.unwrap();
+        handle.turn("Use /issue-62-review".into()).await.unwrap();
+        let added_request = String::from_utf8(request_rx.recv().await.unwrap()).unwrap();
+        assert!(added_request.contains("ADDED_SKILL_INSTRUCTIONS"));
+
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: issue-62-review\ndescription: Review the updated change.\n---\nUPDATED_SKILL_INSTRUCTIONS",
+        )
+        .unwrap();
+        handle.refresh_skills().await.unwrap();
+        handle.turn("Use /issue-62-review".into()).await.unwrap();
+        let updated_request = String::from_utf8(request_rx.recv().await.unwrap()).unwrap();
+        assert!(updated_request.contains("UPDATED_SKILL_INSTRUCTIONS"));
+        assert!(!updated_request.contains("ADDED_SKILL_INSTRUCTIONS"));
+
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: mismatched-skill\ndescription: Invalid.\n---\nINVALID_SKILL_INSTRUCTIONS",
+        )
+        .unwrap();
+        handle.refresh_skills().await.unwrap();
+        handle.turn("Use /issue-62-review".into()).await.unwrap();
+        let invalid_request = String::from_utf8(request_rx.recv().await.unwrap()).unwrap();
+        assert!(!invalid_request.contains("UPDATED_SKILL_INSTRUCTIONS"));
+        assert!(!invalid_request.contains("INVALID_SKILL_INSTRUCTIONS"));
+
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: issue-62-review\ndescription: Restored skill.\n---\nRESTORED_SKILL_INSTRUCTIONS",
+        )
+        .unwrap();
+        handle.refresh_skills().await.unwrap();
+        handle.turn("Use /issue-62-review".into()).await.unwrap();
+        let restored_request = String::from_utf8(request_rx.recv().await.unwrap()).unwrap();
+        assert!(restored_request.contains("RESTORED_SKILL_INSTRUCTIONS"));
+
+        fs::remove_file(skill.join("SKILL.md")).unwrap();
+        handle.refresh_skills().await.unwrap();
+        handle.turn("Use /issue-62-review".into()).await.unwrap();
+        let deleted_request = String::from_utf8(request_rx.recv().await.unwrap()).unwrap();
+        assert!(!deleted_request.contains("RESTORED_SKILL_INSTRUCTIONS"));
+
+        handle.shutdown().await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

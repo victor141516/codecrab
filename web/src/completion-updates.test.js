@@ -2,8 +2,52 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   consumeCompletionNdjson,
-  mergeCompletionUpdate
+  mergeCompletionUpdate,
+  SerialCompletionQueue,
+  SlashCompletionOpening
 } from "./completion-updates.js";
+
+test("one refresh identity remains stable for the whole slash opening", () => {
+  let nextId = 0;
+  const opening = new SlashCompletionOpening(() => `opening-${++nextId}`);
+  assert.equal(opening.refreshId(), "opening-1");
+  assert.equal(opening.refreshId(), "opening-1");
+
+  opening.update({ slash_context: true });
+  assert.equal(opening.refreshId(), "opening-1");
+  assert.equal(opening.refreshId(true), "opening-2");
+
+  opening.close();
+  assert.equal(opening.refreshId(), "opening-3");
+  opening.update(null);
+  assert.equal(opening.refreshId(), "opening-4");
+});
+
+test("serialized completion contexts refresh after rapid slash re-entry", async () => {
+  let nextId = 0;
+  const opening = new SlashCompletionOpening(() => `opening-${++nextId}`);
+  const queue = new SerialCompletionQueue();
+  let releaseFirst;
+  const firstResponse = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const refreshIds = [];
+
+  const request = (slashContext, waitFor = Promise.resolve()) =>
+    queue.enqueue(async () => {
+      refreshIds.push(opening.refreshId());
+      await waitFor;
+      opening.update({ slash_context: slashContext });
+    });
+
+  const opened = request(true, firstResponse);
+  const left = request(false);
+  const reopened = request(true);
+  releaseFirst();
+  await Promise.all([opened, left, reopened]);
+
+  assert.deepEqual(refreshIds, ["opening-1", "opening-1", "opening-2"]);
+});
 
 test("stale recursive completion updates are rejected by request identity", () => {
   const current = {
