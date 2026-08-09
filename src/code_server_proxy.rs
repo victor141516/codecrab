@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::Body,
     extract::{Path, Request, State},
-    http::{HeaderValue, StatusCode, Uri},
+    http::{HeaderValue, StatusCode, Uri, Version},
     response::{IntoResponse, Response},
 };
 use hyper::upgrade::OnUpgrade;
@@ -69,6 +69,10 @@ async fn proxy_request(
         format!("/{}", tail.trim_start_matches('/'))
     };
     *request.uri_mut() = Uri::from_str(&format!("http://{target}{path}{query}"))?;
+    // The public Axum server accepts HTTP/2, but the loopback code-server
+    // connection is deliberately HTTP/1.1. Forwarding the inbound version
+    // makes hyper reject HTTPS-originated requests with UserUnsupportedVersion.
+    *request.version_mut() = Version::HTTP_11;
 
     let upgrade = is_upgrade(request).then(|| hyper::upgrade::on(&mut *request));
     let connector = HttpConnector::new();
@@ -157,6 +161,7 @@ mod tests {
         });
         let instance_id = Uuid::new_v4();
         let mut request = Request::builder()
+            .version(Version::HTTP_2)
             .uri(format!("/code-server/{instance_id}/workspace/file?line=7"))
             .body(Body::empty())
             .unwrap();
