@@ -5,10 +5,12 @@ let changedEmitter;
 let stopped = false;
 
 function virtualUri(commandId, index, side, path) {
-  const query = new URLSearchParams({ commandId, index: String(index), side });
-  return vscode.Uri.parse(
-    `codecrab-diff:/${encodeURIComponent(path.replaceAll("\\", "/"))}?${query}`
-  );
+  const query = new URLSearchParams({ path: path.replaceAll("\\", "/") });
+  return vscode.Uri.from({
+    scheme: "codecrab-diff",
+    path: `/${commandId}/${index}/${side}`,
+    query: query.toString()
+  });
 }
 
 async function openDiff(command) {
@@ -103,11 +105,6 @@ async function activate(context) {
   );
   const files = vscode.workspace.getConfiguration("files");
   await files.update(
-    "readonlyInclude",
-    { "**": true },
-    vscode.ConfigurationTarget.Global
-  );
-  await files.update(
     "exclude",
     {
       "**/.git": false,
@@ -122,6 +119,11 @@ async function activate(context) {
   await vscode.workspace
     .getConfiguration("explorer")
     .update("excludeGitIgnore", false, vscode.ConfigurationTarget.Global);
+  await files.update(
+    "readonlyInclude",
+    { "**": true },
+    vscode.ConfigurationTarget.Global
+  );
   await request("/handshake", { method: "POST", body: "{}" });
   void poll();
 }

@@ -2,10 +2,10 @@
   "name": "codecrab-integration",
   "displayName": "CodeCrab Integration",
   "description": "Managed bridge for CodeCrab file and diff views.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "codecrab",
   "engines": {
-    "vscode": "*"
+    "vscode": "^1.85.0"
   },
   "categories": ["Other"],
   "activationEvents": ["onStartupFinished"],

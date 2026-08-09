@@ -563,6 +563,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extension_manifest_has_a_specific_compatible_vscode_engine() {
+        let manifest: serde_json::Value = serde_json::from_str(EXTENSION_PACKAGE).unwrap();
+        assert_eq!(manifest["version"], "1.0.1");
+        assert_eq!(manifest["engines"]["vscode"], "^1.85.0");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn native_windows_reports_the_managed_integration_as_unavailable() {
