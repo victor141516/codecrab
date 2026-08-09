@@ -13,6 +13,9 @@ request_timeout_seconds = 180
 # Optional deterministic shell executable for managed PTYs. When omitted,
 # CodeCrab detects the user's shell and falls back to platform defaults.
 # shell = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+# Optional path to code-server. When omitted, CodeCrab searches PATH.
+# CodeCrab never downloads or installs code-server.
+# code_server_path = "/usr/local/bin/code-server"
 # Managed automatically as projects acquire or lose saved sessions.
 # Paths may also be added manually.
 session_directories = []

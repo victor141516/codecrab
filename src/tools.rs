@@ -64,6 +64,19 @@ impl ToolBox {
         &self.root
     }
 
+    pub(crate) fn resolve_tool_file_path(&self, name: &str, args: &str) -> Result<PathBuf> {
+        if !matches!(name, "write_file" | "replace_in_file") {
+            anyhow::bail!("{name:?} is not a file mutation tool");
+        }
+        let parsed: Value = serde_json::from_str(args).context("invalid file tool arguments")?;
+        let relative = required_string(&parsed, "path")?;
+        if name == "replace_in_file" {
+            self.existing_path(relative)
+        } else {
+            self.new_path(relative)
+        }
+    }
+
     pub(crate) fn definitions(&self) -> Vec<Value> {
         let mut definitions = vec![
             tool(

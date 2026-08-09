@@ -6864,6 +6864,8 @@ mod tests {
                 status: ActivityStatus::Completed,
                 title: "Ran".into(),
                 detail: "cargo test --all".into(),
+                change_id: None,
+                live_change_id: None,
             },
             AgentActivity {
                 id: "write-1".into(),
@@ -6877,6 +6879,8 @@ mod tests {
                 status: ActivityStatus::Completed,
                 title: "Wrote".into(),
                 detail: "src/lib.rs".into(),
+                change_id: None,
+                live_change_id: None,
             },
         ]);
 
@@ -6921,6 +6925,8 @@ mod tests {
             },
             title: "Ran".into(),
             detail: "cargo test".into(),
+            change_id: None,
+            live_change_id: None,
         });
         app.turns.push(AgentTurn {
             message_id: Uuid::nil(),
@@ -6928,6 +6934,7 @@ mod tests {
             started_at,
             completed_at: completed.then_some(started_at + chrono::Duration::seconds(7)),
             outcome: completed.then_some(crate::session::TurnOutcome::Completed),
+            change_id: None,
         });
         TurnKey {
             session_id: app.session_id,
@@ -7381,6 +7388,8 @@ mod tests {
             status: ActivityStatus::Completed,
             title: "Ran".into(),
             detail: "cargo test".into(),
+            change_id: None,
+            live_change_id: None,
         });
 
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
@@ -7472,6 +7481,8 @@ mod tests {
             status: ActivityStatus::Completed,
             title: "Read".into(),
             detail: "src/main.rs".into(),
+            change_id: None,
+            live_change_id: None,
         });
         app.transcript
             .push(Message::text(Role::Assistant, "Inspection complete."));
@@ -7536,6 +7547,8 @@ mod tests {
                 status: ActivityStatus::Completed,
                 title: "Read".into(),
                 detail: "src/first.rs".into(),
+                change_id: None,
+                live_change_id: None,
             },
             AgentActivity {
                 id: "call-2".into(),
@@ -7549,6 +7562,8 @@ mod tests {
                 status: ActivityStatus::Completed,
                 title: "Read".into(),
                 detail: "src/second.rs".into(),
+                change_id: None,
+                live_change_id: None,
             },
         ]);
 
@@ -7582,6 +7597,8 @@ mod tests {
             status: ActivityStatus::Completed,
             title: "Read".into(),
             detail: file.display().to_string(),
+            change_id: None,
+            live_change_id: None,
         };
 
         assert_eq!(

@@ -384,6 +384,10 @@ only frontend code and needing faster feedback.
 - A release is created by pushing an annotated Git tag named `vX.Y.Z` whose
   version matches the package version. The lowercase `v` is required by
   `.github/workflows/release.yml`.
+- The managed `code-server` integration keeps an informational tested-version
+  reference. Update it only after the managed process, embedded extension,
+  proxy, file navigation, and diff workflows pass against the newer release.
+  CodeCrab must not install or require that exact version.
 - Pushing the tag starts GitHub Actions, which creates a draft release, builds
   and uploads the platform binaries, and publishes the release after all
   required x64 assets are present.
