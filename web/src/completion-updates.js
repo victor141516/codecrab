@@ -1,3 +1,43 @@
+export class SlashCompletionOpening {
+  constructor(generateId = () => crypto.randomUUID()) {
+    this.generateId = generateId;
+    this.id = null;
+  }
+
+  refreshId(forceNew = false) {
+    if (forceNew || !this.id) this.id = this.generateId();
+    return this.id;
+  }
+
+  update(response) {
+    if (!response?.slash_context) this.id = null;
+  }
+
+  close() {
+    this.id = null;
+  }
+}
+
+export class SerialCompletionQueue {
+  constructor() {
+    this.tail = Promise.resolve();
+    this.generation = 0;
+  }
+
+  enqueue(task) {
+    const generation = this.generation;
+    const run = () =>
+      generation === this.generation ? task() : Promise.resolve();
+    const completion = this.tail.then(run, run);
+    this.tail = completion.catch(() => {});
+    return completion;
+  }
+
+  invalidate() {
+    this.generation += 1;
+  }
+}
+
 export function mergeCompletionUpdate(
   current,
   selectedIndex,

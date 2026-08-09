@@ -418,7 +418,7 @@ Discovery precedence is:
 3. `$CODEX_HOME/skills`, or `~/.codex/skills`.
 4. Extra path-list entries from `CODECRAB_SKILLS_DIR`.
 
-Project skills shadow later skills with the same name. CodeCrab initially exposes compact skill metadata, loads the full `SKILL.md` only when selected, and reads referenced resources progressively.
+Project skills shadow later skills with the same name. CodeCrab initially exposes compact skill metadata, loads the full `SKILL.md` only when selected, and reads referenced resources progressively. Opening `/` completion lazily rediscovers skills in both clients, so added, edited, deleted, or newly invalid skills take effect in the active conversation without restarting it.
 
 For general personal guidance, create `~/.config/codecrab/AGENTS.md`. For repository-specific guidance, create `AGENTS.md` at the selected project root. CodeCrab snapshots these instructions when constructing an agent, so changes apply to new conversations, cold resumes, or project switches rather than an already-running agent.
 

@@ -43,7 +43,7 @@ use crate::{
     code_server::{CodeServerManager, EditorStatus, ExtensionAction, ExtensionDiffFile},
     completion::{
         CompletionItem, complete as complete_input, file_completion_context,
-        recursive_file_completion_available, start_file_completion_search,
+        recursive_file_completion_available, slash_completion_range, start_file_completion_search,
     },
     config::{
         Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry, paths_equal,
@@ -323,6 +323,8 @@ struct CompletionRequest {
     session_id: Option<Uuid>,
     before_cursor: String,
     after_cursor: String,
+    #[serde(default)]
+    skill_refresh_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -367,6 +369,7 @@ struct CompletionResponse {
     replace_before: String,
     replace_after: String,
     recursive: bool,
+    slash_context: bool,
 }
 
 #[derive(Serialize)]
@@ -1079,12 +1082,17 @@ async fn completions(
         })?;
     let snapshot = conversation.snapshot();
     let recursive = recursive_file_completion_available(&input, cursor, &snapshot.project_root);
+    let slash_range = slash_completion_range(&input, cursor);
+    let skills = if let (Some(refresh_id), Some(_)) = (request.skill_refresh_id, slash_range) {
+        conversation.queue_skill_refresh_once(refresh_id)?
+    } else {
+        snapshot.skills.clone()
+    };
     let menu = complete_input(
         &input,
         cursor,
         &snapshot.project_root,
-        snapshot
-            .skills
+        skills
             .iter()
             .map(|skill| (skill.name.as_str(), skill.description.as_str())),
     );
@@ -1095,6 +1103,10 @@ async fn completions(
                 .expect("recursive availability requires a file completion context");
             (Vec::new(), context.start, context.end)
         }
+        None if slash_range.is_some() => {
+            let (start, end) = slash_range.expect("checked above");
+            (Vec::new(), start, end)
+        }
         None => return Ok(Json(None)),
     };
     Ok(Json(Some(CompletionResponse {
@@ -1103,6 +1115,7 @@ async fn completions(
         replace_after: input[cursor..token_end].to_owned(),
         items,
         recursive,
+        slash_context: slash_range.is_some(),
     })))
 }
 
@@ -3745,6 +3758,7 @@ mod tests {
                 session_id: None,
                 before_cursor: "/".into(),
                 after_cursor: String::new(),
+                skill_refresh_id: None,
             }),
         )
         .await
@@ -3770,6 +3784,7 @@ mod tests {
                 session_id: None,
                 before_cursor: "@".into(),
                 after_cursor: String::new(),
+                skill_refresh_id: None,
             }),
         )
         .await
@@ -3791,6 +3806,7 @@ mod tests {
                 session_id: None,
                 before_cursor: "@config".into(),
                 after_cursor: String::new(),
+                skill_refresh_id: None,
             }),
         )
         .await
@@ -3808,6 +3824,7 @@ mod tests {
                 session_id: None,
                 before_cursor: "@config".into(),
                 after_cursor: String::new(),
+                skill_refresh_id: None,
             }),
         )
         .await
@@ -3821,6 +3838,115 @@ mod tests {
         assert!(messages.contains("\"request_id\":9"));
         assert!(messages.contains("nested/deeper/my-config-file.toml"));
         assert!(messages.contains("\"type\":\"done\""));
+    }
+
+    #[tokio::test]
+    async fn slash_completion_refreshes_skills_once_per_opening() {
+        async fn slash(
+            state: &ServerState,
+            request_id: u64,
+            before_cursor: &str,
+            skill_refresh_id: Uuid,
+        ) -> CompletionResponse {
+            completions(
+                State(state.clone()),
+                Json(CompletionRequest {
+                    request_id,
+                    session_id: None,
+                    before_cursor: before_cursor.into(),
+                    after_cursor: String::new(),
+                    skill_refresh_id: Some(skill_refresh_id),
+                }),
+            )
+            .await
+            .ok()
+            .unwrap()
+            .0
+            .unwrap()
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let store = SessionStore::new(&root).unwrap();
+        let session = store
+            .create(
+                config
+                    .provider(&config.active_provider)
+                    .unwrap()
+                    .model
+                    .clone(),
+            )
+            .unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+
+        let skill = root.join(".agents/skills/review-rust");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review-rust\ndescription: Review Rust changes.\n---\nReview the code.",
+        )
+        .unwrap();
+
+        let first_opening = Uuid::new_v4();
+        let opened = slash(&state, 1, "/", first_opening).await;
+        assert!(opened.slash_context);
+        assert!(opened.items.iter().any(|item| item.name == "review-rust"));
+
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review-rust\ndescription: Review updated Rust changes.\n---\nReview the updated code.",
+        )
+        .unwrap();
+        let continued = slash(&state, 2, "/r", first_opening).await;
+        let stale_skill = continued
+            .items
+            .iter()
+            .find(|item| item.name == "review-rust")
+            .unwrap();
+        assert_eq!(stale_skill.description, "Review Rust changes.");
+
+        let refreshed = slash(&state, 3, "/", Uuid::new_v4()).await;
+        let refreshed_skill = refreshed
+            .items
+            .iter()
+            .find(|item| item.name == "review-rust")
+            .unwrap();
+        assert_eq!(refreshed_skill.description, "Review updated Rust changes.");
+
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: different-skill\ndescription: Mismatched directory.\n---\nInvalid instructions.",
+        )
+        .unwrap();
+        let invalid = slash(&state, 4, "/", Uuid::new_v4()).await;
+        assert!(invalid.items.iter().all(|item| item.name != "review-rust"));
+
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review-rust\ndescription: Restored Rust review.\n---\nRestored instructions.",
+        )
+        .unwrap();
+        let restored_opening = Uuid::new_v4();
+        let restored = slash(&state, 5, "/", restored_opening).await;
+        assert!(restored.items.iter().any(|item| item.name == "review-rust"));
+
+        std::fs::remove_file(skill.join("SKILL.md")).unwrap();
+        let continued = slash(&state, 6, "/r", restored_opening).await;
+        assert!(
+            continued
+                .items
+                .iter()
+                .any(|item| item.name == "review-rust")
+        );
+        let deleted_opening = Uuid::new_v4();
+        let deleted = slash(&state, 7, "/", deleted_opening).await;
+        assert!(deleted.items.iter().all(|item| item.name != "review-rust"));
+
+        let empty_context = slash(&state, 8, "Please /zzz", deleted_opening).await;
+        assert!(empty_context.slash_context);
+        assert!(empty_context.items.is_empty());
     }
 
     #[tokio::test]
@@ -3887,6 +4013,7 @@ mod tests {
                 session_id: None,
                 before_cursor: "@".into(),
                 after_cursor: String::new(),
+                skill_refresh_id: None,
             }),
         )
         .await

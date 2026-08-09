@@ -177,6 +177,10 @@ impl Agent {
         self.skills.skills()
     }
 
+    pub(crate) fn replace_skills(&mut self, skills: SkillRegistry) {
+        self.skills = skills;
+    }
+
     pub(crate) fn model_catalog(&self) -> &[ModelCatalogEntry] {
         &self.model_catalog
     }
@@ -2993,7 +2997,6 @@ mod tests {
         };
         let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let tools = ToolBox::new(root.clone());
-        let skills = SkillRegistry::discover(&root);
         let store = SessionStore::new(&root).unwrap();
         let session = store
             .create(
@@ -3004,7 +3007,8 @@ mod tests {
                     .clone(),
             )
             .unwrap();
-        let mut agent = test_agent(provider, tools, skills, session).unwrap();
+        let mut agent = test_agent(provider, tools, SkillRegistry::default(), session).unwrap();
+        agent.replace_skills(SkillRegistry::discover(&root));
 
         let answer = agent.turn("Review this").await.unwrap();
 
