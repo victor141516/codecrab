@@ -30,6 +30,7 @@ import {
   Settings,
   Pause,
   Paperclip,
+  PanelLeftClose,
   PanelRight,
   Pencil,
   Play,
@@ -107,6 +108,10 @@ import {
   toggleSessionExpansion,
   visibleSessionRows
 } from "./project-sidebar.js";
+import {
+  loadDesktopSidebarCollapsed,
+  saveDesktopSidebarCollapsed
+} from "./sidebar-preference.js";
 
 const state = ref(null);
 const draft = ref("");
@@ -118,6 +123,7 @@ const recording = ref(false);
 const transcribing = ref(false);
 const error = ref("");
 const sidebarOpen = ref(false);
+const desktopSidebarCollapsed = ref(loadDesktopSidebarCollapsed());
 const projectSidebar = ref(null);
 const composer = ref(null);
 const conversation = ref(null);
@@ -3297,13 +3303,22 @@ function editorFollowKey(project = state.value?.project) {
 }
 
 function editorAvailableWidth() {
-  const sidebarWidth = window.matchMedia("(min-width: 1024px)").matches
+  const sidebarWidth =
+    window.matchMedia("(min-width: 1024px)").matches &&
+    !desktopSidebarCollapsed.value
     ? projectSidebar.value?.getBoundingClientRect().width ?? 0
     : 0;
   return Math.max(
     EDITOR_MIN_WIDTH + CHAT_MIN_WIDTH,
     window.innerWidth - sidebarWidth
   );
+}
+
+async function setDesktopSidebarCollapsed(collapsed) {
+  desktopSidebarCollapsed.value = collapsed;
+  saveDesktopSidebarCollapsed(collapsed);
+  await nextTick();
+  clampEditorToViewport();
 }
 
 function clampEditorToViewport() {
@@ -3996,14 +4011,26 @@ onBeforeUnmount(() => {
 
     <aside
       ref="projectSidebar"
-      class="app-sidebar fixed inset-y-0 left-0 z-40 flex w-72 -translate-x-full flex-col border-r bg-panel transition-transform duration-200 lg:translate-x-0"
-      :class="{ 'translate-x-0': sidebarOpen }"
+      class="app-sidebar fixed inset-y-0 left-0 z-40 flex w-72 -translate-x-full flex-col border-r bg-panel transition-transform duration-200"
+      :class="{
+        'translate-x-0': sidebarOpen,
+        'lg:translate-x-0': !desktopSidebarCollapsed,
+        'lg:-translate-x-full': desktopSidebarCollapsed
+      }"
     >
       <div class="flex h-14 items-center gap-3 border-b border-white/7 px-4">
         <div class="brand-mark grid size-7 place-items-center rounded-md bg-coral text-sm font-black text-black">
           C
         </div>
         <span class="text-sm font-semibold tracking-tight text-white">CodeCrab</span>
+        <button
+          class="ml-auto hidden size-8 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-white lg:grid"
+          aria-label="Hide projects and sessions"
+          title="Hide projects and sessions"
+          @click="setDesktopSidebarCollapsed(true)"
+        >
+          <PanelLeftClose class="size-4" aria-hidden="true" />
+        </button>
       </div>
 
       <div class="px-3 py-3.5">
@@ -4161,12 +4188,24 @@ onBeforeUnmount(() => {
       </div>
     </aside>
 
-    <main class="workspace-shell flex h-full min-w-0 flex-col lg:pl-72">
+    <main
+      class="workspace-shell flex h-full min-w-0 flex-col transition-[padding-left] duration-200"
+      :class="{ 'lg:pl-72': !desktopSidebarCollapsed }"
+    >
       <header class="app-header flex h-14 shrink-0 items-center gap-3 border-b bg-ink/90 px-4 backdrop-blur">
         <button
           class="grid size-8 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-white lg:hidden"
-          aria-label="Open sessions"
+          aria-label="Show projects and sessions"
           @click="sidebarOpen = true"
+        >
+          <Menu class="size-4" aria-hidden="true" />
+        </button>
+        <button
+          v-if="desktopSidebarCollapsed"
+          class="hidden size-8 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-white lg:grid"
+          aria-label="Show projects and sessions"
+          title="Show projects and sessions"
+          @click="setDesktopSidebarCollapsed(false)"
         >
           <Menu class="size-4" aria-hidden="true" />
         </button>
