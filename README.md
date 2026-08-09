@@ -219,7 +219,7 @@ codecrab resume
 codecrab resume <session-id-or-prefix>
 ```
 
-The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact `child of` hint. Deleting a parent does not delete or rewrite its descendants.
+The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches. On desktop, the web sidebar can be hidden completely from its header and reopened from the workspace header; that browser-local preference survives reloads, while the compact mobile drawer remains transient. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact `child of` hint. Deleting a parent does not delete or rewrite its descendants.
 
 The web composer keeps model, reasoning, and speed selection beside its attachment, dictation, and send actions. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
 

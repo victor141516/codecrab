@@ -40,5 +40,5 @@ test("server project picker remains usable in compact and wide viewports", () =>
   assert.match(appSource, /max-h-\[90dvh\]/);
   assert.match(appSource, /p-3 backdrop-blur-sm sm:p-6/);
   assert.match(appSource, /flex-col-reverse gap-2 sm:flex-row/);
-  assert.doesNotMatch(appSource, /Show projects/);
+  assert.doesNotMatch(appSource, /Show projects on server/);
 });
