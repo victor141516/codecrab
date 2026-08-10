@@ -191,6 +191,7 @@ struct TurnToggleTarget {
 struct ConversationSource {
     lines: Vec<Line<'static>>,
     user_lines: HashSet<usize>,
+    single_row_lines: HashSet<usize>,
     copy_targets: Vec<CopyTarget>,
     turn_toggles: Vec<TurnToggleTarget>,
     node_lines: Vec<(Uuid, usize)>,
@@ -4562,7 +4563,12 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     });
 
     let source = conversation_source(app);
-    let rows = wrap_conversation_lines(&source.lines, &source.user_lines, inner.width.max(1));
+    let rows = wrap_conversation_lines(
+        &source.lines,
+        &source.user_lines,
+        &source.single_row_lines,
+        inner.width.max(1),
+    );
     if let Some(anchor) = app.pending_turn_anchor.take()
         && let Some(summary_line) = source
             .turn_toggles
@@ -4630,6 +4636,7 @@ fn conversation_source(app: &App) -> ConversationSource {
     let mut source = ConversationSource {
         lines: Vec::new(),
         user_lines: HashSet::new(),
+        single_row_lines: HashSet::new(),
         copy_targets: Vec::new(),
         turn_toggles: Vec::new(),
         node_lines: Vec::new(),
@@ -5151,9 +5158,12 @@ fn push_activity_line(source: &mut ConversationSource, app: &App, activity: &Age
         ),
         Span::styled(detail.clone(), Style::default().fg(MUTED)),
     ]));
+    if matches!(activity.tool.as_str(), "shell" | "shell_noninteractive") {
+        source.single_row_lines.insert(line_index);
+    }
     if matches!(
         activity.tool.as_str(),
-        "shell" | "read_file" | "write_file" | "replace_in_file"
+        "shell" | "shell_noninteractive" | "read_file" | "write_file" | "replace_in_file"
     ) && !detail.is_empty()
     {
         source.copy_targets.push(CopyTarget {
@@ -5170,6 +5180,7 @@ fn push_activity_line(source: &mut ConversationSource, app: &App, activity: &Age
 fn wrap_conversation_lines(
     lines: &[Line<'static>],
     user_lines: &HashSet<usize>,
+    single_row_lines: &HashSet<usize>,
     width: u16,
 ) -> Vec<VisualRow> {
     let mut rows = Vec::new();
@@ -5181,7 +5192,12 @@ fn wrap_conversation_lines(
         };
         let mut row_width = 0;
         let mut source_offset = 0;
-        for span in &line.spans {
+        let source_length = line
+            .spans
+            .iter()
+            .map(|span| span.content.len())
+            .sum::<usize>();
+        'content: for span in &line.spans {
             for character in span.content.chars() {
                 let source_start = source_offset;
                 source_offset += character.len_utf8();
@@ -5201,6 +5217,23 @@ fn wrap_conversation_lines(
                     continue;
                 }
                 if !row.units.is_empty() && row_width + character_width > width {
+                    if single_row_lines.contains(&source_line) {
+                        let mut omitted_start = source_start;
+                        while !row.units.is_empty() && row_width.saturating_add(1) > width {
+                            let removed = row.units.pop().expect("row was checked as non-empty");
+                            row_width = row_width.saturating_sub(removed.width);
+                            omitted_start = removed.source_start;
+                        }
+                        row.units.push(VisualUnit {
+                            text: "…".into(),
+                            width: 1,
+                            style: span.style,
+                            source_line,
+                            source_start: omitted_start,
+                            source_end: source_length,
+                        });
+                        break 'content;
+                    }
                     rows.push(std::mem::take(&mut row));
                     row.source_line = source_line;
                     row.user_message = user_lines.contains(&source_line);
@@ -7586,6 +7619,79 @@ mod tests {
         assert!(!copied.iter().any(|text| text.contains("Wrote src")));
     }
 
+    #[test]
+    fn long_shell_commands_use_one_terminal_row_without_losing_the_full_detail() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let command = "cargo test --workspace --all-features --release";
+        app.pending_user = Some("Run every test".into());
+        app.activities.push(AgentActivity {
+            id: "shell-1".into(),
+            turn_message_id: Uuid::nil(),
+            turn_message_index: 0,
+            sequence: Some(1),
+            started_at: None,
+            completed_at: None,
+            tool: "shell".into(),
+            kind: ActivityKind::Shell,
+            status: ActivityStatus::Completed,
+            title: "Ran command".into(),
+            detail: command.into(),
+            change_id: None,
+            live_change_id: None,
+        });
+
+        let source = conversation_source(&app);
+        let activity_line = source
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains(command))
+            .unwrap();
+        assert!(source.single_row_lines.contains(&activity_line));
+
+        let rows = wrap_conversation_lines(
+            &source.lines,
+            &source.user_lines,
+            &source.single_row_lines,
+            32,
+        );
+        let activity_rows = rows
+            .iter()
+            .filter(|row| row.source_line == activity_line)
+            .collect::<Vec<_>>();
+        assert_eq!(activity_rows.len(), 1);
+        let collapsed = activity_rows[0]
+            .units
+            .iter()
+            .map(|unit| unit.text.as_str())
+            .collect::<String>();
+        assert!(collapsed.contains("cargo test"));
+        assert!(collapsed.ends_with('…'));
+        assert!(
+            source
+                .copy_targets
+                .iter()
+                .any(|target| target.text == command)
+        );
+
+        let full_line = source.lines[activity_line].to_string();
+        let wide_rows = wrap_conversation_lines(
+            &source.lines,
+            &source.user_lines,
+            &source.single_row_lines,
+            display_width(&full_line) as u16,
+        );
+        let wide_activity = wide_rows
+            .iter()
+            .find(|row| row.source_line == activity_line)
+            .unwrap()
+            .units
+            .iter()
+            .map(|unit| unit.text.as_str())
+            .collect::<String>();
+        assert_eq!(wide_activity, full_line);
+    }
+
     fn add_terminal_turn(app: &mut App, completed: bool) -> TurnKey {
         let started_at = chrono::Utc::now() - chrono::Duration::seconds(7);
         app.transcript
@@ -7675,7 +7781,12 @@ mod tests {
         let mut completed = test_app(root.path());
         let key = add_terminal_turn(&mut completed, true);
         let source = conversation_source(&completed);
-        let rows = wrap_conversation_lines(&source.lines, &source.user_lines, 80);
+        let rows = wrap_conversation_lines(
+            &source.lines,
+            &source.user_lines,
+            &source.single_row_lines,
+            80,
+        );
         let summary_line = source.turn_toggles[0].line;
         let summary_row = rows
             .iter()
@@ -7726,7 +7837,7 @@ mod tests {
     #[test]
     fn dragged_selection_copies_visual_text_without_newlines_at_soft_wraps() {
         let lines = vec![Line::from("abcdef"), Line::from("🦀x")];
-        let rows = wrap_conversation_lines(&lines, &HashSet::new(), 3);
+        let rows = wrap_conversation_lines(&lines, &HashSet::new(), &HashSet::new(), 3);
         let view = ConversationView {
             area: Rect::new(0, 0, 3, 3),
             rows,
