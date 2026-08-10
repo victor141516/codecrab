@@ -12,6 +12,7 @@ import {
   ArrowUp,
   CalendarClock,
   Check,
+  CircleStop,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -26,6 +27,7 @@ import {
   GitBranch,
   ListTodo,
   LoaderCircle,
+  LocateFixed,
   Menu,
   Mic,
   Settings,
@@ -39,6 +41,7 @@ import {
   Plus,
   RefreshCw,
   Square,
+  SquareTerminal,
   Trash2,
   X
 } from "@lucide/vue";
@@ -161,6 +164,17 @@ const usageRefreshing = ref(false);
 const usageResetting = ref(false);
 const usageConfirm = ref(false);
 const usageNotice = ref("");
+const processesOpen = ref(false);
+const processes = ref([]);
+const selectedProcessId = ref(null);
+const processOutput = ref(null);
+const processStopConfirm = ref(false);
+const processError = ref("");
+const processOutputViewport = ref(null);
+const processOutputFollowing = ref(true);
+const processNow = ref(Date.now());
+let processRefreshTimer = null;
+let processRefreshPending = false;
 let usageResetKey = null;
 let queuedUsageRefresh = null;
 const cronOpen = ref(false);
@@ -1058,7 +1072,7 @@ async function resumeSession(project, id) {
   );
   if (!nextState) {
     await rollbackComposerNavigation(source);
-    return;
+    return null;
   }
   await activateComposerDraft(nextState.project, nextState.session?.id);
   if (
@@ -1068,10 +1082,20 @@ async function resumeSession(project, id) {
     void runPrompt("", { continuation: true });
   }
   if (runtimeFor(id).error) error.value = runtimeFor(id).error;
+  return nextState;
 }
 
-async function deleteSession(project, id) {
+async function deleteSession(project, id, activeTerminalCount = 0) {
   if (runtimeFor(id).sending) return;
+  const stopProcesses = activeTerminalCount > 0;
+  if (
+    stopProcesses &&
+    !window.confirm(
+      `This session has ${activeTerminalCount} active managed terminal${activeTerminalCount === 1 ? "" : "s"}. Stop them before deleting the session?`
+    )
+  ) {
+    return;
+  }
   const deletingActive =
     project === state.value?.project && id === session.value?.id;
   if (deletingActive) closeAutocomplete();
@@ -1082,7 +1106,7 @@ async function deleteSession(project, id) {
   try {
     const nextState = await api("/api/sessions/delete", {
       method: "POST",
-      body: JSON.stringify({ project, id })
+      body: JSON.stringify({ project, id, stop_processes: stopProcesses })
     });
     sessionStates.delete(id);
     sessionRuntimes.delete(id);
@@ -1103,6 +1127,176 @@ async function deleteSession(project, id) {
     if (source) await rollbackComposerNavigation(source);
     error.value = cause.message;
   }
+}
+
+function processQuery(sessionId = session.value?.id) {
+  return sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+}
+
+async function refreshProcesses() {
+  if (!processesOpen.value || !session.value?.id || processRefreshPending) return;
+  processRefreshPending = true;
+  processNow.value = Date.now();
+  try {
+    processes.value = await api(`/api/processes${processQuery()}`);
+    if (selectedProcessId.value) {
+      const viewport = processOutputViewport.value;
+      const follow =
+        processOutputFollowing.value ||
+        !viewport ||
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 24;
+      processOutput.value = await api(
+        `/api/processes/${encodeURIComponent(selectedProcessId.value)}${processQuery()}`
+      );
+      if (follow) {
+        processOutputFollowing.value = true;
+        await nextTick();
+        if (processOutputViewport.value) {
+          processOutputViewport.value.scrollTop =
+            processOutputViewport.value.scrollHeight;
+        }
+      }
+    }
+    processError.value = "";
+  } catch (cause) {
+    processError.value = cause.message;
+  } finally {
+    processRefreshPending = false;
+  }
+}
+
+function startProcessRefresh() {
+  if (processRefreshTimer) window.clearInterval(processRefreshTimer);
+  processRefreshTimer = window.setInterval(() => {
+    void refreshProcesses();
+  }, 250);
+}
+
+async function openProcesses() {
+  if (!session.value?.id) {
+    error.value = "Create or resume a session before managing processes.";
+    return;
+  }
+  processesOpen.value = true;
+  selectedProcessId.value = null;
+  processOutput.value = null;
+  processStopConfirm.value = false;
+  processError.value = "";
+  processOutputFollowing.value = true;
+  await refreshProcesses();
+  startProcessRefresh();
+}
+
+function closeProcesses() {
+  processesOpen.value = false;
+  selectedProcessId.value = null;
+  processOutput.value = null;
+  processStopConfirm.value = false;
+  processError.value = "";
+  if (processRefreshTimer) window.clearInterval(processRefreshTimer);
+  processRefreshTimer = null;
+}
+
+async function openSessionProcesses(project, id) {
+  if (project !== state.value?.project || id !== session.value?.id) {
+    const resumed = await resumeSession(project, id);
+    if (!resumed) return;
+  }
+  await openProcesses();
+}
+
+async function viewProcess(terminalId) {
+  selectedProcessId.value = terminalId;
+  processOutput.value = null;
+  processStopConfirm.value = false;
+  processOutputFollowing.value = true;
+  await refreshProcesses();
+}
+
+function backToProcessList() {
+  selectedProcessId.value = null;
+  processOutput.value = null;
+  processStopConfirm.value = false;
+}
+
+function selectedProcess() {
+  return (
+    processes.value.find(
+      (process) => process.terminal_id === selectedProcessId.value
+    ) ?? null
+  );
+}
+
+function requestProcessStop(terminalId) {
+  selectedProcessId.value = terminalId;
+  processStopConfirm.value = true;
+}
+
+async function confirmProcessStop() {
+  const terminalId = selectedProcessId.value;
+  if (!terminalId) return;
+  try {
+    processOutput.value = await api("/api/processes/stop", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: session.value?.id,
+        terminal_id: terminalId
+      })
+    });
+    processStopConfirm.value = false;
+    await refreshProcesses();
+  } catch (cause) {
+    processError.value = cause.message;
+  }
+}
+
+function formatProcessDuration(createdAt) {
+  const seconds = Math.max(
+    0,
+    Math.floor((processNow.value - Date.parse(createdAt)) / 1000)
+  );
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) {
+    return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+  }
+  return `${Math.floor(seconds / 3600)}h ${String(
+    Math.floor((seconds % 3600) / 60)
+  ).padStart(2, "0")}m`;
+}
+
+function processStateLabel(process) {
+  return {
+    running: "Running",
+    exited: process?.exit_code == null ? "Exited" : `Exited ${process.exit_code}`,
+    closed: "Stopped",
+    interrupted: "Interrupted"
+  }[process?.process_state] ?? "Waiting";
+}
+
+function terminalSpanStyle(style) {
+  let foreground = style?.foreground;
+  let background = style?.background;
+  if (style?.reverse) [foreground, background] = [background, foreground];
+  return {
+    color: foreground,
+    backgroundColor: background,
+    fontWeight: style?.bold ? "700" : undefined,
+    opacity: style?.faint ? "0.65" : undefined,
+    fontStyle: style?.italic ? "italic" : undefined,
+    textDecoration: [
+      style?.underline && style.underline !== "none" ? "underline" : "",
+      style?.strikethrough ? "line-through" : ""
+    ]
+      .filter(Boolean)
+      .join(" ") || undefined
+  };
+}
+
+function handleProcessOutputScroll() {
+  const viewport = processOutputViewport.value;
+  if (!viewport) return;
+  processOutputFollowing.value =
+    viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 24;
 }
 
 function preserveNewerLiveGlobals(nextState) {
@@ -2403,6 +2597,12 @@ async function sendPrompt() {
     openBranchNavigator();
     return;
   }
+  if (prompt === "/processes") {
+    await clearComposer();
+    closeAutocomplete();
+    await openProcesses();
+    return;
+  }
   if (prompt === "/goal") {
     error.value = "Write the objective after /goal.";
     return;
@@ -2738,6 +2938,17 @@ function handleGlobalKeydown(event) {
   if (cronOpen.value) {
     event.preventDefault();
     cronOpen.value = false;
+    return;
+  }
+  if (processesOpen.value) {
+    event.preventDefault();
+    if (processStopConfirm.value) {
+      processStopConfirm.value = false;
+    } else if (selectedProcessId.value) {
+      backToProcessList();
+    } else {
+      closeProcesses();
+    }
     return;
   }
   if (!sending.value) return;
@@ -3318,6 +3529,56 @@ async function scrollToBranchMessage(
   return true;
 }
 
+async function goToProcessOrigin() {
+  const activityId =
+    processOutput.value?.origin_activity_id ??
+    selectedProcess()?.origin_activity_id;
+  if (!activityId) {
+    processError.value = "This terminal has no recorded origin activity.";
+    return;
+  }
+  closeProcesses();
+  await scrollToActivity(activityId);
+}
+
+async function goToProcessOriginFor(process) {
+  selectedProcessId.value = process.terminal_id;
+  await goToProcessOrigin();
+}
+
+async function scrollToActivity(activityId) {
+  const item = timeline.value.find(
+    (candidate) =>
+      candidate.type === "assistant_turn" &&
+      candidate.events.some(
+        (event) =>
+          event.type === "activity" && event.activity.id === activityId
+      )
+  );
+  const model = virtualTimelineStore.active();
+  const viewport = conversation.value;
+  const index = item ? model?.indexByKey.get(item.key) : null;
+  if (!item || !model || !viewport || index == null) {
+    error.value = "The originating shell activity is not visible on this branch.";
+    return false;
+  }
+  const expanded = new Set(expandedTurnKeys.value);
+  expanded.add(item.key);
+  expandedTurnKeys.value = expanded;
+  autoScroll.value = false;
+  viewport.scrollTop =
+    TIMELINE_VERTICAL_PADDING + Math.max(0, model.offsetForIndex(index) - 16);
+  updateVirtualWindow();
+  await nextTick();
+  await nextTick();
+  const activity = viewport.querySelector(
+    `[data-activity-id="${CSS.escape(activityId)}"]`
+  );
+  activity?.scrollIntoView({ block: "center" });
+  updateVirtualWindow();
+  return true;
+}
+
 function ensureTimelineResizeObserver() {
   if (timelineResizeObserver || typeof ResizeObserver === "undefined") return;
   timelineResizeObserver = new ResizeObserver((entries) => {
@@ -3768,6 +4029,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   if (cronRefreshTimer !== null) window.clearInterval(cronRefreshTimer);
+  if (processRefreshTimer !== null) window.clearInterval(processRefreshTimer);
   saveVirtualSessionView();
   disconnectTimelineRows();
   timelineResizeObserver?.disconnect();
@@ -3884,6 +4146,126 @@ onBeforeUnmount(() => {
           <label class="block text-[10px] text-zinc-500 sm:col-span-2">Prompt<textarea v-model="cronDraft.prompt" rows="6" class="control mt-1 w-full resize-y"></textarea></label>
         </div>
         <div class="flex justify-end gap-2 pt-2"><button class="rounded px-3 py-1.5 text-xs text-zinc-500 hover:bg-white/5" @click="cronDraft = null">Cancel</button><button class="rounded bg-amber-300 px-3 py-1.5 text-xs font-semibold text-amber-950" @click="saveCronJob">Save</button></div>
+      </section>
+    </div>
+
+    <div
+      v-if="processesOpen"
+      class="fixed inset-0 z-[70] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"
+      @click.self="closeProcesses"
+    >
+      <section
+        data-testid="processes-modal"
+        class="relative flex h-[min(46rem,88vh)] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-fuchsia-400/20 bg-[#111318] shadow-2xl shadow-black/70"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="processes-title"
+      >
+        <header class="flex items-center gap-3 border-b border-white/7 px-4 py-3">
+          <button
+            v-if="selectedProcessId"
+            class="grid size-7 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-zinc-200"
+            aria-label="Back to process list"
+            @click="backToProcessList"
+          ><ChevronLeft class="size-4" /></button>
+          <SquareTerminal class="size-4 text-fuchsia-300" aria-hidden="true" />
+          <div class="min-w-0 flex-1">
+            <h2 id="processes-title" class="text-sm font-semibold text-zinc-100">
+              {{ selectedProcessId ? "Process output" : "Running processes" }}
+            </h2>
+            <p class="mt-0.5 truncate font-mono text-[10px] text-zinc-600">
+              {{ selectedProcessId ? processOutput?.command : `${processes.length} active in this session` }}
+            </p>
+          </div>
+          <button
+            class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-white/5 hover:text-zinc-200"
+            aria-label="Close processes"
+            @click="closeProcesses"
+          ><X class="size-4" /></button>
+        </header>
+
+        <div v-if="processError" class="border-b border-red-400/15 bg-red-400/5 px-4 py-2 text-[11px] text-red-300">
+          {{ processError }}
+        </div>
+
+        <div v-if="!selectedProcessId" class="min-h-0 flex-1 overflow-y-auto p-4">
+          <div v-if="!processes.length" class="grid h-full place-items-center text-xs text-zinc-600">
+            No managed terminals are running in this session.
+          </div>
+          <div v-else class="space-y-2">
+            <article
+              v-for="process in processes"
+              :key="process.terminal_id"
+              class="flex items-center gap-3 rounded-lg border border-white/7 bg-white/[0.025] p-3"
+            >
+              <span class="size-2 shrink-0 animate-pulse rounded-full bg-fuchsia-400" aria-hidden="true" />
+              <span class="w-20 shrink-0 font-mono text-[11px] text-cyan-300">
+                {{ formatProcessDuration(process.created_at) }}
+              </span>
+              <code class="min-w-0 flex-1 truncate text-[11px] text-zinc-300" :title="process.command">
+                {{ process.command }}
+              </code>
+              <button class="grid size-8 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-cyan-300" title="View output" aria-label="View output" @click="viewProcess(process.terminal_id)">
+                <SquareTerminal class="size-4" />
+              </button>
+              <button class="grid size-8 place-items-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-amber-300" title="Go to originating shell activity" aria-label="Go to origin" @click="goToProcessOriginFor(process)">
+                <LocateFixed class="size-4" />
+              </button>
+              <button class="grid size-8 place-items-center rounded-md text-zinc-500 hover:bg-red-400/10 hover:text-red-300" title="Stop process" aria-label="Stop process" @click="requestProcessStop(process.terminal_id)">
+                <CircleStop class="size-4" />
+              </button>
+            </article>
+          </div>
+        </div>
+
+        <template v-else>
+          <div class="flex items-center gap-3 border-b border-white/7 px-4 py-2 text-[10px]">
+            <span
+              class="rounded px-2 py-1 font-semibold uppercase tracking-wide"
+              :class="{
+                'bg-amber-400/10 text-amber-300': processOutput?.process_state === 'running',
+                'bg-emerald-400/10 text-emerald-300': processOutput?.process_state === 'exited',
+                'bg-red-400/10 text-red-300': ['closed', 'interrupted'].includes(processOutput?.process_state)
+              }"
+            >{{ processStateLabel(processOutput) }}</span>
+            <span class="font-mono text-cyan-300">{{ formatProcessDuration(processOutput?.created_at || selectedProcess()?.created_at) }}</span>
+            <span class="ml-auto text-zinc-600">Read-only · 1 MiB scrollback</span>
+          </div>
+          <div
+            ref="processOutputViewport"
+            class="min-h-0 flex-1 overflow-auto bg-black p-3 font-mono text-[12px] leading-5"
+            @scroll.passive="handleProcessOutputScroll"
+          >
+            <div v-if="!processOutput" class="flex items-center gap-2 text-zinc-600">
+              <LoaderCircle class="size-3.5 animate-spin" /> Loading output
+            </div>
+            <div v-else class="min-w-max">
+              <div v-for="(line, lineIndex) in processOutput.lines" :key="lineIndex" class="min-h-5 whitespace-pre">
+                <span v-for="(span, spanIndex) in line.spans" :key="spanIndex" :style="terminalSpanStyle(span.style)">{{ span.text }}</span>
+              </div>
+            </div>
+          </div>
+          <footer class="flex items-center gap-2 border-t border-white/7 px-4 py-3">
+            <button class="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs text-amber-300 hover:bg-amber-400/10" @click="goToProcessOrigin">
+              <LocateFixed class="size-3.5" /> Go to origin
+            </button>
+            <button v-if="processOutput?.process_state === 'running'" class="ml-auto flex items-center gap-1.5 rounded-md bg-red-400/10 px-3 py-1.5 text-xs text-red-300 hover:bg-red-400/20" @click="requestProcessStop(selectedProcessId)">
+              <CircleStop class="size-3.5" /> Stop process
+            </button>
+          </footer>
+        </template>
+
+        <div v-if="processStopConfirm" class="absolute inset-0 z-10 grid place-items-center bg-black/75 p-4 backdrop-blur-sm">
+          <section class="w-full max-w-md rounded-xl border border-red-400/20 bg-[#181317] p-4 shadow-2xl">
+            <h3 class="text-sm font-semibold text-red-200">Stop this process?</h3>
+            <p class="mt-2 text-xs leading-5 text-zinc-400">The complete managed process tree will be terminated. The active agent turn will continue.</p>
+            <code class="mt-3 block max-h-24 overflow-auto rounded bg-black/40 p-2 text-[10px] text-zinc-300">{{ processOutput?.command || selectedProcess()?.command }}</code>
+            <div class="mt-4 flex justify-end gap-2">
+              <button class="rounded px-3 py-1.5 text-xs text-zinc-500 hover:bg-white/5" @click="processStopConfirm = false">Cancel</button>
+              <button class="rounded bg-red-300 px-3 py-1.5 text-xs font-semibold text-red-950" @click="confirmProcessStop">Stop process</button>
+            </div>
+          </section>
+        </div>
       </section>
     </div>
 
@@ -4475,11 +4857,21 @@ onBeforeUnmount(() => {
                 />
               </button>
               <button
+                v-if="item.active_terminal_count > 0"
+                class="mr-1 flex h-7 shrink-0 items-center gap-1 rounded-md bg-fuchsia-400/10 px-1.5 font-mono text-[9px] font-semibold text-fuchsia-300 transition hover:bg-fuchsia-400/20 hover:text-fuchsia-200"
+                :aria-label="`Open ${item.active_terminal_count} active process${item.active_terminal_count === 1 ? '' : 'es'} in ${item.title || 'session'}`"
+                title="Open active processes"
+                @click.stop="openSessionProcesses(project.root, item.id)"
+              >
+                <SquareTerminal class="size-3" aria-hidden="true" />
+                {{ item.active_terminal_count }}
+              </button>
+              <button
                 class="mr-1 grid size-8 shrink-0 place-items-center rounded-md text-zinc-400 transition hover:bg-red-500/12 hover:text-red-300 disabled:pointer-events-none disabled:opacity-30"
                 :disabled="runtimeFor(item.id).sending"
                 :aria-label="`Delete session ${item.title || shortId(item.id)}`"
                 title="Delete session"
-                @click.stop="deleteSession(project.root, item.id)"
+                @click.stop="deleteSession(project.root, item.id, item.active_terminal_count)"
               >
                 <Trash2 class="size-3.5" aria-hidden="true" />
               </button>
@@ -4754,6 +5146,7 @@ onBeforeUnmount(() => {
                   <div
                     v-if="event.type === 'activity'"
                     class="activity-row"
+                    :data-activity-id="event.activity.id"
                     :class="[
                       `activity-${event.activity.kind}`,
                       {

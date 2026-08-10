@@ -66,6 +66,7 @@ use crate::{
         list_session_projects, resolve_global_session,
     },
     skills::SkillRegistry,
+    terminal::{TerminalOutputSnapshot, TerminalProcessState},
     transcription::Transcriber,
 };
 
@@ -80,6 +81,8 @@ const APP_ICON_512: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web/icon-5
 const SHUTDOWN_WARNING_DELAY: Duration = Duration::from_millis(100);
 const SHUTDOWN_WAITING_MESSAGE: &str = "CodeCrab is still shutting down because active HTTP/HTTPS \
 requests or open connections have not finished. Press Ctrl+C again to force exit.";
+const TERMINAL_SHUTDOWN_WAITING_MESSAGE: &str = "CodeCrab still has managed terminals running. \
+Press Ctrl+C again to stop their process trees and force exit.";
 
 #[derive(Debug, Eq, PartialEq)]
 enum ShutdownOutcome {
@@ -302,6 +305,27 @@ struct ModelRequest {
 struct SessionRequest {
     project: Option<PathBuf>,
     id: String,
+    #[serde(default)]
+    stop_processes: bool,
+}
+
+#[derive(Deserialize)]
+struct ProcessRequest {
+    session_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct StopProcessRequest {
+    session_id: Option<Uuid>,
+    terminal_id: String,
+}
+
+#[derive(Serialize)]
+struct ProcessSummary {
+    terminal_id: String,
+    command: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    origin_activity_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -568,12 +592,31 @@ pub(crate) async fn serve(
     )
     .await;
     if matches!(outcome, Ok(ShutdownOutcome::Forced)) {
+        let _ = state.inner.conversations.close_all_terminals();
         eprintln!("Forcing CodeCrab to exit immediately.");
         std::process::exit(130);
     }
     state.inner.code_server.shutdown().await;
     let outcome = outcome?;
     debug_assert_eq!(outcome, ShutdownOutcome::Graceful);
+    if state.inner.conversations.active_terminal_count() > 0 {
+        eprintln!("{TERMINAL_SHUTDOWN_WAITING_MESSAGE}");
+        loop {
+            tokio::select! {
+                signal = shutdown_signal() => {
+                    signal?;
+                    state.inner.conversations.close_all_terminals()?;
+                    eprintln!("Forcing CodeCrab to exit after stopping managed terminals.");
+                    std::process::exit(130);
+                }
+                () = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if state.inner.conversations.active_terminal_count() == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
     state.inner.conversations.cancel_all();
     while state
         .inner
@@ -617,6 +660,9 @@ fn server_app(state: ServerState) -> Router {
                 .route("/completions/recursive", post(recursive_completions))
                 .route("/chat", post(chat))
                 .route("/chat/cancel", post(cancel_chat))
+                .route("/processes", get(list_processes))
+                .route("/processes/stop", post(stop_process))
+                .route("/processes/{terminal_id}", get(process_output))
                 .route("/attachments/preflight", post(attachment_preflight))
                 .route("/attachments/upload", post(upload_attachment))
                 .route(
@@ -877,6 +923,11 @@ fn live_session_projects(
             model: session.model.clone(),
             depth: 0,
             descendant_count: 0,
+            active_terminal_count: session
+                .terminals
+                .iter()
+                .filter(|terminal| terminal.state == TerminalProcessState::Running)
+                .count(),
         };
         let live_root = (session.scope == crate::session::SessionScope::Project)
             .then_some(&live.snapshot.project_root);
@@ -1604,6 +1655,49 @@ async fn cancel_chat(
     Json(json!({ "cancelled": cancelled }))
 }
 
+async fn list_processes(
+    State(state): State<ServerState>,
+    Query(request): Query<ProcessRequest>,
+) -> ApiResult<Vec<ProcessSummary>> {
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .context("create or resume a session before listing processes")?;
+    Ok(Json(
+        conversation
+            .running_terminals()
+            .into_iter()
+            .map(|terminal| ProcessSummary {
+                terminal_id: terminal.id,
+                command: terminal.command,
+                created_at: terminal.created_at,
+                origin_activity_id: terminal.origin_activity_id,
+            })
+            .collect(),
+    ))
+}
+
+async fn process_output(
+    State(state): State<ServerState>,
+    AxumPath(terminal_id): AxumPath<String>,
+    Query(request): Query<ProcessRequest>,
+) -> ApiResult<TerminalOutputSnapshot> {
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .context("create or resume a session before viewing process output")?;
+    Ok(Json(conversation.terminal_output(&terminal_id)?))
+}
+
+async fn stop_process(
+    State(state): State<ServerState>,
+    Json(request): Json<StopProcessRequest>,
+) -> ApiResult<TerminalOutputSnapshot> {
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .context("create or resume a session before stopping a process")?;
+    conversation.close_terminal(&request.terminal_id)?;
+    Ok(Json(conversation.terminal_output(&request.terminal_id)?))
+}
+
 async fn session_stream(State(state): State<ServerState>) -> Response {
     let mut live_events = state.inner.conversations.subscribe_live();
     let (output_tx, output_rx) = mpsc::channel::<std::result::Result<Bytes, Infallible>>(32);
@@ -1659,7 +1753,9 @@ async fn session_stream(State(state): State<ServerState>) -> Response {
                         break;
                     }
                 }
-                ConversationLiveEvent::Installed | ConversationLiveEvent::Snapshot => {
+                ConversationLiveEvent::Installed
+                | ConversationLiveEvent::Snapshot
+                | ConversationLiveEvent::Terminals => {
                     let Ok(catalog) = session_catalog_message(&state, envelope.revision).await
                     else {
                         continue;
@@ -2063,6 +2159,18 @@ async fn delete_session(
     let target_id = target.id;
     let deleting_active = selected_session == Some(target_id);
     let deleted_index = sessions.iter().position(|session| session.id == target_id);
+    if let Some(conversation) = state.inner.conversations.get(target_id) {
+        let active_terminals = conversation.running_terminal_count();
+        if active_terminals > 0 && !request.stop_processes {
+            return Err(ApiError::message(
+                StatusCode::CONFLICT,
+                "confirm stopping active processes before deleting this session",
+            ));
+        }
+        if active_terminals > 0 {
+            conversation.close_terminals()?;
+        }
+    }
     if let Some(conversation) =
         state
             .inner
@@ -2706,6 +2814,20 @@ mod tests {
     fn test_conversation(agent: Agent) -> ConversationHandle {
         let registry = SessionRegistry::at(agent.project_root().join("test-global-config.toml"));
         ConversationHandle::spawn(agent, registry).unwrap()
+    }
+
+    fn api_ok<T>(result: ApiResult<T>) -> T {
+        match result {
+            Ok(Json(value)) => value,
+            Err(error) => panic!("{:#}", error.error),
+        }
+    }
+
+    fn api_error<T>(result: ApiResult<T>) -> ApiError {
+        match result {
+            Ok(_) => panic!("expected API error"),
+            Err(error) => error,
+        }
     }
 
     #[tokio::test]
@@ -3428,6 +3550,141 @@ mod tests {
         assert_eq!(response["cancelled"], true);
         assert!(turn_was_cancelled(outcome.result.as_ref().unwrap_err()));
         blocked_request.abort();
+    }
+
+    #[tokio::test]
+    async fn process_api_lists_views_stops_and_guards_session_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("model", "http://127.0.0.1:1/v1");
+        let store = SessionStore::new(&root).unwrap();
+        let session = store
+            .create_for_provider(config.active_provider.clone(), "model".into())
+            .unwrap();
+        let session_id = session.id;
+        store.save(&session).unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let terminals = agent.terminal_manager();
+        let command = if cfg!(windows) {
+            "$value = Read-Host 'Value'; Write-Output $value"
+        } else {
+            "printf 'Value: '; IFS= read value; printf '%s\\n' \"$value\""
+        };
+        let first_manager = terminals.clone();
+        let second_manager = terminals.clone();
+        let (first, second) =
+            tokio::join!(first_manager.shell(command), second_manager.shell(command));
+        let first_id = first.unwrap()["terminal_id"].as_str().unwrap().to_owned();
+        let second_id = second.unwrap()["terminal_id"].as_str().unwrap().to_owned();
+        terminals
+            .set_origin_activity(&first_id, "call-shell-first")
+            .unwrap();
+        terminals
+            .set_origin_activity(&second_id, "call-shell-second")
+            .unwrap();
+
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+        let active_terminal_count = |response: &StateResponse| {
+            response
+                .projects
+                .iter()
+                .flat_map(|project| &project.sessions)
+                .find(|session| session.id == session_id)
+                .unwrap()
+                .active_terminal_count
+        };
+        let initial_state = snapshot_for(&state, Some(session_id)).await.unwrap();
+        assert_eq!(active_terminal_count(&initial_state), 2);
+        let processes = api_ok(
+            list_processes(
+                State(state.clone()),
+                Query(ProcessRequest {
+                    session_id: Some(session_id),
+                }),
+            )
+            .await,
+        );
+        assert_eq!(processes.len(), 2);
+        assert!(processes.iter().any(|process| {
+            process.terminal_id == first_id
+                && process.origin_activity_id.as_deref() == Some("call-shell-first")
+        }));
+
+        let output = api_ok(
+            process_output(
+                State(state.clone()),
+                AxumPath(first_id.clone()),
+                Query(ProcessRequest {
+                    session_id: Some(session_id),
+                }),
+            )
+            .await,
+        );
+        assert_eq!(output.process_state, TerminalProcessState::Running);
+        assert_eq!(
+            output.origin_activity_id.as_deref(),
+            Some("call-shell-first")
+        );
+
+        let stopped = api_ok(
+            stop_process(
+                State(state.clone()),
+                Json(StopProcessRequest {
+                    session_id: Some(session_id),
+                    terminal_id: first_id,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(stopped.process_state, TerminalProcessState::Closed);
+        assert_eq!(
+            api_ok(
+                list_processes(
+                    State(state.clone()),
+                    Query(ProcessRequest {
+                        session_id: Some(session_id),
+                    }),
+                )
+                .await
+            )
+            .len(),
+            1
+        );
+        let updated_state = snapshot_for(&state, Some(session_id)).await.unwrap();
+        assert_eq!(active_terminal_count(&updated_state), 1);
+
+        let rejected = api_error(
+            delete_session(
+                State(state.clone()),
+                Json(SessionRequest {
+                    project: Some(root.clone()),
+                    id: session_id.to_string(),
+                    stop_processes: false,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(rejected.status, StatusCode::CONFLICT);
+        assert!(store.load(Some(&session_id.to_string())).is_ok());
+        assert_eq!(terminals.running_records().len(), 1);
+
+        api_ok(
+            delete_session(
+                State(state),
+                Json(SessionRequest {
+                    project: Some(root),
+                    id: session_id.to_string(),
+                    stop_processes: true,
+                }),
+            )
+            .await,
+        );
+        assert!(terminals.running_records().is_empty());
+        assert!(store.load(Some(&session_id.to_string())).is_err());
+        assert_eq!(
+            terminals.output(&second_id).unwrap().process_state,
+            TerminalProcessState::Closed
+        );
     }
 
     #[tokio::test]
@@ -4305,6 +4562,7 @@ mod tests {
             Json(SessionRequest {
                 project: None,
                 id: other.id.to_string(),
+                stop_processes: false,
             }),
         )
         .await
@@ -4594,6 +4852,7 @@ mod tests {
             Json(SessionRequest {
                 project: Some(root.clone()),
                 id: active_id.to_string(),
+                stop_processes: false,
             }),
         )
         .await
@@ -4620,6 +4879,7 @@ mod tests {
             Json(SessionRequest {
                 project: Some(root.clone()),
                 id: next_id.to_string(),
+                stop_processes: false,
             }),
         )
         .await
@@ -4633,6 +4893,7 @@ mod tests {
             Json(SessionRequest {
                 project: Some(root.clone()),
                 id: newest_id.to_string(),
+                stop_processes: false,
             }),
         )
         .await

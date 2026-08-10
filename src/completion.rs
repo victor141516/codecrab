@@ -25,6 +25,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("models", "Alias for /model"),
     ("skills", "Open the interactive skill picker"),
     ("sessions", "Browse, resume, or delete saved sessions"),
+    ("processes", "Manage running shell terminals"),
     ("no-project", "Create a session without a project"),
     ("branches", "Browse conversation branches"),
     ("providers", "List configured provider profiles"),
@@ -1076,6 +1077,11 @@ mod tests {
             menu.items
                 .iter()
                 .any(|item| item.kind == CompletionKind::Command && item.name == "goals")
+        );
+        assert!(
+            menu.items
+                .iter()
+                .any(|item| item.kind == CompletionKind::Command && item.name == "processes")
         );
         assert!(
             menu.items

@@ -34,6 +34,7 @@ use crate::{
         Session, SessionScope, SessionStore, TurnOutcome,
     },
     skills::{Skill, SkillRegistry},
+    terminal::TerminalManager,
     tools::ToolBox,
 };
 
@@ -161,6 +162,10 @@ impl Agent {
 
     pub(crate) fn project_root(&self) -> &Path {
         self.tools.root()
+    }
+
+    pub(crate) fn terminal_manager(&self) -> TerminalManager {
+        self.tools.terminal_manager()
     }
 
     pub(crate) fn attachment_store(&self) -> Result<AttachmentStore> {
@@ -769,11 +774,22 @@ impl Agent {
                             return Err(TurnCancelled.into());
                         }
                     };
-                    if is_terminal_tool(&call.function.name) {
-                        self.sync_terminal_state();
-                    }
                     result
                 };
+                if call.function.name == "shell"
+                    && result["ok"] == true
+                    && result["result"]["state"] == "running"
+                    && let Some(terminal_id) = result["result"]["terminal_id"].as_str()
+                    && let Err(error) = self.tools.set_terminal_origin(terminal_id, &call.id)
+                {
+                    self.diagnostics.error(format!(
+                        "cannot associate terminal {terminal_id:?} with activity {}: {error:#}",
+                        call.id
+                    ));
+                }
+                if is_terminal_tool(&call.function.name) {
+                    self.sync_terminal_state();
+                }
                 activity.finish(result["ok"].as_bool().unwrap_or(false));
                 if let Some(pending) = pending_change {
                     match self.change_tracker.after_operation(

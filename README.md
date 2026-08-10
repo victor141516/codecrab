@@ -21,6 +21,7 @@ CodeCrab keeps final responses concise by default while adapting when the user r
 - 🖥️ **Three ways to work** — full-screen terminal UI, pipe-friendly one-shot CLI, and a responsive browser interface.
 - 🔌 **Flexible providers** — use OpenAI or OpenAI-compatible Chat Completions APIs, including local providers.
 - ⚡ **Live, transparent progress** — stream assistant text and structured reads, searches, edits, commands, retries, and other tool activity as they happen.
+- 🧵 **Managed background processes** — see per-session process counts, inspect styled live output, jump to the originating shell activity, and stop a process tree from either client.
 - 🧭 **Web code explorer and diffs** — optionally embed a managed `code-server`, follow edits live, and inspect per-operation or complete turn changes.
 - 💾 **Persistent sessions** — resume conversations with their messages, tool history, model settings, terminals, goals, and project context intact.
 - 🌿 **Conversation branches** — edit an earlier prompt, preview alternate paths, and switch branches without losing history.
@@ -45,7 +46,7 @@ The table below compares the user-facing capabilities documented in this README 
 | Models, reasoning, and speed | Uses the provider catalog and persists model, reasoning, and service tier per session. | Exposes model and reasoning selection across its clients and protocol. | Broadly comparable; CodeCrab deliberately avoids inventing provider capabilities absent from the catalog. |
 | Streaming and tool activity | Persists and streams assistant deltas, retries, progress, and typed tool lifecycle events in exact order to TUI and web. | Streams typed thread, turn, item, plan, diff, approval, and tool events through app-server and clients. | Both are live and structured; Codex exposes a broader event taxonomy for integrations. |
 | File editing and diffs | Reads, writes, and performs exact replacements; the web client can follow edits and open Git-backed operation diffs or accumulated turn changes through a managed `code-server`. | Adds `apply_patch`, aggregated turn diffs, `/diff`, and `codex apply`. | Both expose first-class diffs; CodeCrab uses its optional embedded web IDE while Codex integrates the workflow directly into its clients. |
-| Shell and persistent PTYs | Supports non-interactive commands and conversation-scoped PTYs with text, paste, key, mouse, resize, observe, list, and close operations. | Supports PTYs, background processes, stdin, resize, termination, `/ps`, and `/stop`. | Both support persistent interactive processes; Codex has more direct user-facing process management. |
+| Shell and persistent PTYs | Supports non-interactive commands and conversation-scoped PTYs with text, paste, key, mouse, resize, observation, styled live output, origin navigation, per-session counts, and termination through `/processes`. | Supports PTYs, background processes, stdin, resize, termination, `/ps`, and `/stop`. | Both expose persistent process management through their terminal and graphical clients. |
 | Persistent sessions | Saves cross-project sessions, live workers, activities, model state, terminals, branches, goals, and URL-addressable web navigation. | Adds rename, archive, search, filters, sections, manual ordering, pagination, and session forks. | CodeCrab covers persistence and concurrent work; Codex provides richer session organization. |
 | Conversation branches | Keeps a non-destructive tree inside one session, with message editing and reversible preview in TUI and web. | Provides `/side`, `/btw`, `/fork`, in-memory forks, and forks at a selected turn. | CodeCrab emphasizes visible in-session history; Codex offers more ways to promote or isolate forks. |
 | Long-running goals and planning | Persistent goals continue automatically until the model verifies completion or reports a blocker. | Provides structured Plan mode, plan events, and multiple-choice `request_user_input`. | CodeCrab has first-class autonomous goals; Codex has richer interactive planning and decision checkpoints. |
@@ -131,6 +132,7 @@ Useful composer controls:
 | `/` after existing text | Complete skills only |
 | `@path` | Find and reference a file or directory |
 | `/no-project` | Start a new session without selecting a project |
+| `/processes` | Inspect and stop managed shell processes in the current session |
 | `Ctrl+V`, `Alt+V`, `Command+V` when reported | Paste clipboard files or image pixels; terminals may consume `Command+V` before CodeCrab sees it |
 | `Enter` | Complete the selected item or send |
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | Insert a newline (`Alt+Enter` or `Ctrl+J` on macOS) |
@@ -143,6 +145,8 @@ Useful composer controls:
 Run `/help` or press `F1` for the complete keyboard reference. The terminal handles Unicode-aware soft wrapping, international keyboard layouts including AltGr, Markdown and code highlighting, mouse selection, native clipboard copy, and explicit image/file clipboard paste.
 
 Long shell commands are limited to one terminal activity row and end with an ellipsis only when they exceed the available width; copying the activity still returns the complete command. The web client keeps its expand/collapse control, while `codecrab run` prints complete command activity.
+
+When a managed shell command remains active, its session row shows a live count. `/processes` opens the current session's process list in both clients; the web count opens the same view after selecting that session. Each entry shows its command and duration and can open a read-only, ANSI-styled live viewer, jump to the exact shell activity that created it, or stop its complete managed process tree after confirmation. The viewer retains the existing 1 MiB terminal scrollback, interprets overwritten lines, and stays open with a final state when the command finishes. Stopping a process does not stop the agent turn, so the agent may run it again if needed.
 
 Sending a new turn while the agent is idle jumps the terminal conversation to the bottom and resumes automatic following. You can keep typing while an agent turn runs; sending then adds an editable follow-up to a queue without changing a manually scrolled position. **Steer** cancels the current turn and sends one selected follow-up next without reordering the rest.
 
@@ -209,7 +213,7 @@ The web UI is also an installable PWA. Open it from localhost or a trusted HTTPS
 > [!WARNING]
 > The server has **no built-in HTTP authentication**. Keep it on localhost or place it behind an authenticated gateway before exposing it to a network. HTTPS encrypts traffic but does not authenticate users; its fresh in-memory certificate is self-signed and changes on every startup.
 
-Press `Ctrl+C` once for graceful shutdown. If requests or connections keep the process alive, CodeCrab explains why; press `Ctrl+C` again to force an immediate exit.
+Press `Ctrl+C` once for graceful shutdown. If requests, connections, or managed terminal processes keep the process alive, CodeCrab explains why; press `Ctrl+C` again to stop managed process trees and force an immediate exit.
 
 ## Everyday workflows
 
@@ -224,6 +228,8 @@ codecrab resume <session-id-or-prefix>
 ```
 
 The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy, including the top-level **No project** group. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches. On desktop, the web sidebar can be hidden completely from its header and reopened from the workspace header; that browser-local preference survives reloads, while the compact mobile drawer remains transient. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact `child of` hint. Deleting a parent does not delete or rewrite its descendants.
+
+Deleting a session with active managed processes requires one confirmation covering all of them. Accepting stops every managed process tree before deleting; declining leaves both the processes and session untouched. The terminal asks the same question before exiting while managed processes are active.
 
 The web composer keeps model, reasoning, and speed selection beside its attachment, dictation, and send actions. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
 
@@ -247,6 +253,7 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | --- | --- |
 | `/help` | Open keyboard and command help |
 | `/model` | Choose a provider-returned model, reasoning level, and speed |
+| `/processes` | Inspect and stop managed shell processes in the current session |
 | `/skills` | Browse installed Agent Skills |
 | `/sessions` | Browse, resume, or delete sessions across projects |
 | `/no-project` | Start a new session without a project |
@@ -497,6 +504,9 @@ With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription 
 | `POST` | `/api/completions/recursive` | Progressive fuzzy filesystem completion batches |
 | `POST` | `/api/chat` | Run or edit a prompt as an ordered NDJSON event stream |
 | `POST` | `/api/chat/cancel` | Cancel one session's active provider or tool operation |
+| `GET` | `/api/processes` | List active managed processes for one session |
+| `GET` | `/api/processes/{terminal_id}` | Read styled live or final output for one managed process |
+| `POST` | `/api/processes/stop` | Stop one managed process tree without cancelling the agent turn |
 | `POST` | `/api/attachments/preflight` | Look up a session attachment by browser-computed SHA-256 |
 | `POST` | `/api/attachments/upload` | Stream and verify one bounded browser file upload for an explicit project/session |
 | `POST` | `/api/transcribe` | Transcribe uploaded audio |

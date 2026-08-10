@@ -60,6 +60,7 @@ use crate::{
         AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionProject, SessionScope,
         SessionStore, list_session_projects,
     },
+    terminal::{TerminalOutputSnapshot, TerminalProcessState, TerminalRecord, TerminalStyle},
     transcription::Transcriber,
 };
 use uuid::Uuid;
@@ -122,6 +123,22 @@ struct SessionPicker {
     projects: Vec<SessionProjectView>,
     selected: usize,
     collapsed_sessions: HashSet<Uuid>,
+}
+
+enum ProcessDialogView {
+    List,
+    Output(String),
+}
+
+struct ProcessDialog {
+    processes: Vec<TerminalRecord>,
+    selected: usize,
+    view: ProcessDialogView,
+    output: Option<TerminalOutputSnapshot>,
+    output_scroll: u16,
+    output_follow: bool,
+    stop_confirm: bool,
+    last_refresh: Instant,
 }
 
 struct GoalPicker {
@@ -195,6 +212,7 @@ struct ConversationSource {
     copy_targets: Vec<CopyTarget>,
     turn_toggles: Vec<TurnToggleTarget>,
     node_lines: Vec<(Uuid, usize)>,
+    activity_lines: Vec<(String, usize)>,
 }
 
 #[derive(Clone)]
@@ -883,6 +901,9 @@ struct App {
     model_catalog: Vec<ModelCatalogEntry>,
     model_picker: Option<ModelPicker>,
     session_picker: Option<SessionPicker>,
+    process_dialog: Option<ProcessDialog>,
+    session_delete_confirm: bool,
+    exit_confirm: bool,
     branch_navigator: Option<BranchNavigator>,
     should_quit: bool,
     project: String,
@@ -911,6 +932,7 @@ struct App {
     expanded_turns: HashSet<TurnKey>,
     pending_turn_anchor: Option<TurnAnchor>,
     pending_branch_node: Option<Uuid>,
+    pending_activity_id: Option<String>,
 }
 
 struct BackgroundTurn {
@@ -1058,6 +1080,9 @@ impl App {
             model_catalog,
             model_picker: None,
             session_picker: None,
+            process_dialog: None,
+            session_delete_confirm: false,
+            exit_confirm: false,
             branch_navigator: None,
             should_quit: false,
             project,
@@ -1086,6 +1111,7 @@ impl App {
             expanded_turns: HashSet::new(),
             pending_turn_anchor: None,
             pending_branch_node: None,
+            pending_activity_id: None,
         })
     }
 
@@ -1312,6 +1338,9 @@ impl App {
             || self.transcription.is_some()
             || self.goal_picker.is_some()
             || self.session_picker.is_some()
+            || self.process_dialog.is_some()
+            || self.session_delete_confirm
+            || self.exit_confirm
             || self.model_picker.is_some()
             || self.show_help
             || self.show_skills
@@ -2436,6 +2465,249 @@ impl App {
         Ok(false)
     }
 
+    fn open_processes(&mut self) {
+        let processes = self.conversation.running_terminals();
+        self.process_dialog = Some(ProcessDialog {
+            processes,
+            selected: 0,
+            view: ProcessDialogView::List,
+            output: None,
+            output_scroll: 0,
+            output_follow: true,
+            stop_confirm: false,
+            last_refresh: Instant::now() - Duration::from_secs(1),
+        });
+        self.show_help = false;
+        self.show_skills = false;
+        self.model_picker = None;
+        self.session_picker = None;
+        self.goal_picker = None;
+        self.close_completion();
+        self.refresh_process_dialog();
+    }
+
+    fn refresh_process_dialog(&mut self) {
+        let Some(dialog) = self.process_dialog.as_mut() else {
+            return;
+        };
+        if dialog.last_refresh.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        dialog.last_refresh = Instant::now();
+        let selected_id = dialog
+            .processes
+            .get(dialog.selected)
+            .map(|terminal| terminal.id.clone());
+        dialog.processes = self.conversation.running_terminals();
+        dialog.selected = selected_id
+            .as_ref()
+            .and_then(|id| {
+                dialog
+                    .processes
+                    .iter()
+                    .position(|terminal| &terminal.id == id)
+            })
+            .unwrap_or_else(|| {
+                dialog
+                    .selected
+                    .min(dialog.processes.len().saturating_sub(1))
+            });
+        if let ProcessDialogView::Output(terminal_id) = &dialog.view {
+            match self.conversation.terminal_output(terminal_id) {
+                Ok(output) => dialog.output = Some(output),
+                Err(error) => {
+                    self.error = Some(format!("Could not read terminal output: {error:#}"))
+                }
+            }
+        }
+    }
+
+    fn selected_process_id(&self) -> Option<String> {
+        let dialog = self.process_dialog.as_ref()?;
+        match &dialog.view {
+            ProcessDialogView::List => dialog
+                .processes
+                .get(dialog.selected)
+                .map(|terminal| terminal.id.clone()),
+            ProcessDialogView::Output(terminal_id) => Some(terminal_id.clone()),
+        }
+    }
+
+    fn view_selected_process(&mut self) {
+        let Some(terminal_id) = self.selected_process_id() else {
+            return;
+        };
+        let output = match self.conversation.terminal_output(&terminal_id) {
+            Ok(output) => output,
+            Err(error) => {
+                self.error = Some(format!("Could not read terminal output: {error:#}"));
+                return;
+            }
+        };
+        if let Some(dialog) = self.process_dialog.as_mut() {
+            dialog.view = ProcessDialogView::Output(terminal_id);
+            dialog.output = Some(output);
+            dialog.output_scroll = 0;
+            dialog.output_follow = true;
+        }
+    }
+
+    fn go_to_selected_process_origin(&mut self) {
+        let origin = self.process_dialog.as_ref().and_then(|dialog| {
+            dialog
+                .output
+                .as_ref()
+                .and_then(|output| output.origin_activity_id.clone())
+                .or_else(|| {
+                    dialog
+                        .processes
+                        .get(dialog.selected)
+                        .and_then(|terminal| terminal.origin_activity_id.clone())
+                })
+        });
+        let Some(origin) = origin else {
+            self.error = Some("This terminal has no recorded origin activity.".into());
+            return;
+        };
+        if let Some(activity) = self
+            .activities
+            .iter()
+            .find(|activity| activity.id == origin)
+        {
+            self.expanded_turns.insert(TurnKey {
+                session_id: self.session_id,
+                message_index: activity.turn_message_index,
+            });
+        }
+        self.process_dialog = None;
+        self.pending_activity_id = Some(origin);
+        self.auto_scroll = false;
+    }
+
+    fn stop_selected_process(&mut self) {
+        let Some(terminal_id) = self.selected_process_id() else {
+            return;
+        };
+        if let Err(error) = self.conversation.close_terminal(&terminal_id) {
+            self.error = Some(format!("Could not stop terminal: {error:#}"));
+            return;
+        }
+        if let Some(dialog) = self.process_dialog.as_mut() {
+            dialog.stop_confirm = false;
+            if matches!(dialog.view, ProcessDialogView::Output(_)) {
+                dialog.output = self.conversation.terminal_output(&terminal_id).ok();
+            }
+            dialog.last_refresh = Instant::now() - Duration::from_secs(1);
+        }
+        self.refresh_process_dialog();
+    }
+
+    fn request_quit(&mut self) {
+        if self.conversations.active_terminal_count() > 0 {
+            self.exit_confirm = true;
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    fn handle_process_key(&mut self, key: KeyCode) {
+        let confirming = self
+            .process_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.stop_confirm);
+        if confirming {
+            match key {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.stop_selected_process(),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.stop_confirm = false;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let output_open = self
+            .process_dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog.view, ProcessDialogView::Output(_)));
+        if output_open {
+            match key {
+                KeyCode::Up => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.output_follow = false;
+                        dialog.output_scroll = dialog.output_scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.output_follow = false;
+                        dialog.output_scroll = dialog.output_scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.output_follow = false;
+                        dialog.output_scroll = dialog.output_scroll.saturating_sub(10);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.output_follow = false;
+                        dialog.output_scroll = dialog.output_scroll.saturating_add(10);
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.output_follow = true;
+                    }
+                }
+                KeyCode::Char('g' | 'G') => self.go_to_selected_process_origin(),
+                KeyCode::Char('k' | 'K') | KeyCode::Delete => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.stop_confirm = true;
+                    }
+                }
+                KeyCode::Esc => {
+                    if let Some(dialog) = self.process_dialog.as_mut() {
+                        dialog.view = ProcessDialogView::List;
+                        dialog.output = None;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            KeyCode::Up => {
+                if let Some(dialog) = self.process_dialog.as_mut()
+                    && !dialog.processes.is_empty()
+                {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(dialog) = self.process_dialog.as_mut()
+                    && !dialog.processes.is_empty()
+                {
+                    dialog.selected =
+                        (dialog.selected + 1).min(dialog.processes.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('o' | 'O') => self.view_selected_process(),
+            KeyCode::Char('g' | 'G') => self.go_to_selected_process_origin(),
+            KeyCode::Char('k' | 'K') | KeyCode::Delete => {
+                if self.selected_process_id().is_some()
+                    && let Some(dialog) = self.process_dialog.as_mut()
+                {
+                    dialog.stop_confirm = true;
+                }
+            }
+            KeyCode::Esc => self.process_dialog = None,
+            _ => {}
+        }
+    }
+
     async fn open_session_picker(&mut self) -> Result<()> {
         self.save_active_session().await?;
         let current_id = self
@@ -2721,6 +2993,21 @@ impl App {
             let project = &picker.projects[project_index].project;
             (project.root.clone(), project.sessions[session_index].id)
         };
+        let active_terminals = self
+            .conversations
+            .get(id)
+            .map(|conversation| conversation.running_terminal_count())
+            .unwrap_or(0);
+        if active_terminals > 0 && !self.session_delete_confirm {
+            self.session_delete_confirm = true;
+            return Ok(());
+        }
+        self.session_delete_confirm = false;
+        if active_terminals > 0
+            && let Some(conversation) = self.conversations.get(id)
+        {
+            conversation.close_terminals()?;
+        }
         let store = SessionStore::for_project_root_in(root.as_deref(), &self.registry.data_dir()?)?;
         let active_snapshot = self.conversation.snapshot();
         let deleting_active = self.active_session
@@ -3086,6 +3373,9 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.goal_picker.is_none()
             && self.session_picker.is_none()
+            && self.process_dialog.is_none()
+            && !self.session_delete_confirm
+            && !self.exit_confirm
             && self.model_picker.is_none()
             && !self.show_help
             && !self.show_skills
@@ -3409,6 +3699,13 @@ impl App {
             self.preferred_column = None;
             self.close_completion();
             return self.command(&prompt).await;
+        }
+        if prompt == "/processes" {
+            self.clear_composer_text();
+            self.preferred_column = None;
+            self.close_completion();
+            self.open_processes();
+            return Ok(());
         }
         if prompt == "/usage" && self.usage_available() {
             self.clear_composer_text();
@@ -3734,11 +4031,12 @@ impl App {
 
     async fn command(&mut self, command: &str) -> Result<()> {
         match command {
-            "/quit" => self.should_quit = true,
+            "/quit" => self.request_quit(),
             "/help" => self.show_help = true,
             "/model" | "/models" => self.open_model_picker(),
             "/skills" => self.open_skill_picker(),
             "/sessions" => self.open_session_picker().await?,
+            "/processes" => self.open_processes(),
             "/no-project" => self.create_no_project_session().await?,
             "/branches" => self.open_branch_navigator(),
             "/goals" => self.open_goal_picker(),
@@ -3781,6 +4079,32 @@ impl App {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Ok(());
+        }
+        if self.exit_confirm {
+            match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    self.conversations.close_all_terminals()?;
+                    self.exit_confirm = false;
+                    self.should_quit = true;
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => self.exit_confirm = false,
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.session_delete_confirm {
+            match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    self.delete_session_selection().await?;
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => self.session_delete_confirm = false,
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.process_dialog.is_some() {
+            self.handle_process_key(key.code);
             return Ok(());
         }
         if self.usage_open {
@@ -4010,7 +4334,7 @@ impl App {
 
         if key.modifiers == KeyModifiers::CONTROL {
             match key.code {
-                KeyCode::Char('c' | 'd') if !self.is_busy() => self.should_quit = true,
+                KeyCode::Char('c' | 'd') if !self.is_busy() => self.request_quit(),
                 KeyCode::Char('c') => {}
                 KeyCode::Char('j') => self.insert("\n"),
                 _ => {}
@@ -4173,6 +4497,7 @@ async fn run_tui(
             app.dispatch_queued_prompt_if_idle()?;
         }
         app.finish_transcription_if_ready().await?;
+        app.refresh_process_dialog();
         app.update_drag_autoscroll();
         app.spinner = app.spinner.wrapping_add(1);
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -4263,6 +4588,25 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.usage_open {
         render_usage(frame, app, area);
+    }
+    if app.process_dialog.is_some() {
+        render_process_dialog(frame, app, area);
+    }
+    if app.session_delete_confirm {
+        render_confirmation(
+            frame,
+            area,
+            " Stop processes and delete session? ",
+            "Every managed terminal in this session will be stopped before deletion.\n\nEnter/Y confirm  •  Esc/N cancel",
+        );
+    }
+    if app.exit_confirm {
+        render_confirmation(
+            frame,
+            area,
+            " Stop processes and exit? ",
+            "Every managed terminal will be stopped before CodeCrab exits.\n\nEnter/Y confirm  •  Esc/N cancel",
+        );
     }
 }
 
@@ -4590,6 +4934,15 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     {
         app.scroll = node_row.saturating_sub(2).min(u16::MAX as usize) as u16;
     }
+    if let Some(activity_id) = app.pending_activity_id.take()
+        && let Some(source_line) = source
+            .activity_lines
+            .iter()
+            .find_map(|(id, line)| (id == &activity_id).then_some(*line))
+        && let Some(activity_row) = rows.iter().position(|row| row.source_line == source_line)
+    {
+        app.scroll = activity_row.saturating_sub(2).min(u16::MAX as usize) as u16;
+    }
     app.max_scroll = rows
         .len()
         .saturating_sub(inner.height as usize)
@@ -4640,6 +4993,7 @@ fn conversation_source(app: &App) -> ConversationSource {
         copy_targets: Vec::new(),
         turn_toggles: Vec::new(),
         node_lines: Vec::new(),
+        activity_lines: Vec::new(),
     };
     let mut message_index = 0;
     while message_index < app.transcript.len() {
@@ -5149,6 +5503,9 @@ fn push_activity_line(source: &mut ConversationSource, app: &App, activity: &Age
     let detail = activity_detail_for_display(&app.project_root, activity);
     let detail_start = "  ".len() + icon.len() + title.len();
     let line_index = source.lines.len();
+    source
+        .activity_lines
+        .push((activity.id.clone(), line_index));
     source.lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(icon, Style::default().fg(icon_color)),
@@ -5554,6 +5911,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  /goals     manage persistent goals"),
         Line::from("  /no-project create a session without a project"),
         Line::from("  /model     choose model, thinking, and speed"),
+        Line::from("  /processes manage running shell terminals"),
         Line::from("  /sessions  resume or delete saved sessions"),
         Line::from("  /skills    show available skills"),
         Line::from("  /quit      save and quit"),
@@ -5750,6 +6108,238 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+fn render_process_dialog(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(dialog) = app.process_dialog.as_mut() else {
+        return;
+    };
+    match &dialog.view {
+        ProcessDialogView::List => {
+            let height = (dialog.processes.len().min(12) as u16 + 6)
+                .clamp(9, area.height.saturating_sub(2).max(9));
+            let popup = centered_rect(area, 88, height);
+            frame.render_widget(Clear, popup);
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "↑↓ select  •  Enter/O output  •  G origin  •  K stop  •  Esc close",
+                    Style::default().fg(MUTED),
+                )),
+                Line::default(),
+            ];
+            if dialog.processes.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No managed terminals are running in this session.",
+                    Style::default().fg(MUTED),
+                )));
+            }
+            for (index, process) in dialog.processes.iter().enumerate() {
+                let selected = index == dialog.selected;
+                let duration = format_live_duration(process.created_at);
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(
+                            if selected { " › " } else { "   " },
+                            Style::default().fg(Color::Magenta),
+                        ),
+                        Span::styled(format!("{:<10}", duration), Style::default().fg(AQUA)),
+                        Span::styled(
+                            compact_text(&process.command.replace('\n', " "), 64),
+                            Style::default().fg(if selected { Color::White } else { MUTED }),
+                        ),
+                    ])
+                    .style(if selected {
+                        Style::default().bg(Color::Rgb(42, 48, 58))
+                    } else {
+                        Style::default()
+                    }),
+                );
+            }
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Magenta))
+                        .title(Span::styled(
+                            format!(" Processes · {} running ", dialog.processes.len()),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                ),
+                popup,
+            );
+        }
+        ProcessDialogView::Output(_) => {
+            let popup = centered_rect(area, 94, 88);
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(Span::styled(
+                    " Process output ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+            let [header, output_area, footer] = Layout::vertical([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+            if let Some(output) = &dialog.output {
+                let (status, status_color) = match output.process_state {
+                    TerminalProcessState::Running => ("RUNNING", Color::Yellow),
+                    TerminalProcessState::Exited => ("EXITED", Color::Green),
+                    TerminalProcessState::Closed => ("STOPPED", Color::Red),
+                    TerminalProcessState::Interrupted => ("INTERRUPTED", Color::Red),
+                };
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                format!(" {status} "),
+                                Style::default()
+                                    .fg(status_color)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("{}  ", format_live_duration(output.created_at)),
+                                Style::default().fg(AQUA),
+                            ),
+                            Span::styled(
+                                compact_text(&output.command.replace('\n', " "), 72),
+                                Style::default().fg(Color::White),
+                            ),
+                        ]),
+                        Line::default(),
+                    ]),
+                    header,
+                );
+                let lines = output
+                    .lines
+                    .iter()
+                    .map(|line| {
+                        Line::from(
+                            line.spans
+                                .iter()
+                                .map(|span| {
+                                    Span::styled(
+                                        span.text.clone(),
+                                        terminal_ratatui_style(&span.style),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let maximum_scroll = lines
+                    .len()
+                    .saturating_sub(output_area.height as usize)
+                    .min(u16::MAX as usize) as u16;
+                if dialog.output_follow {
+                    dialog.output_scroll = maximum_scroll;
+                } else {
+                    dialog.output_scroll = dialog.output_scroll.min(maximum_scroll);
+                }
+                frame.render_widget(
+                    Paragraph::new(lines).scroll((dialog.output_scroll, 0)),
+                    output_area,
+                );
+            } else {
+                frame.render_widget(Paragraph::new("Waiting for terminal output…"), output_area);
+            }
+            frame.render_widget(
+                Paragraph::new("↑↓/Pg scroll  •  End follow  •  G origin  •  K stop  •  Esc list")
+                    .style(Style::default().fg(MUTED)),
+                footer,
+            );
+        }
+    }
+    if dialog.stop_confirm {
+        render_confirmation(
+            frame,
+            area,
+            " Stop this process? ",
+            "The complete managed process tree will be terminated. The agent turn will continue.\n\nEnter/Y confirm  •  Esc/N cancel",
+        );
+    }
+}
+
+fn format_live_duration(created_at: chrono::DateTime<chrono::Utc>) -> String {
+    let seconds = chrono::Utc::now()
+        .signed_duration_since(created_at)
+        .num_seconds()
+        .max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+fn terminal_ratatui_style(style: &TerminalStyle) -> Style {
+    let mut foreground = parse_hex_color(&style.foreground).unwrap_or(Color::White);
+    let mut background = parse_hex_color(&style.background).unwrap_or(Color::Black);
+    if style.reverse {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    let mut rendered = Style::default().fg(foreground).bg(background);
+    if style.bold {
+        rendered = rendered.add_modifier(Modifier::BOLD);
+    }
+    if style.faint {
+        rendered = rendered.add_modifier(Modifier::DIM);
+    }
+    if style.italic {
+        rendered = rendered.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline != "none" {
+        rendered = rendered.add_modifier(Modifier::UNDERLINED);
+    }
+    if style.strikethrough {
+        rendered = rendered.add_modifier(Modifier::CROSSED_OUT);
+    }
+    rendered
+}
+
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let value = value.strip_prefix('#')?;
+    (value.len() == 6).then_some(Color::Rgb(
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ))
+}
+
+fn render_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    message: &'static str,
+) {
+    let popup = centered_rect(area, 66, 9);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(message)
+            .centered()
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(Span::styled(
+                        title,
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+            ),
+        popup,
+    );
+}
+
 fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(picker) = &app.session_picker else {
         return;
@@ -5844,6 +6434,11 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Some(ConversationLifecycle::Idle) => "idle",
                     _ => "",
                 };
+                let active_terminal_count = app
+                    .conversations
+                    .get(session.id)
+                    .map(|conversation| conversation.running_terminal_count())
+                    .unwrap_or(0);
                 let session_title = if session.scheduled_run.is_some() {
                     format!("[cron] {}", session.title)
                 } else {
@@ -5870,6 +6465,16 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         format!("{:<20}", compact_text(&session_title, 19)),
                         Style::default()
                             .fg(if selected { Color::White } else { AQUA })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if active_terminal_count > 0 {
+                            format!(" 󰆍 {active_terminal_count} ")
+                        } else {
+                            String::new()
+                        },
+                        Style::default()
+                            .fg(Color::Magenta)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
@@ -8666,6 +9271,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn processes_command_opens_during_an_active_turn_and_owns_input() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.running = Some(tokio::spawn(std::future::pending()));
+        app.input = "/processes".into();
+        app.cursor = app.input.len();
+
+        app.submit().await.unwrap();
+
+        assert!(app.process_dialog.is_some());
+        assert!(app.input.is_empty());
+        assert!(app.prompt_queue.items.is_empty());
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Processes · 0 running"));
+        assert!(text.contains("No managed terminals are running"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.process_dialog.is_none());
+        app.running.take().unwrap().abort();
+    }
+
+    #[tokio::test]
     async fn a_parked_openai_turn_requests_usage_refresh_when_it_finishes() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
@@ -8781,7 +9419,23 @@ mod tests {
 
             assert!(text.contains("Slash menu"), "missing menu at {width}");
             assert!(text.contains("/help"), "missing command at {width}");
-            assert!(text.contains("/review-rust"), "missing skill at {width}");
+
+            app.input.clear();
+            app.cursor = 0;
+            app.completion = None;
+            app.insert("/review");
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let filtered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                filtered.contains("/review-rust"),
+                "missing filtered skill at {width}"
+            );
         }
     }
 

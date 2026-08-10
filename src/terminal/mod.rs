@@ -6,6 +6,7 @@ use std::{
     io::Read,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, Weak},
     thread,
     time::Instant,
@@ -20,7 +21,10 @@ use tattoy_wezterm_term::{
     CellAttributes, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind, Terminal,
     TerminalConfiguration, TerminalSize, color::ColorPalette,
 };
-use tokio::time::{sleep, timeout_at};
+use tokio::{
+    sync::watch,
+    time::{sleep, timeout_at},
+};
 
 use self::constants::{
     CHILD_POLL_INTERVAL, DEFAULT_COLUMNS, DEFAULT_ROWS, FOLLOW_UP_DEADLINE, INITIAL_OBSERVATION,
@@ -113,6 +117,8 @@ pub(crate) struct TerminalRecord {
     pub rows: u16,
     pub state: TerminalProcessState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_activity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_snapshot: Option<TerminalScreenSnapshot>,
@@ -122,11 +128,28 @@ pub(crate) struct TerminalRecord {
     pub recent_transcript: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct TerminalOutputSnapshot {
+    pub terminal_id: String,
+    pub command: String,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub process_state: TerminalProcessState,
+    pub exit_code: Option<u32>,
+    pub origin_activity_id: Option<String>,
+    pub screen_sequence: u64,
+    pub rows: usize,
+    pub columns: usize,
+    pub lines: Vec<TerminalScreenLine>,
+}
+
 #[derive(Clone)]
 pub(crate) struct TerminalManager {
     root: PathBuf,
     configured_shell: Option<String>,
     inner: Arc<Mutex<ManagerState>>,
+    revision: Arc<AtomicU64>,
+    changes: watch::Sender<u64>,
 }
 
 #[derive(Default)]
@@ -147,6 +170,7 @@ struct TerminalActor {
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
     process_tree: ProcessTree,
+    origin_activity_id: Mutex<Option<String>>,
 }
 
 struct ActorCore {
@@ -205,6 +229,7 @@ impl DerefMut for TerminalEmulator {
 
 impl TerminalManager {
     pub(crate) fn new(root: PathBuf, configured_shell: Option<String>) -> Self {
+        let (changes, _) = watch::channel(0);
         Self {
             root,
             configured_shell,
@@ -212,7 +237,18 @@ impl TerminalManager {
                 next_id: 1,
                 ..ManagerState::default()
             })),
+            revision: Arc::new(AtomicU64::new(0)),
+            changes,
         }
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn publish(&self) {
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.changes.send(revision);
     }
 
     pub(crate) fn restore(&self, records: &[TerminalRecord], next_id: u64) {
@@ -240,6 +276,39 @@ impl TerminalManager {
         let mut records = state.records.values().cloned().collect::<Vec<_>>();
         records.sort_by_key(|record| terminal_number(&record.id));
         (state.next_id, records)
+    }
+
+    pub(crate) fn running_records(&self) -> Vec<TerminalRecord> {
+        let (_, records) = self.persisted_state();
+        records
+            .into_iter()
+            .filter(|record| record.state == TerminalProcessState::Running)
+            .collect()
+    }
+
+    pub(crate) fn set_origin_activity(&self, terminal_id: &str, activity_id: &str) -> Result<()> {
+        let actor = self.actor(terminal_id)?;
+        *actor
+            .origin_activity_id
+            .lock()
+            .expect("terminal origin mutex poisoned") = Some(activity_id.to_owned());
+        if let Some(record) = self
+            .inner
+            .lock()
+            .expect("terminal manager mutex poisoned")
+            .records
+            .get_mut(terminal_id)
+        {
+            record.origin_activity_id = Some(activity_id.to_owned());
+        }
+        self.publish();
+        Ok(())
+    }
+
+    pub(crate) fn output(&self, terminal_id: &str) -> Result<TerminalOutputSnapshot> {
+        let actor = self.actor(terminal_id)?;
+        let record = self.update_record(&actor, ObservationClassification::Unchanged)?;
+        actor.output_snapshot(&record)
     }
 
     pub(crate) async fn shell(&self, command: &str) -> Result<Value> {
@@ -335,6 +404,7 @@ impl TerminalManager {
         let actor = self.actor(terminal_id)?;
         actor.close()?;
         let record = self.update_record(&actor, ObservationClassification::Unchanged)?;
+        self.publish();
         Ok(json!({
             "terminal_id": record.id,
             "state": record.state,
@@ -382,6 +452,7 @@ impl TerminalManager {
         if let Some(error) = first_error {
             return Err(error);
         }
+        self.publish();
         Ok(())
     }
 
@@ -427,7 +498,13 @@ impl TerminalManager {
                 reader_eof: false,
                 closed: false,
             }));
-            spawn_reader(reader, core.clone(), id.clone())?;
+            spawn_reader(
+                reader,
+                core.clone(),
+                id.clone(),
+                self.revision.clone(),
+                self.changes.clone(),
+            )?;
 
             let actor = Arc::new(TerminalActor {
                 id: id.clone(),
@@ -439,6 +516,7 @@ impl TerminalManager {
                 master: Mutex::new(Some(pair.master)),
                 child: Mutex::new(Some(child)),
                 process_tree,
+                origin_activity_id: Mutex::new(None),
             });
             let record = actor.record(ObservationClassification::Unchanged)?;
             Ok::<_, anyhow::Error>((actor, record))
@@ -449,6 +527,8 @@ impl TerminalManager {
         let (actor, record) = result?;
         state.actors.insert(id.clone(), actor.clone());
         state.records.insert(id, record);
+        drop(state);
+        self.publish();
         Ok(actor)
     }
 
@@ -757,10 +837,39 @@ impl TerminalActor {
             columns: size.cols as u16,
             rows: size.rows as u16,
             state,
+            origin_activity_id: self
+                .origin_activity_id
+                .lock()
+                .expect("terminal origin mutex poisoned")
+                .clone(),
             exit_code,
             latest_snapshot: Some(snapshot),
             latest_observation: observation,
             recent_transcript: transcript,
+        })
+    }
+
+    fn output_snapshot(&self, record: &TerminalRecord) -> Result<TerminalOutputSnapshot> {
+        let core = self.core.lock().expect("terminal emulator mutex poisoned");
+        let emulator = &core.emulator;
+        let palette = emulator.palette();
+        let lines = scrollback_lines(emulator)
+            .into_iter()
+            .map(|line| styled_line(&line, &palette))
+            .collect();
+        let size = emulator.get_size();
+        Ok(TerminalOutputSnapshot {
+            terminal_id: self.id.clone(),
+            command: self.command.clone(),
+            created_at: self.created_at,
+            completed_at: record.completed_at,
+            process_state: record.state,
+            exit_code: record.exit_code,
+            origin_activity_id: record.origin_activity_id.clone(),
+            screen_sequence: core.sequence,
+            rows: size.rows,
+            columns: size.cols,
+            lines,
         })
     }
 }
@@ -809,6 +918,8 @@ fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     core: Arc<Mutex<ActorCore>>,
     terminal_id: String,
+    revision: Arc<AtomicU64>,
+    changes: watch::Sender<u64>,
 ) -> Result<()> {
     thread::Builder::new()
         .name(format!("codecrab-{terminal_id}-reader"))
@@ -820,6 +931,7 @@ fn spawn_reader(
                         core.lock()
                             .expect("terminal emulator mutex poisoned")
                             .reader_eof = true;
+                        publish_change(&revision, &changes);
                         break;
                     }
                     Ok(read) => {
@@ -829,12 +941,14 @@ fn spawn_reader(
                         if screen_fingerprint(&core.emulator) != before {
                             core.sequence = core.sequence.saturating_add(1);
                             core.last_change = Instant::now();
+                            publish_change(&revision, &changes);
                         }
                     }
                     Err(_) => {
                         core.lock()
                             .expect("terminal emulator mutex poisoned")
                             .reader_eof = true;
+                        publish_change(&revision, &changes);
                         break;
                     }
                 }
@@ -842,6 +956,11 @@ fn spawn_reader(
         })
         .context("cannot start terminal reader")?;
     Ok(())
+}
+
+fn publish_change(revision: &AtomicU64, changes: &watch::Sender<u64>) {
+    let revision = revision.fetch_add(1, Ordering::AcqRel) + 1;
+    let _ = changes.send(revision);
 }
 
 fn snapshot(
@@ -855,9 +974,10 @@ fn snapshot(
 ) -> TerminalScreenSnapshot {
     let emulator = &core.emulator;
     let size = emulator.get_size();
+    let palette = emulator.palette();
     let mut lines = visible_lines(emulator)
         .into_iter()
-        .map(|line| styled_line(&line))
+        .map(|line| styled_line(&line, &palette))
         .collect::<Vec<_>>();
     while lines.last().is_some_and(is_blank_screen_line) {
         lines.pop();
@@ -887,10 +1007,13 @@ fn snapshot(
     }
 }
 
-fn styled_line(line: &tattoy_wezterm_term::Line) -> TerminalScreenLine {
+fn styled_line(
+    line: &tattoy_wezterm_term::Line,
+    palette: &tattoy_wezterm_term::color::ColorPalette,
+) -> TerminalScreenLine {
     let mut spans: Vec<TerminalStyleSpan> = Vec::new();
     for cell in line.visible_cells() {
-        let style = terminal_style(cell.attrs());
+        let style = terminal_style(cell.attrs(), palette);
         let text = if cell.attrs().invisible() {
             " ".repeat(cell.width())
         } else {
@@ -910,11 +1033,16 @@ fn styled_line(line: &tattoy_wezterm_term::Line) -> TerminalScreenLine {
     }
 }
 
-fn terminal_style(attributes: &CellAttributes) -> TerminalStyle {
+fn terminal_style(
+    attributes: &CellAttributes,
+    palette: &tattoy_wezterm_term::color::ColorPalette,
+) -> TerminalStyle {
     let intensity = format!("{:?}", attributes.intensity()).to_ascii_lowercase();
+    let foreground = palette.resolve_fg(attributes.foreground());
+    let background = palette.resolve_bg(attributes.background());
     TerminalStyle {
-        foreground: format!("{:?}", attributes.foreground()),
-        background: format!("{:?}", attributes.background()),
+        foreground: srgba_hex(foreground),
+        background: srgba_hex(background),
         bold: intensity == "bold",
         faint: intensity == "half",
         italic: attributes.italic(),
@@ -923,6 +1051,16 @@ fn terminal_style(attributes: &CellAttributes) -> TerminalStyle {
         strikethrough: attributes.strikethrough(),
         invisible: attributes.invisible(),
     }
+}
+
+fn srgba_hex(color: tattoy_wezterm_term::color::SrgbaTuple) -> String {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        channel(color.0),
+        channel(color.1),
+        channel(color.2)
+    )
 }
 
 fn is_blank_screen_line(line: &TerminalScreenLine) -> bool {
@@ -995,6 +1133,11 @@ fn visible_lines(emulator: &Terminal) -> Vec<tattoy_wezterm_term::Line> {
     let end = screen.scrollback_rows();
     let start = end.saturating_sub(screen.physical_rows);
     screen.lines_in_phys_range(start..end)
+}
+
+fn scrollback_lines(emulator: &Terminal) -> Vec<tattoy_wezterm_term::Line> {
+    let screen = emulator.screen();
+    screen.lines_in_phys_range(0..screen.scrollback_rows())
 }
 
 fn parse_key(value: &str) -> Result<KeyCode> {
@@ -1609,6 +1752,7 @@ mod tests {
                 columns: 120,
                 rows: 40,
                 state: TerminalProcessState::Running,
+                origin_activity_id: Some("call-7".into()),
                 exit_code: None,
                 latest_snapshot: None,
                 latest_observation: ObservationClassification::Unchanged,
@@ -1687,12 +1831,8 @@ mod tests {
         assert!(snapshot.bracketed_paste);
         assert_eq!(snapshot.lines[0].spans[0].text, "red");
         assert!(snapshot.lines[0].spans[0].style.bold);
-        assert!(
-            snapshot.lines[0].spans[0]
-                .style
-                .foreground
-                .contains("PaletteIndex(1)")
-        );
+        assert!(snapshot.lines[0].spans[0].style.foreground.starts_with('#'));
+        assert_eq!(snapshot.lines[0].spans[0].style.foreground.len(), 7);
 
         let mut terminal = core.emulator;
         terminal.send_paste("safe").unwrap();
@@ -1749,6 +1889,30 @@ mod tests {
         let started = manager.shell(prompt_command()).await.unwrap();
         let id = started["terminal_id"].as_str().unwrap();
 
+        manager.set_origin_activity(id, "call-shell").unwrap();
+        let live_output = manager.output(id).unwrap();
+        assert_eq!(live_output.process_state, TerminalProcessState::Running);
+        assert_eq!(
+            live_output.origin_activity_id.as_deref(),
+            Some("call-shell")
+        );
+        assert_eq!(live_output.command, prompt_command());
+        assert!(
+            live_output
+                .lines
+                .iter()
+                .any(|line| { line.spans.iter().any(|span| span.text.contains("Name")) })
+        );
+        assert!(
+            live_output
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| {
+                    span.style.foreground.starts_with('#') && span.style.background.starts_with('#')
+                })
+        );
+
         let resized = manager
             .input(id, &[json!({"type": "resize", "columns": 90, "rows": 30})])
             .await
@@ -1773,6 +1937,14 @@ mod tests {
                 .unwrap()
                 .contains("Hello Ada")
         );
+        let final_output = manager.output(id).unwrap();
+        assert_eq!(final_output.process_state, TerminalProcessState::Exited);
+        assert!(final_output.completed_at.is_some());
+        assert!(final_output.lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.text.contains("Hello Ada"))
+        }));
     }
 
     #[tokio::test]
