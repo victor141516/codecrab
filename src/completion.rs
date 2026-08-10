@@ -30,6 +30,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("provider", "Add, select, or remove a provider profile"),
     ("goal", "Start a persistent goal"),
     ("goals", "Browse and manage persistent goals"),
+    ("usage", "Show OpenAI plan usage and reset credits"),
     ("cron", "Manage scheduled agent tasks"),
     ("quit", "Save the session and exit"),
 ];
@@ -132,6 +133,7 @@ pub(crate) fn complete<'a>(
     cursor: usize,
     working_directory: &Path,
     skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+    usage_available: bool,
 ) -> Option<CompletionMenu> {
     if let Some(context) = file_completion_context(input, cursor, working_directory) {
         let items = file_completion_items(&context);
@@ -149,6 +151,7 @@ pub(crate) fn complete<'a>(
         items.extend(
             COMMANDS
                 .iter()
+                .filter(|(name, _)| *name != "usage" || usage_available)
                 .filter(|(name, _)| name.starts_with(context.prefix))
                 .map(|(name, description)| CompletionItem {
                     id: format!("command:{name}"),
@@ -400,6 +403,7 @@ pub(crate) fn complete_progressive<'a>(
     cursor: usize,
     working_directory: &Path,
     skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+    usage_available: bool,
     request_id: u64,
 ) -> (Option<CompletionMenu>, Option<CompletionSearch>) {
     if let Some(context) = file_completion_context(input, cursor, working_directory) {
@@ -413,7 +417,10 @@ pub(crate) fn complete_progressive<'a>(
         let search = start_recursive_file_completion(context, items, request_id);
         return (menu, search);
     }
-    (complete(input, cursor, working_directory, skills), None)
+    (
+        complete(input, cursor, working_directory, skills, usage_available),
+        None,
+    )
 }
 
 pub(crate) fn recursive_file_completion_available(
@@ -961,7 +968,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let skills = [("review-rust", "Review Rust changes.")];
 
-        let menu = complete("/", 1, root.path(), skills).unwrap();
+        let menu = complete("/", 1, root.path(), skills, true).unwrap();
         assert!(
             menu.items
                 .iter()
@@ -985,11 +992,18 @@ mod tests {
         assert!(
             menu.items
                 .iter()
+                .any(|item| item.kind == CompletionKind::Command && item.name == "usage")
+        );
+        let without_usage = complete("/", 1, root.path(), skills, false).unwrap();
+        assert!(without_usage.items.iter().all(|item| item.name != "usage"));
+        assert!(
+            menu.items
+                .iter()
                 .all(|item| item.kind != CompletionKind::Command || item.name != "clear")
         );
 
         let input = "Please /";
-        let menu = complete(input, input.len(), root.path(), skills).unwrap();
+        let menu = complete(input, input.len(), root.path(), skills, true).unwrap();
         assert!(
             menu.items
                 .iter()
@@ -1021,7 +1035,7 @@ mod tests {
         fs::write(workspace.join("hello.txt"), "hello").unwrap();
         fs::write(temp.path().join("above.md"), "above").unwrap();
 
-        let menu = complete("@", 1, &workspace, []).unwrap();
+        let menu = complete("@", 1, &workspace, [], false).unwrap();
         let directory = menu.items.iter().find(|item| item.name == "src").unwrap();
         assert_eq!(directory.kind, CompletionKind::Directory);
         assert_eq!(directory.icon, Some(NERD_FOLDER));
@@ -1034,7 +1048,7 @@ mod tests {
         assert_eq!(file.replacement, "@hello.txt ");
 
         let input = "@../abo";
-        let menu = complete(input, input.len(), &workspace, []).unwrap();
+        let menu = complete(input, input.len(), &workspace, [], false).unwrap();
         assert!(menu.items.iter().any(|item| item.name == "../above.md"));
     }
 
@@ -1046,7 +1060,7 @@ mod tests {
         fs::write(temp.path().join("my-config-file.toml"), "").unwrap();
         fs::write(temp.path().join("unrelated.toml"), "").unwrap();
 
-        let menu = complete("@config", 7, temp.path(), []).unwrap();
+        let menu = complete("@config", 7, temp.path(), [], false).unwrap();
         let names = menu
             .items
             .iter()
@@ -1152,7 +1166,7 @@ mod tests {
         fs::write(temp.path().join("sub/hide.txt"), "").unwrap();
         fs::write(temp.path().join("sub/blocked/child.txt"), "").unwrap();
 
-        let menu = complete("@sub/", 5, temp.path(), []).unwrap();
+        let menu = complete("@sub/", 5, temp.path(), [], false).unwrap();
         let position = |name| {
             menu.items
                 .iter()
@@ -1233,7 +1247,7 @@ mod tests {
         fs::write(temp.path().join("absolute-file.txt"), "").unwrap();
         let display_root = temp.path().to_string_lossy().replace('\\', "/");
         let input = format!("@{display_root}/absolute");
-        let menu = complete(&input, input.len(), Path::new("."), []).unwrap();
+        let menu = complete(&input, input.len(), Path::new("."), [], false).unwrap();
         let item = menu
             .items
             .iter()

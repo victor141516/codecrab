@@ -22,6 +22,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Gauge,
   GitBranch,
   ListTodo,
   LoaderCircle,
@@ -36,6 +37,7 @@ import {
   Play,
   ScanLine,
   Plus,
+  RefreshCw,
   Square,
   Trash2,
   X
@@ -114,6 +116,13 @@ import {
   loadDesktopSidebarCollapsed,
   saveDesktopSidebarCollapsed
 } from "./sidebar-preference.js";
+import {
+  canResetUsage,
+  formatUsageDuration,
+  formatUsageReset,
+  resetOutcomeMessage,
+  usageIndicator
+} from "./usage.js";
 
 const state = ref(null);
 const draft = ref("");
@@ -147,6 +156,13 @@ const overflowingActivityKeys = ref(new Set());
 const expandedTurnKeys = ref(new Set());
 const goalsOpen = ref(false);
 const providersOpen = ref(false);
+const usageOpen = ref(false);
+const usageRefreshing = ref(false);
+const usageResetting = ref(false);
+const usageConfirm = ref(false);
+const usageNotice = ref("");
+let usageResetKey = null;
+let queuedUsageRefresh = null;
 const cronOpen = ref(false);
 const cronDraft = ref(null);
 const cronDraftId = ref("");
@@ -381,6 +397,22 @@ const dictationAvailable = computed(
   () => state.value?.dictation_available ?? false
 );
 const providers = computed(() => state.value?.providers ?? []);
+const usage = computed(() => state.value?.usage ?? { available: false });
+const usageLabel = computed(() => usageIndicator(usage.value));
+const usageCanReset = computed(() => canResetUsage(usage.value));
+watch(
+  () => `${session.value?.id ?? ""}:${session.value?.provider ?? ""}`,
+  () => {
+    if (usage.value.available) {
+      void refreshUsage(session.value?.id);
+      return;
+    }
+    usageOpen.value = false;
+    usageConfirm.value = false;
+    usageNotice.value = "";
+    usageResetKey = null;
+  }
+);
 const cron = computed(() => state.value?.cron ?? null);
 const cronJobs = computed(() => cron.value?.jobs ?? []);
 const goals = computed(() => session.value?.goals ?? []);
@@ -644,6 +676,122 @@ async function api(path, options = {}) {
     throw new Error(body.error || `Request failed with ${response.status}`);
   }
   return body;
+}
+
+function applySharedUsage(nextUsage) {
+  for (const [id, cached] of sessionStates) {
+    if (cached.usage?.available) {
+      sessionStates.set(id, { ...cached, usage: nextUsage });
+    }
+  }
+  if (state.value?.usage?.available) {
+    state.value = { ...state.value, usage: nextUsage };
+  }
+}
+
+async function refreshUsage(
+  requestedSession = session.value?.id,
+  { coalesce = false } = {}
+) {
+  const target = targetState(requestedSession);
+  if (!requestedSession || !target?.usage?.available) return;
+  if (usageRefreshing.value) {
+    queuedUsageRefresh = {
+      sessionId: requestedSession,
+      coalesce: queuedUsageRefresh ? queuedUsageRefresh.coalesce && coalesce : coalesce
+    };
+    return;
+  }
+  usageRefreshing.value = true;
+  usageNotice.value = "";
+  try {
+    const nextUsage = await api(
+      `/api/usage?session_id=${encodeURIComponent(requestedSession)}&coalesce=${coalesce}`
+    );
+    applySharedUsage(nextUsage);
+  } catch (cause) {
+    const currentTarget = targetState(requestedSession);
+    if (currentTarget) {
+      applySharedUsage({
+        ...currentTarget.usage,
+        stale: true,
+        can_reset: false,
+        error: `Usage unavailable: ${cause.message}`
+      });
+    }
+  } finally {
+    usageRefreshing.value = false;
+    const queued = queuedUsageRefresh;
+    queuedUsageRefresh = null;
+    if (queued) {
+      void refreshUsage(queued.sessionId, { coalesce: queued.coalesce });
+    }
+  }
+}
+
+function openUsage() {
+  usageOpen.value = true;
+  usageConfirm.value = false;
+  usageNotice.value = "";
+  void refreshUsage(session.value?.id);
+}
+
+function closeUsage() {
+  if (usageResetting.value) return;
+  usageOpen.value = false;
+  usageConfirm.value = false;
+  usageNotice.value = "";
+  usageResetKey = null;
+}
+
+function requestUsageReset() {
+  if (!usageCanReset.value || usageRefreshing.value || usageResetting.value) return;
+  usageConfirm.value = true;
+  usageNotice.value = "";
+  usageResetKey = null;
+}
+
+function cancelUsageReset() {
+  usageConfirm.value = false;
+  usageResetKey = null;
+}
+
+async function confirmUsageReset() {
+  if (!usageCanReset.value || usageResetting.value) return;
+  const requestedSession = session.value?.id;
+  usageResetting.value = true;
+  usageNotice.value = "";
+  usageResetKey ??=
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    const result = await api("/api/usage/reset", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: requestedSession,
+        idempotency_key: usageResetKey
+      })
+    });
+    applySharedUsage(result.usage);
+    if (session.value?.id === requestedSession) {
+      usageNotice.value = resetOutcomeMessage(result);
+      usageConfirm.value = false;
+    }
+    usageResetKey = null;
+  } catch (cause) {
+    const failedUsage = targetState(requestedSession)?.usage ?? usage.value;
+    applySharedUsage({
+      ...failedUsage,
+      stale: true,
+      can_reset: false,
+      error: `Usage unavailable: ${cause.message}`
+    });
+    if (session.value?.id === requestedSession) {
+      usageNotice.value = `Reset failed: ${cause.message}`;
+    }
+  } finally {
+    usageResetting.value = false;
+  }
 }
 
 function editProvider(provider = null) {
@@ -2097,6 +2245,9 @@ async function handleChatStreamEvent(
   if (event.type === "done") {
     setTargetState(sessionId, event.state);
     applyWorkerLifecycles(event.state.workers ?? []);
+    if (event.state.usage?.available) {
+      void refreshUsage(sessionId, { coalesce: true });
+    }
     return true;
   }
   if (event.type === "cancelled") {
@@ -2226,6 +2377,12 @@ async function sendPrompt() {
     ) {
       recalledMessageNode.value = nodeId;
     }
+    return;
+  }
+  if (prompt === "/usage" && usage.value.available) {
+    await clearComposer();
+    closeAutocomplete();
+    openUsage();
     return;
   }
   if (prompt === "/goals") {
@@ -3722,6 +3879,119 @@ onBeforeUnmount(() => {
     </div>
 
     <div
+      v-if="usageOpen"
+      class="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
+      @click.self="closeUsage"
+    >
+      <section
+        data-testid="usage-modal"
+        class="flex max-h-[85vh] w-full max-w-xl flex-col overflow-hidden rounded-xl border border-emerald-400/20 bg-[#15131a] shadow-2xl shadow-black/60"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="usage-title"
+      >
+        <header class="flex items-center gap-3 border-b border-white/7 px-4 py-3">
+          <Gauge class="size-4 text-emerald-300" aria-hidden="true" />
+          <div class="min-w-0 flex-1">
+            <h2 id="usage-title" class="text-sm font-semibold text-zinc-100">OpenAI usage</h2>
+            <p class="mt-0.5 text-[10px] text-zinc-600">ChatGPT plan quota for this OpenAI account</p>
+          </div>
+          <button
+            class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-white/5 hover:text-zinc-200 disabled:opacity-40"
+            :disabled="usageResetting"
+            aria-label="Close usage"
+            @click="closeUsage"
+          ><X class="size-4" /></button>
+        </header>
+
+        <div class="min-h-0 space-y-4 overflow-y-auto p-4">
+          <div v-if="usageRefreshing && !usage.snapshot" class="flex items-center justify-center gap-2 py-12 text-xs text-zinc-500">
+            <LoaderCircle class="size-4 animate-spin" /> Loading usage
+          </div>
+          <template v-else-if="usage.snapshot">
+            <div class="flex items-center justify-between text-[10px] text-zinc-500">
+              <span>Plan</span>
+              <span class="font-mono uppercase text-zinc-300">{{ usage.snapshot.plan_type }}</span>
+            </div>
+
+            <div class="space-y-2">
+              <article
+                v-for="window in usage.snapshot.windows"
+                :key="`${window.limit_id}:${window.kind}`"
+                class="rounded-lg border border-white/7 bg-white/[0.02] p-3"
+              >
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <p class="text-xs font-semibold text-zinc-200">{{ window.limit_name || window.limit_id }}</p>
+                    <p class="mt-0.5 text-[9px] uppercase tracking-wide text-zinc-600">{{ window.kind }} · {{ formatUsageDuration(window.window_duration_seconds) }}</p>
+                  </div>
+                  <p class="font-mono text-xs text-emerald-300">{{ window.remaining_percent }}% remaining</p>
+                </div>
+                <div class="mt-3 h-1.5 overflow-hidden rounded-full bg-white/5">
+                  <div class="h-full rounded-full bg-emerald-400/70" :style="{ width: `${window.remaining_percent}%` }" />
+                </div>
+                <div class="mt-2 flex justify-between text-[9px] text-zinc-600">
+                  <span>{{ window.used_percent }}% used</span>
+                  <span>Resets {{ formatUsageReset(window.resets_at, undefined, undefined, true) }}</span>
+                </div>
+              </article>
+            </div>
+
+            <section class="rounded-lg border border-white/7 bg-white/[0.02] p-3">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <h3 class="text-xs font-semibold text-zinc-200">Manual reset credits</h3>
+                  <p class="mt-1 text-[10px] text-zinc-600">Use one credit to reset eligible OpenAI usage windows now.</p>
+                </div>
+                <span class="rounded bg-emerald-400/10 px-2 py-1 font-mono text-xs text-emerald-300">{{ usage.snapshot.reset_credits.available_count }}</span>
+              </div>
+              <div v-if="usage.snapshot.reset_credits.credits.length" class="mt-3 space-y-2 border-t border-white/5 pt-3">
+                <div v-for="credit in usage.snapshot.reset_credits.credits" :key="credit.id" class="text-[10px] text-zinc-500">
+                  <p class="font-semibold text-zinc-300">{{ credit.title || credit.reset_type }}</p>
+                  <p v-if="credit.description" class="mt-0.5">{{ credit.description }}</p>
+                  <p v-if="credit.expires_at" class="mt-0.5 font-mono text-zinc-600">Expires {{ new Date(credit.expires_at).toLocaleString() }}</p>
+                </div>
+              </div>
+            </section>
+
+            <p v-if="usage.stale" class="rounded-lg border border-amber-400/15 bg-amber-400/5 px-3 py-2 text-[10px] text-amber-200">
+              This is the last known usage. Refresh before using a reset credit.
+            </p>
+            <p v-if="usage.error" class="text-[10px] text-red-300">{{ usage.error }}</p>
+            <p v-if="usage.last_updated_at" class="text-[9px] text-zinc-650">Updated {{ formatUsageReset(usage.last_updated_at, undefined, undefined, true) }}</p>
+          </template>
+          <p v-else class="py-12 text-center text-xs text-zinc-600">Usage is currently unavailable.</p>
+
+          <p v-if="usageNotice" class="rounded-lg border border-white/7 bg-white/[0.02] px-3 py-2 text-[10px] text-zinc-300">{{ usageNotice }}</p>
+
+          <div v-if="usageConfirm" class="rounded-lg border border-amber-400/20 bg-amber-400/5 p-3">
+            <p class="text-xs font-semibold text-amber-200">Use one manual reset credit?</p>
+            <p class="mt-1 text-[10px] leading-relaxed text-zinc-400">
+              This immediately resets every eligible usage window. You will have {{ Math.max(0, usage.snapshot.reset_credits.available_count - 1) }} credit{{ usage.snapshot.reset_credits.available_count - 1 === 1 ? '' : 's' }} remaining.
+            </p>
+            <p v-if="!usageCanReset" class="mt-2 text-[10px] text-amber-200">
+              Reset confirmation is paused because current usage cannot be reset. Refresh to verify the account state, or cancel.
+            </p>
+            <div class="mt-3 flex justify-end gap-2">
+              <button class="rounded px-3 py-1.5 text-xs text-zinc-500 hover:bg-white/5" :disabled="usageResetting" @click="cancelUsageReset">Cancel</button>
+              <button data-testid="usage-reset-confirm" class="flex items-center gap-2 rounded bg-amber-300 px-3 py-1.5 text-xs font-semibold text-amber-950 disabled:opacity-50" :disabled="usageResetting || !usageCanReset" @click="confirmUsageReset">
+                <LoaderCircle v-if="usageResetting" class="size-3.5 animate-spin" />
+                {{ usageResetting ? 'Resetting' : 'Use reset credit' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <footer class="flex items-center justify-end gap-2 border-t border-white/7 px-4 py-3">
+          <button data-testid="usage-refresh" class="flex items-center gap-2 rounded px-3 py-1.5 text-xs text-zinc-400 hover:bg-white/5 disabled:opacity-40" :disabled="usageRefreshing || usageResetting" @click="refreshUsage()">
+            <RefreshCw class="size-3.5" :class="{ 'animate-spin': usageRefreshing }" /> Refresh
+          </button>
+          <button v-if="!usageConfirm" data-testid="usage-reset" class="rounded bg-emerald-300 px-3 py-1.5 text-xs font-semibold text-emerald-950 disabled:cursor-not-allowed disabled:opacity-35" :disabled="!usageCanReset || usageRefreshing || usageResetting" @click="requestUsageReset">Reset usage</button>
+        </footer>
+      </section>
+    </div>
+
+    <div
       v-if="providersOpen"
       class="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
       @click.self="providersOpen = false"
@@ -4242,6 +4512,17 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="ml-auto flex items-center gap-2">
+          <button
+            v-if="usage.available"
+            data-testid="usage-indicator"
+            class="flex h-8 items-center gap-1.5 rounded-md px-2 font-mono text-[9px] text-emerald-300 transition hover:bg-emerald-400/10"
+            title="OpenAI usage"
+            aria-label="OpenAI usage"
+            @click="openUsage"
+          >
+            <Gauge class="size-3.5 shrink-0" aria-hidden="true" />
+            <span class="hidden max-w-56 truncate lg:inline">{{ usageLabel }}</span>
+          </button>
           <button
             v-if="session"
             class="relative grid size-8 place-items-center rounded-md transition hover:bg-white/5 hover:text-cyan-300"

@@ -17,6 +17,7 @@ CodeCrab keeps final responses concise by default while adapting when the user r
 
 - 🤖 **Autonomous execution** — no approval prompts, artificial tool-round limits, or hidden iteration cap.
 - 💬 **ChatGPT Plus/Pro login** — use your ChatGPT subscription through browser-based OAuth; no API key or separate API billing is required.
+- 📊 **OpenAI usage and resets** — see provider-reported quota windows and use available manual reset credits from the terminal or web client.
 - 🖥️ **Three ways to work** — full-screen terminal UI, pipe-friendly one-shot CLI, and a responsive browser interface.
 - 🔌 **Flexible providers** — use OpenAI or OpenAI-compatible Chat Completions APIs, including local providers.
 - ⚡ **Live, transparent progress** — stream assistant text and structured reads, searches, edits, commands, retries, and other tool activity as they happen.
@@ -251,6 +252,7 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | `/provider` | Add, select, or remove a provider profile |
 | `/goal <objective>` | Start a persistent goal |
 | `/goals` | Browse and manage goals |
+| `/usage` | Inspect OpenAI ChatGPT quota and use manual reset credits |
 | `/quit` | Save and exit |
 
 A built-in command runs only when it is the entire input. Text such as `Explain /help` is sent to the agent unchanged.
@@ -349,6 +351,12 @@ codecrab auth logout
 ```
 
 CodeCrab uses OAuth PKCE, refreshes tokens automatically, and uses the subscription's Codex allowance. The default OpenAI profile has `auth = "auto"`: it selects ChatGPT OAuth when a login exists, otherwise its configured API key. Use `oauth` or `api_key` to require one path explicitly.
+
+When the selected provider is the official OpenAI service and ChatGPT OAuth is active, both clients show a compact quota indicator. Open `/usage` in the terminal or select the indicator in the web header to inspect every provider-reported window, percentage used and remaining, and the automatic reset time in your local timezone. Window lengths and reset-credit availability come from OpenAI rather than from hardcoded plan assumptions.
+
+If OpenAI grants the account manual reset credits, the same view can redeem one at any time after explicit confirmation. Credits and quota belong to the OpenAI account, not to an individual conversation, so they can be viewed or used from any eligible OpenAI session. CodeCrab refreshes usage after successful turns and reset attempts. A failed refresh leaves the last known values marked stale and disables redemption until a refresh succeeds; usage failures never block chatting.
+
+Quota and reset-credit support uses private ChatGPT subscription endpoints. This is not a public compatibility contract and may change without notice. The feature is hidden for OpenAI API-key sessions and OpenAI-compatible providers.
 
 ### API keys and compatible providers
 
@@ -479,6 +487,8 @@ With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription 
 | --- | --- | --- |
 | `GET` | `/api/health` | Process health and version |
 | `GET` | `/api/state` | Current project, session, models, skills, providers, and workers |
+| `GET` | `/api/usage` | Refresh official OpenAI ChatGPT quota and reset-credit state |
+| `POST` | `/api/usage/reset` | Redeem one available OpenAI manual reset credit idempotently |
 | `POST` | `/api/completions` | Shared command, skill, and filesystem completion |
 | `POST` | `/api/completions/recursive` | Progressive fuzzy filesystem completion batches |
 | `POST` | `/api/chat` | Run or edit a prompt as an ordered NDJSON event stream |
