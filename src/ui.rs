@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::{Local, TimeZone};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -34,6 +35,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
+    account_usage::{ResetOutcome, ResetResult, UsageState, UsageTracker},
     agent::{Agent, turn_was_cancelled},
     attachments::AttachmentStore,
     audio::AudioRecording,
@@ -126,6 +128,14 @@ struct GoalPicker {
     selected: usize,
     describing: bool,
     description_scroll: u16,
+}
+
+enum UsageTaskResult {
+    Refreshed(UsageState),
+    Reset {
+        result: Result<ResetResult>,
+        state: UsageState,
+    },
 }
 
 enum PendingGoalAction {
@@ -880,6 +890,16 @@ struct App {
     model: String,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
+    usage_tracker: UsageTracker,
+    usage_state: UsageState,
+    usage_task: Option<JoinHandle<UsageTaskResult>>,
+    usage_refresh_pending: bool,
+    running_usage_refresh_requested: bool,
+    usage_open: bool,
+    usage_confirm: bool,
+    usage_reset_key: Option<String>,
+    usage_scroll: u16,
+    usage_notice: Option<String>,
     skills: Vec<SkillView>,
     background_turns: HashMap<Uuid, BackgroundTurn>,
     model_catalogs: HashMap<Uuid, Vec<ModelCatalogEntry>>,
@@ -890,6 +910,7 @@ struct App {
 }
 
 struct BackgroundTurn {
+    provider: String,
     running: Option<JoinHandle<Result<ConversationTurn>>>,
     event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     pending_user: Option<String>,
@@ -899,6 +920,12 @@ struct BackgroundTurn {
     resume_goal_after_queue: bool,
     pending_goal_action: Option<PendingGoalAction>,
     live_messages: Vec<Message>,
+    usage_refresh_requested: bool,
+}
+
+struct AppServices {
+    debug_openai: DebugOutput,
+    usage_tracker: Option<UsageTracker>,
 }
 
 impl App {
@@ -906,7 +933,7 @@ impl App {
         agent: Agent,
         model_catalog: Vec<ModelCatalogEntry>,
         catalog_error: Option<String>,
-        debug_openai: DebugOutput,
+        services: AppServices,
         config: Config,
         registry: SessionRegistry,
         coordinator: SessionCoordinator,
@@ -939,6 +966,24 @@ impl App {
         let session_id = conversation.snapshot().session.id;
         let conversations = coordinator.manager();
         let model_catalogs = HashMap::from([(session_id, model_catalog.clone())]);
+        let usage_tracker = services
+            .usage_tracker
+            .map(Ok)
+            .unwrap_or_else(|| UsageTracker::new(services.debug_openai.clone()))?;
+        let usage_available = usage_tracker.available_for(&config, &provider);
+        let usage_state = if usage_available {
+            UsageState::empty()
+        } else {
+            UsageState::hidden()
+        };
+        let usage_task = usage_available.then(|| {
+            let tracker = usage_tracker.clone();
+            let config = config.clone();
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                UsageTaskResult::Refreshed(tracker.refresh_for(&config, &provider).await)
+            })
+        });
         Ok(Self {
             coordinator,
             conversations,
@@ -953,7 +998,7 @@ impl App {
             recording: None,
             transcription: None,
             send_after_transcription: false,
-            debug_openai,
+            debug_openai: services.debug_openai,
             config,
             registry,
             clipboard: arboard::Clipboard::new().ok(),
@@ -1004,6 +1049,16 @@ impl App {
             model,
             reasoning_effort,
             service_tier,
+            usage_tracker,
+            usage_state,
+            usage_task,
+            usage_refresh_pending: false,
+            running_usage_refresh_requested: false,
+            usage_open: false,
+            usage_confirm: false,
+            usage_reset_key: None,
+            usage_scroll: 0,
+            usage_notice: None,
             skills,
             background_turns: HashMap::new(),
             model_catalogs,
@@ -1043,6 +1098,136 @@ impl App {
             .find(|model| model.slug == self.model)
             .and_then(|model| model.service_tiers.iter().find(|tier| tier.id == selected))
             .is_some_and(|tier| tier.name.eq_ignore_ascii_case("fast"))
+    }
+
+    fn usage_available(&self) -> bool {
+        self.usage_tracker
+            .available_for(&self.config, &self.provider)
+    }
+
+    fn usage_indicator(&self) -> Option<String> {
+        if !self.usage_available() {
+            return None;
+        }
+        let Some(window) = self
+            .usage_state
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.windows.first())
+        else {
+            return Some(if self.usage_task.is_some() {
+                "Loading usage…".into()
+            } else {
+                "Usage unavailable".into()
+            });
+        };
+        let reset = format_local_reset(window.resets_at, "%a %H:%M");
+        Some(format!(
+            "{}% remaining · Resets {reset}{}",
+            window.remaining_percent,
+            if self.usage_state.stale {
+                " · stale"
+            } else {
+                ""
+            }
+        ))
+    }
+
+    fn start_usage_refresh(&mut self) {
+        if !self.usage_available() {
+            return;
+        }
+        if self.usage_task.is_some() {
+            self.usage_refresh_pending = true;
+            return;
+        }
+        let tracker = self.usage_tracker.clone();
+        let config = self.config.clone();
+        let provider = self.provider.clone();
+        self.usage_notice = None;
+        self.usage_task = Some(tokio::spawn(async move {
+            UsageTaskResult::Refreshed(tracker.refresh_for(&config, &provider).await)
+        }));
+    }
+
+    fn sync_usage_provider(&mut self) {
+        if self.usage_available() {
+            if !self.usage_state.available {
+                self.usage_state = UsageState::empty();
+            }
+            self.start_usage_refresh();
+        } else {
+            self.usage_state = UsageState::hidden();
+            self.usage_open = false;
+            self.usage_confirm = false;
+            self.usage_reset_key = None;
+            self.usage_scroll = 0;
+            self.usage_refresh_pending = false;
+            self.usage_notice = None;
+        }
+    }
+
+    fn start_usage_reset(&mut self) {
+        if self.usage_task.is_some() || !self.usage_state.can_reset {
+            return;
+        }
+        let tracker = self.usage_tracker.clone();
+        let config = self.config.clone();
+        let provider = self.provider.clone();
+        let idempotency_key = self
+            .usage_reset_key
+            .get_or_insert_with(|| Uuid::new_v4().to_string())
+            .clone();
+        self.usage_confirm = false;
+        self.usage_notice = None;
+        self.usage_task = Some(tokio::spawn(async move {
+            let result = tracker
+                .reset_for(&config, &provider, &idempotency_key, None)
+                .await;
+            let state = tracker.current_for(&config, &provider).await;
+            UsageTaskResult::Reset { result, state }
+        }));
+    }
+
+    async fn finish_usage_task_if_ready(&mut self) -> Result<()> {
+        if !self
+            .usage_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return Ok(());
+        }
+        let task = self.usage_task.take().expect("checked above");
+        match task.await.context("usage task failed")? {
+            UsageTaskResult::Refreshed(state) => self.usage_state = state,
+            UsageTaskResult::Reset { result, state } => {
+                self.usage_state = state;
+                if result.is_ok() {
+                    self.usage_reset_key = None;
+                }
+                self.usage_notice = Some(match result {
+                    Ok(result) => match result.outcome {
+                        ResetOutcome::Reset => format!(
+                            "Usage reset completed. {} window{} reset.",
+                            result.windows_reset,
+                            if result.windows_reset == 1 { "" } else { "s" }
+                        ),
+                        ResetOutcome::NothingToReset => {
+                            "No current usage window was eligible for reset.".into()
+                        }
+                        ResetOutcome::NoCredit => "No reset credits are available.".into(),
+                        ResetOutcome::AlreadyRedeemed => {
+                            "This reset request was already redeemed.".into()
+                        }
+                    },
+                    Err(error) => format!("Reset failed: {error:#}"),
+                });
+            }
+        }
+        if std::mem::take(&mut self.usage_refresh_pending) {
+            self.start_usage_refresh();
+        }
+        Ok(())
     }
 
     fn insert(&mut self, text: &str) {
@@ -1440,6 +1625,7 @@ impl App {
             self.skills
                 .iter()
                 .map(|skill| (skill.name.as_str(), skill.description.as_str())),
+            self.usage_available(),
             self.completion_request_id,
         );
         self.completion = menu;
@@ -2384,10 +2570,12 @@ impl App {
         let running = self.running.take();
         let event_rx = self.event_rx.take();
         debug_assert_eq!(running.is_some(), event_rx.is_some());
-        let id = self.conversation.snapshot().session.id;
+        let snapshot = self.conversation.snapshot();
+        let id = snapshot.session.id;
         self.background_turns.insert(
             id,
             BackgroundTurn {
+                provider: snapshot.session.provider,
                 running,
                 event_rx,
                 pending_user: self.pending_user.take(),
@@ -2397,8 +2585,49 @@ impl App {
                 resume_goal_after_queue: std::mem::take(&mut self.resume_goal_after_queue),
                 pending_goal_action: self.pending_goal_action.take(),
                 live_messages: std::mem::take(&mut self.live_messages),
+                usage_refresh_requested: std::mem::take(&mut self.running_usage_refresh_requested),
             },
         );
+    }
+
+    async fn refresh_usage_for_finished_background_turns(&mut self) {
+        let mut provider = None;
+        for background in self.background_turns.values_mut() {
+            if background.usage_refresh_requested
+                || !background
+                    .running
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            {
+                continue;
+            }
+            let handle = background.running.take().expect("checked above");
+            let turn =
+                match handle.await {
+                    Ok(turn) => turn,
+                    Err(error) => Err(anyhow::Error::new(error)
+                        .context("background conversation turn task failed")),
+                };
+            let turn_succeeded = turn.as_ref().is_ok_and(|turn| turn.result.is_ok());
+            background.running = Some(tokio::spawn(async move { turn }));
+            background.usage_refresh_requested = true;
+            if turn_succeeded
+                && self
+                    .usage_tracker
+                    .available_for(&self.config, &background.provider)
+            {
+                provider = Some(background.provider.clone());
+            }
+        }
+        let Some(provider) = provider else {
+            return;
+        };
+        if self.usage_available() {
+            self.start_usage_refresh();
+        } else {
+            self.usage_tracker
+                .refresh_in_background(self.config.clone(), provider);
+        }
     }
 
     fn restore_turn_state(&mut self, id: Uuid) {
@@ -2427,6 +2656,7 @@ impl App {
         }
         self.pending_goal_action = background.pending_goal_action;
         self.live_messages = background.live_messages;
+        self.running_usage_refresh_requested = background.usage_refresh_requested;
     }
 
     async fn delete_session_selection(&mut self) -> Result<()> {
@@ -2505,6 +2735,7 @@ impl App {
 
     fn sync_active_session(&mut self) {
         self.apply_snapshot(self.conversation.snapshot());
+        self.sync_usage_provider();
         self.live_messages.clear();
         self.pending_user = None;
         self.pending_user_attachments.clear();
@@ -2989,6 +3220,9 @@ impl App {
                 false
             }
         };
+        if turn_succeeded && !std::mem::take(&mut self.running_usage_refresh_requested) {
+            self.start_usage_refresh();
+        }
         if self.apply_pending_goal_action().await? {
             return Ok(());
         }
@@ -3085,6 +3319,12 @@ impl App {
             self.close_completion();
             return self.command(&prompt).await;
         }
+        if prompt == "/usage" && self.usage_available() {
+            self.clear_composer_text();
+            self.preferred_column = None;
+            self.close_completion();
+            return self.command(&prompt).await;
+        }
         if prompt == "/providers" || prompt.starts_with("/provider ") {
             self.clear_composer_text();
             self.preferred_column = None;
@@ -3129,6 +3369,7 @@ impl App {
         self.pending_user = Some(prompt.clone());
         self.pending_user_attachments = attachments.clone();
         self.live_messages.clear();
+        self.running_usage_refresh_requested = false;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_rx = Some(event_rx);
@@ -3166,6 +3407,7 @@ impl App {
         self.pending_user = Some(prompt.clone());
         self.pending_user_attachments = attachments.clone();
         self.live_messages.clear();
+        self.running_usage_refresh_requested = false;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_rx = Some(event_rx);
@@ -3183,6 +3425,7 @@ impl App {
         self.pending_user = None;
         self.pending_user_attachments.clear();
         self.live_messages.clear();
+        self.running_usage_refresh_requested = false;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_rx = Some(event_rx);
@@ -3405,6 +3648,13 @@ impl App {
             "/sessions" => self.open_session_picker().await?,
             "/branches" => self.open_branch_navigator(),
             "/goals" => self.open_goal_picker(),
+            "/usage" if self.usage_available() => {
+                self.usage_open = true;
+                self.usage_confirm = false;
+                self.usage_reset_key = None;
+                self.usage_scroll = 0;
+                self.start_usage_refresh();
+            }
             _ => self.error = Some(format!("Unknown command: {command}")),
         }
         Ok(())
@@ -3412,6 +3662,33 @@ impl App {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Ok(());
+        }
+        if self.usage_open {
+            match key.code {
+                KeyCode::Esc if self.usage_confirm => {
+                    self.usage_confirm = false;
+                    self.usage_reset_key = None;
+                }
+                KeyCode::Esc => {
+                    self.usage_open = false;
+                    self.usage_reset_key = None;
+                    self.usage_scroll = 0;
+                    self.usage_notice = None;
+                }
+                KeyCode::Char('r' | 'R') => self.start_usage_refresh(),
+                KeyCode::Up => self.usage_scroll = self.usage_scroll.saturating_sub(1),
+                KeyCode::Down => self.usage_scroll = self.usage_scroll.saturating_add(1),
+                KeyCode::PageUp => self.usage_scroll = self.usage_scroll.saturating_sub(5),
+                KeyCode::PageDown => self.usage_scroll = self.usage_scroll.saturating_add(5),
+                KeyCode::Enter if self.usage_confirm && self.usage_state.can_reset => {
+                    self.start_usage_reset()
+                }
+                KeyCode::Enter if self.usage_task.is_none() && self.usage_state.can_reset => {
+                    self.usage_confirm = true;
+                }
+                _ => {}
+            }
             return Ok(());
         }
         if self.branch_navigator.is_some() {
@@ -3717,7 +3994,10 @@ pub(crate) async fn interactive(
             agent,
             model_catalog,
             catalog_error,
-            debug_openai,
+            AppServices {
+                debug_openai,
+                usage_tracker: None,
+            },
             config,
             registry.clone(),
             coordinator,
@@ -3764,7 +4044,9 @@ async fn run_tui(
     loop {
         app.drain_agent_events();
         app.drain_completion_updates();
+        app.refresh_usage_for_finished_background_turns().await;
         app.finish_turn_if_ready().await?;
+        app.finish_usage_task_if_ready().await?;
         if !app.is_running() {
             app.apply_pending_goal_action().await?;
             app.dispatch_queued_prompt_if_idle()?;
@@ -3857,6 +4139,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.goal_picker.is_some() {
         render_goal_picker(frame, app, area);
+    }
+    if app.usage_open {
+        render_usage(frame, app, area);
     }
 }
 
@@ -4099,6 +4384,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let status = app.status();
     let thinking = app.reasoning_effort.as_deref().unwrap_or("default");
     let fast = app.uses_fast_service_tier();
+    let usage = app.usage_indicator();
     let provider = (app.config.providers.len() > 1).then(|| app.session_provider());
     let separator = "  │  ";
     let model_section_width = provider
@@ -4108,7 +4394,10 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         + thinking.chars().count()
         + 1
         + if fast { 2 } else { 0 };
-    let fixed_width = status.chars().count() + model_section_width + separator.chars().count() * 2;
+    let fixed_width = status.chars().count()
+        + model_section_width
+        + usage.as_ref().map_or(0, |usage| usage.chars().count())
+        + separator.chars().count() * if usage.is_some() { 3 } else { 2 };
     let mut spans = vec![
         Span::styled(status, Style::default().fg(status_color)),
         Span::styled(separator, Style::default().fg(MUTED)),
@@ -4126,6 +4415,14 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     spans.extend([
         Span::raw(" "),
         Span::styled(thinking, Style::default().fg(AQUA)),
+    ]);
+    if let Some(usage) = usage {
+        spans.extend([
+            Span::styled(separator, Style::default().fg(MUTED)),
+            Span::styled(usage, Style::default().fg(AQUA)),
+        ]);
+    }
+    spans.extend([
         Span::styled(separator, Style::default().fg(MUTED)),
         Span::styled(
             compact_path(
@@ -5554,6 +5851,188 @@ fn render_goal_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
+fn render_usage(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let mut lines = vec![Line::from(Span::styled(
+        "OpenAI ChatGPT plan usage",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(snapshot) = &app.usage_state.snapshot {
+        lines.push(Line::from(Span::styled(
+            format!("Plan: {}", snapshot.plan_type),
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::default());
+        for window in &snapshot.windows {
+            let name = window.limit_name.clone().unwrap_or_else(|| "Codex".into());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{name}: "),
+                    Style::default().fg(AQUA).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{}% used / {}% remaining",
+                    window.used_percent, window.remaining_percent
+                )),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} window · Resets {}",
+                    format_usage_duration(window.window_duration_seconds),
+                    format_local_reset(window.resets_at, "%a, %b %-d at %H:%M %Z")
+                ),
+                Style::default().fg(MUTED),
+            )));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("Manual resets: ", Style::default().fg(AQUA)),
+            Span::raw(format!(
+                "{} available",
+                snapshot.reset_credits.available_count
+            )),
+        ]));
+        for credit in &snapshot.reset_credits.credits {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}{}",
+                    credit.title.as_deref().unwrap_or("Reset credit"),
+                    credit
+                        .expires_at
+                        .as_ref()
+                        .map(|value| format!(" · Expires {}", format_credit_expiry(value)))
+                        .unwrap_or_default()
+                ),
+                Style::default().fg(MUTED),
+            )));
+            if let Some(description) = &credit.description {
+                lines.push(Line::from(Span::styled(
+                    format!("    {description}"),
+                    Style::default().fg(MUTED),
+                )));
+            }
+        }
+    } else {
+        lines.extend([Line::default(), Line::from("Usage unavailable")]);
+    }
+    if app.usage_state.stale {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            app.usage_state
+                .error
+                .as_deref()
+                .unwrap_or("Usage unavailable"),
+            Style::default().fg(Color::Yellow),
+        )));
+        if let Some(updated) = app.usage_state.last_updated_at {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Last updated {}",
+                    format_local_reset(updated, "%a, %b %-d at %H:%M:%S %Z")
+                ),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+    if let Some(notice) = &app.usage_notice {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            notice.clone(),
+            Style::default().fg(AQUA),
+        )));
+    }
+    lines.push(Line::default());
+    if app.usage_task.is_some() {
+        lines.push(Line::from(Span::styled(
+            "Refreshing usage…",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if app.usage_confirm {
+        if app.usage_state.can_reset {
+            let remaining = app
+                .usage_state
+                .snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.reset_credits.available_count - 1);
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Reset usage now? This consumes 1 credit ({remaining} remaining). This cannot be undone."
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Enter confirm · Esc cancel",
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Reset confirmation paused because current usage cannot be reset. Refresh to verify the account state, or cancel.",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(Span::styled(
+                "R refresh · Esc cancel",
+                Style::default().fg(MUTED),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            if app.usage_state.can_reset {
+                "↑↓ scroll · R refresh · Enter reset usage · Esc close"
+            } else {
+                "↑↓ scroll · R retry/refresh · Esc close"
+            },
+            Style::default().fg(MUTED),
+        )));
+    }
+    let height = (lines.len() as u16 + 2).clamp(10, area.height.saturating_sub(2).max(10));
+    let popup = centered_rect(area, 82, height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.usage_scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CRAB))
+                    .title(Span::styled(
+                        " Usage ",
+                        Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
+                    )),
+            ),
+        popup,
+    );
+}
+
+fn format_usage_duration(seconds: i64) -> String {
+    if seconds > 0 && seconds % 604_800 == 0 {
+        let weeks = seconds / 604_800;
+        format!("{weeks} week{}", if weeks == 1 { "" } else { "s" })
+    } else if seconds > 0 && seconds % 86_400 == 0 {
+        let days = seconds / 86_400;
+        format!("{days} day{}", if days == 1 { "" } else { "s" })
+    } else if seconds > 0 && seconds % 3_600 == 0 {
+        let hours = seconds / 3_600;
+        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+    } else {
+        format!("{} minutes", seconds.max(0) / 60)
+    }
+}
+
+fn format_credit_expiry(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value).map_or_else(
+        |_| value.to_owned(),
+        |date| {
+            date.with_timezone(&Local)
+                .format("%a, %b %-d at %H:%M %Z")
+                .to_string()
+        },
+    )
+}
+
 fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -5575,6 +6054,14 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
             horizontal: 0,
             vertical: 0,
         })
+}
+
+fn format_local_reset(timestamp: i64, format: &str) -> String {
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|value| value.format(format).to_string())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn composer_rows(input: &str, width: usize) -> Vec<ComposerRow> {
@@ -5923,6 +6410,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use crate::{
+        account_usage::{ResetCredit, ResetCredits, UsageSnapshot, UsageWindow, UsageWindowKind},
         completion::{NERD_FOLDER, file_completion_context, file_icon},
         config::{Config, SessionRegistry, paths_equal},
         provider::{
@@ -5974,7 +6462,10 @@ mod tests {
             .unwrap(),
             Vec::new(),
             None,
-            DebugOutput::default(),
+            AppServices {
+                debug_openai: DebugOutput::default(),
+                usage_tracker: Some(UsageTracker::test(false, None).unwrap()),
+            },
             config,
             registry,
             coordinator,
@@ -7765,6 +8256,207 @@ mod tests {
 
         assert!(text.contains("Skills (0)"));
         assert!(text.contains(".agents/skills"));
+    }
+
+    #[tokio::test]
+    async fn renders_and_scrolls_provider_defined_openai_usage_at_wide_and_compact_sizes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.usage_open = true;
+        app.usage_state = UsageState {
+            available: true,
+            stale: false,
+            can_reset: true,
+            last_updated_at: Some(1_786_826_000),
+            snapshot: Some(UsageSnapshot {
+                plan_type: "pro".into(),
+                windows: vec![UsageWindow {
+                    limit_id: "codex".into(),
+                    limit_name: None,
+                    kind: UsageWindowKind::Primary,
+                    used_percent: 37.0,
+                    remaining_percent: 63.0,
+                    window_duration_seconds: 604_800,
+                    resets_at: 1_786_826_526,
+                }],
+                reset_credits: ResetCredits {
+                    available_count: 2,
+                    applicable_available_count: 1,
+                    credits: (1..=3)
+                        .map(|index| ResetCredit {
+                            id: format!("credit-{index}"),
+                            reset_type: "codex_rate_limits".into(),
+                            status: "available".into(),
+                            granted_at: "2026-06-17T00:00:00Z".into(),
+                            expires_at: Some("2026-07-17T00:00:00Z".into()),
+                            title: Some(format!("Reset credit {index}")),
+                            description: Some("Ready to redeem".into()),
+                        })
+                        .collect(),
+                },
+            }),
+            error: None,
+        };
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("OpenAI ChatGPT plan usage"));
+        assert!(rendered.contains("37% used / 63% remaining"));
+        assert!(rendered.contains("1 week window"));
+        assert!(rendered.contains("Manual resets: 2 available"));
+        assert!(rendered.contains("Enter reset usage"));
+
+        app.usage_confirm = true;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("consumes 1 credit (1 remaining)"));
+        assert!(rendered.contains("cannot be undone"));
+
+        app.usage_state.can_reset = false;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let paused = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(paused.contains("confirmation paused"));
+        app.usage_state.can_reset = true;
+
+        let compact_backend = TestBackend::new(58, 14);
+        let mut compact_terminal = Terminal::new(compact_backend).unwrap();
+        compact_terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.usage_scroll, 1);
+        compact_terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let compact = compact_terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(compact.contains("Plan: pro"));
+    }
+
+    #[tokio::test]
+    async fn usage_command_opens_during_an_active_turn_instead_of_queuing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let provider = app
+            .config
+            .providers
+            .get_mut(&app.provider)
+            .expect("active provider");
+        provider.base_url = crate::config::OFFICIAL_OPENAI_BASE_URL.into();
+        provider.auth = "oauth".into();
+        app.usage_tracker = UsageTracker::test(true, None).unwrap();
+        app.usage_state = UsageState::empty();
+        app.running = Some(tokio::spawn(std::future::pending()));
+        app.usage_task = Some(tokio::spawn(std::future::pending()));
+        app.input = "/usage".into();
+        app.cursor = app.input.len();
+
+        app.submit().await.unwrap();
+
+        assert!(app.usage_open);
+        assert!(app.input.is_empty());
+        assert!(app.prompt_queue.items.is_empty());
+        app.running.take().unwrap().abort();
+        app.usage_task.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn a_parked_openai_turn_requests_usage_refresh_when_it_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let provider = app
+            .config
+            .providers
+            .get_mut(&app.provider)
+            .expect("active provider");
+        provider.base_url = crate::config::OFFICIAL_OPENAI_BASE_URL.into();
+        provider.auth = "oauth".into();
+        app.usage_tracker = UsageTracker::test(true, Some("http://127.0.0.1:1".into())).unwrap();
+        app.usage_state = UsageState::empty();
+        let snapshot = app.conversation.snapshot();
+        app.running = Some(tokio::spawn(async move {
+            Ok(ConversationTurn {
+                result: Ok("finished test turn".into()),
+                snapshot,
+            })
+        }));
+        app.event_rx = Some(mpsc::unbounded_channel().1);
+        let id = app.conversation.snapshot().session.id;
+        app.park_current_turn();
+        tokio::task::yield_now().await;
+
+        app.refresh_usage_for_finished_background_turns().await;
+
+        assert!(
+            app.background_turns
+                .values()
+                .all(|background| background.usage_refresh_requested)
+        );
+        assert!(app.usage_task.is_some());
+        app.restore_turn_state(id);
+        app.finish_turn_if_ready().await.unwrap();
+        assert!(!app.usage_refresh_pending);
+        app.usage_task.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn a_parked_failed_turn_does_not_refresh_usage_or_refresh_again_after_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let provider = app
+            .config
+            .providers
+            .get_mut(&app.provider)
+            .expect("active provider");
+        provider.base_url = crate::config::OFFICIAL_OPENAI_BASE_URL.into();
+        provider.auth = "oauth".into();
+        app.usage_tracker = UsageTracker::test(true, Some("http://127.0.0.1:1".into())).unwrap();
+        app.usage_state = UsageState::empty();
+        let snapshot = app.conversation.snapshot();
+        app.running = Some(tokio::spawn(async move {
+            Ok(ConversationTurn {
+                result: Err(anyhow::anyhow!("failed test turn")),
+                snapshot,
+            })
+        }));
+        app.event_rx = Some(mpsc::unbounded_channel().1);
+        let id = app.conversation.snapshot().session.id;
+        app.park_current_turn();
+        tokio::task::yield_now().await;
+
+        app.refresh_usage_for_finished_background_turns().await;
+        assert!(app.usage_task.is_none());
+
+        app.restore_turn_state(id);
+        app.finish_turn_if_ready().await.unwrap();
+        assert!(app.usage_task.is_none());
     }
 
     #[test]

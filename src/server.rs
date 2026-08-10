@@ -35,6 +35,7 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use uuid::Uuid;
 
 use crate::{
+    account_usage::{ResetResult, UsageState, UsageTracker},
     agent::{Agent, turn_was_cancelled},
     attachments::{Attachment, AttachmentStore, MAX_ATTACHMENT_BYTES, validate_sha256},
     auth::OAuthStore,
@@ -114,6 +115,7 @@ pub(crate) struct ServerInner {
     conversations: ConversationManager,
     catalogs: RwLock<HashMap<Uuid, CatalogState>>,
     cron: CronStore,
+    usage: UsageTracker,
     pub(crate) code_server: CodeServerManager,
 }
 
@@ -139,6 +141,7 @@ struct StateResponse {
     models: Vec<ModelCatalogEntry>,
     catalog_error: Option<String>,
     dictation_available: bool,
+    usage: UsageState,
     providers: Vec<ProviderSummary>,
     workers: Vec<ConversationStatus>,
     cron: Option<CronSnapshot>,
@@ -271,6 +274,13 @@ struct ConversationRequest {
 }
 
 #[derive(Deserialize)]
+struct UsageRequest {
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    coalesce: bool,
+}
+
+#[derive(Deserialize)]
 struct BranchRequest {
     session_id: Option<Uuid>,
     node_id: Uuid,
@@ -360,6 +370,14 @@ struct ProviderRequest {
     api_key: Option<String>,
     #[serde(default)]
     clear_api_key: bool,
+}
+
+#[derive(Deserialize)]
+struct ResetUsageRequest {
+    session_id: Option<Uuid>,
+    idempotency_key: String,
+    #[serde(default)]
+    credit_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -499,6 +517,7 @@ pub(crate) async fn serve(
     let initial_id = initial_handle.snapshot().session.id;
     let manager = coordinator.manager();
     let code_server_path = config.code_server_path.clone();
+    let usage = UsageTracker::new(debug_openai.clone())?;
     let state = ServerState {
         inner: Arc::new(ServerInner {
             coordinator,
@@ -521,6 +540,7 @@ pub(crate) async fn serve(
                 },
             )])),
             cron: CronStore::default()?,
+            usage,
             code_server: CodeServerManager::new(code_server_path)?,
         }),
     };
@@ -601,6 +621,8 @@ fn server_app(state: ServerState) -> Router {
             Router::new()
                 .route("/health", get(health))
                 .route("/state", get(get_state))
+                .route("/usage", get(get_usage))
+                .route("/usage/reset", post(reset_usage))
                 .route("/completions", post(completions))
                 .route("/completions/recursive", post(recursive_completions))
                 .route("/chat", post(chat))
@@ -935,7 +957,7 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         .first()
         .map(|project| project.root.display().to_string())
         .unwrap_or_else(|| root.display().to_string());
-    let config = state.inner.config.read().unwrap();
+    let config = state.inner.config.read().unwrap().clone();
     let dictation_available = session.as_ref().is_some_and(|session| {
         Transcriber::is_available_with_oauth(
             &config,
@@ -945,6 +967,15 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         .unwrap_or(false)
     });
     let providers = config.summaries();
+    let usage = if let Some(session) = &session {
+        state
+            .inner
+            .usage
+            .current_for(&config, &session.provider)
+            .await
+    } else {
+        UsageState::hidden()
+    };
     let (cron, cron_error) = match state.inner.cron.snapshot(chrono::Utc::now()) {
         Ok(snapshot) => (Some(snapshot), None),
         Err(error) => (None, Some(format!("{error:#}"))),
@@ -968,6 +999,7 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
             .and_then(|id| state.inner.catalogs.read().unwrap().get(&id).cloned())
             .and_then(|catalog| catalog.error),
         dictation_available,
+        usage,
         providers,
         workers: state.inner.conversations.statuses(),
         cron,
@@ -994,6 +1026,63 @@ async fn get_state(
         conversation.persist_if_idle().await?;
     }
     Ok(Json(snapshot_for(&state, request.session_id).await?))
+}
+
+async fn get_usage(
+    State(state): State<ServerState>,
+    Query(request): Query<UsageRequest>,
+) -> ApiResult<UsageState> {
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::message(
+                StatusCode::CONFLICT,
+                "create or resume a session before requesting usage",
+            )
+        })?;
+    let provider = conversation.snapshot().session.provider;
+    let config = state.inner.config.read().unwrap().clone();
+    let usage = if request.coalesce {
+        state
+            .inner
+            .usage
+            .refresh_coalesced_for(&config, &provider)
+            .await
+    } else {
+        state.inner.usage.refresh_for(&config, &provider).await
+    };
+    Ok(Json(usage))
+}
+
+async fn reset_usage(
+    State(state): State<ServerState>,
+    Json(request): Json<ResetUsageRequest>,
+) -> ApiResult<ResetResult> {
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::message(
+                StatusCode::CONFLICT,
+                "create or resume a session before resetting usage",
+            )
+        })?;
+    let provider = conversation.snapshot().session.provider;
+    let config = state.inner.config.read().unwrap().clone();
+    let result = state
+        .inner
+        .usage
+        .reset_for(
+            &config,
+            &provider,
+            &request.idempotency_key,
+            request.credit_id.as_deref(),
+        )
+        .await
+        .map_err(|error| ApiError {
+            status: StatusCode::CONFLICT,
+            error,
+        })?;
+    Ok(Json(result))
 }
 
 async fn get_cron(State(state): State<ServerState>) -> ApiResult<CronSnapshot> {
@@ -1088,6 +1177,10 @@ async fn completions(
     } else {
         snapshot.skills.clone()
     };
+    let usage_available = state.inner.usage.available_for(
+        &state.inner.config.read().unwrap(),
+        &snapshot.session.provider,
+    );
     let menu = complete_input(
         &input,
         cursor,
@@ -1095,6 +1188,7 @@ async fn completions(
         skills
             .iter()
             .map(|skill| (skill.name.as_str(), skill.description.as_str())),
+        usage_available,
     );
     let (items, token_start, token_end) = match menu {
         Some(menu) => (menu.items, menu.token_start, menu.token_end),
@@ -1385,6 +1479,7 @@ async fn chat(
         })?;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let session_id = conversation.snapshot().session.id;
+    let provider = conversation.snapshot().session.provider;
     let turn = if let Some(node_id) = request.edit_node_id {
         conversation.start_edit_turn_with_attachments(
             node_id,
@@ -1422,10 +1517,17 @@ async fn chat(
         let _ = forward_events.await;
 
         let message = match result {
-            Ok(()) => match snapshot_for(&state, Some(session_id)).await {
-                Ok(state) => ChatStreamMessage::Done { state },
-                Err(error) => stream_error(error),
-            },
+            Ok(()) => {
+                let config = state.inner.config.read().unwrap().clone();
+                state
+                    .inner
+                    .usage
+                    .refresh_in_background(config, provider.clone());
+                match snapshot_for(&state, Some(session_id)).await {
+                    Ok(state) => ChatStreamMessage::Done { state },
+                    Err(error) => stream_error(error),
+                }
+            }
             Err(error) if turn_was_cancelled(&error) => {
                 match snapshot_for(&state, Some(session_id)).await {
                     Ok(state) => ChatStreamMessage::Cancelled { state },
@@ -2721,6 +2823,25 @@ mod tests {
         oauth_logged_in: bool,
         registry: SessionRegistry,
     ) -> ServerState {
+        let usage = UsageTracker::test(oauth_logged_in, None).unwrap();
+        test_state_with_registry_and_usage(
+            config,
+            root,
+            conversation,
+            oauth_logged_in,
+            registry,
+            usage,
+        )
+    }
+
+    fn test_state_with_registry_and_usage(
+        config: Config,
+        root: PathBuf,
+        conversation: ConversationHandle,
+        oauth_logged_in: bool,
+        registry: SessionRegistry,
+        usage: UsageTracker,
+    ) -> ServerState {
         let session_id = conversation.snapshot().session.id;
         let coordinator = SessionCoordinator::new(
             config.clone(),
@@ -2748,6 +2869,7 @@ mod tests {
                     root.join("test-cron.json"),
                     root.join(".test-global-config").join("cron-runtime"),
                 ),
+                usage,
                 code_server: CodeServerManager::new(None).unwrap(),
             }),
         }
@@ -3723,6 +3845,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_api_refreshes_and_redeems_through_shared_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider_server = tokio::spawn(async move {
+            let responses = [
+                r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":37,"limit_window_seconds":604800,"reset_at":1786826526}},"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":1}}"#,
+                r#"{"credits":[{"id":"credit-1","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-06-17T00:00:00Z","expires_at":null}],"available_count":1}"#,
+                r#"{"code":"reset","windows_reset":1}"#,
+                r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":1787431326}},"rate_limit_reset_credits":{"available_count":0,"applicable_available_count":0}}"#,
+            ];
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(crate::test_support::read_http_request(&mut socket).await);
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                            response.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut config = Config::test("test-model", crate::config::OFFICIAL_OPENAI_BASE_URL);
+        config
+            .providers
+            .get_mut(&config.active_provider)
+            .unwrap()
+            .auth = "oauth".into();
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create("test-model".into())
+            .unwrap();
+        let session_id = session.id;
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let registry = SessionRegistry::at(root.join("test-global-config.toml"));
+        let usage = UsageTracker::test(true, Some(format!("http://{address}"))).unwrap();
+        let state = test_state_with_registry_and_usage(
+            config,
+            root,
+            test_conversation(agent),
+            true,
+            registry,
+            usage,
+        );
+
+        let refreshed = get_usage(
+            State(state.clone()),
+            Query(UsageRequest {
+                session_id: Some(session_id),
+                coalesce: false,
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert!(refreshed.available);
+        assert!(!refreshed.stale);
+        assert!(refreshed.can_reset);
+        assert_eq!(
+            refreshed.snapshot.unwrap().windows[0].remaining_percent,
+            63.0
+        );
+
+        let reset = reset_usage(
+            State(state),
+            Json(ResetUsageRequest {
+                session_id: Some(session_id),
+                idempotency_key: "request-123".into(),
+                credit_id: None,
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        assert_eq!(reset.outcome, crate::account_usage::ResetOutcome::Reset);
+        assert_eq!(reset.windows_reset, 1);
+        assert!(!reset.usage.can_reset);
+        assert_eq!(
+            reset.usage.snapshot.unwrap().windows[0].remaining_percent,
+            100.0
+        );
+
+        let requests = provider_server.await.unwrap();
+        let reset_request = String::from_utf8(requests[2].clone()).unwrap();
+        assert!(reset_request.starts_with("POST /wham/rate-limit-reset-credits/consume"));
+        assert!(reset_request.contains(r#""redeem_request_id":"request-123""#));
+    }
+
+    #[tokio::test]
     async fn completion_api_uses_shared_commands_skills_and_files() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -3750,6 +3971,7 @@ mod tests {
             .unwrap();
         let agent = build_agent(&root, &config, false, session).unwrap();
         let state = test_state(config, root.clone(), test_conversation(agent), false);
+        assert!(!snapshot(&state).await.unwrap().usage.available);
 
         let slash = completions(
             State(state.clone()),
@@ -3776,6 +3998,7 @@ mod tests {
                 .any(|item| item.kind == crate::completion::CompletionKind::Skill
                     && item.name == "review-rust")
         );
+        assert!(slash.items.iter().all(|item| item.name != "usage"));
 
         let files = completions(
             State(state.clone()),
