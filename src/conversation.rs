@@ -24,6 +24,7 @@ use crate::{
     provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection, Role},
     session::{GoalStatus, Session, SessionStore, TurnOutcome},
     skills::{Skill, SkillRegistry},
+    terminal::{TerminalManager, TerminalOutputSnapshot, TerminalRecord},
 };
 
 #[derive(Clone)]
@@ -71,6 +72,7 @@ pub(crate) enum ConversationLiveEvent {
     Lifecycle,
     Agent(AgentEvent),
     Snapshot,
+    Terminals,
 }
 
 #[derive(Clone)]
@@ -227,6 +229,7 @@ pub(crate) struct ConversationHandle {
     lifecycle: Arc<AtomicU8>,
     observation: Arc<Mutex<ConversationObservation>>,
     observation_hub: ObservationHub,
+    terminals: TerminalManager,
     session_id: Uuid,
     project_root: PathBuf,
     live_hub: ConversationLiveHub,
@@ -327,6 +330,7 @@ impl ConversationHandle {
         live_hub: ConversationLiveHub,
     ) -> Result<Self> {
         let initial = snapshot(&agent);
+        let terminals = agent.terminal_manager();
         let session_id = initial.session.id;
         let project_root = initial.project_root.clone();
         let (commands, command_rx) = mpsc::unbounded_channel();
@@ -344,6 +348,31 @@ impl ConversationHandle {
         let skill_refresh = Arc::new(Mutex::new(SkillRefreshCache {
             recent: VecDeque::new(),
         }));
+        let mut terminal_changes = terminals.subscribe();
+        let terminal_state = terminals.clone();
+        let terminal_live_hub = live_hub.clone();
+        let terminal_observation = observation.clone();
+        let terminal_project_root = project_root.clone();
+        spawn_worker(async move {
+            let mut active_count = terminal_state.running_records().len();
+            while terminal_changes.changed().await.is_ok() {
+                let next_active_count = terminal_state.running_records().len();
+                if next_active_count == active_count {
+                    continue;
+                }
+                active_count = next_active_count;
+                let observation_revision = terminal_observation
+                    .lock()
+                    .expect("conversation observation mutex poisoned")
+                    .revision;
+                terminal_live_hub.publish(
+                    session_id,
+                    terminal_project_root.clone(),
+                    observation_revision,
+                    ConversationLiveEvent::Terminals,
+                );
+            }
+        })?;
         spawn_worker(run_worker(
             agent,
             command_rx,
@@ -370,6 +399,7 @@ impl ConversationHandle {
             lifecycle,
             observation,
             observation_hub,
+            terminals,
             session_id,
             project_root,
             live_hub,
@@ -379,6 +409,34 @@ impl ConversationHandle {
 
     pub(crate) fn snapshot(&self) -> ConversationSnapshot {
         self.snapshot.borrow().clone()
+    }
+
+    fn snapshot_with_terminal_state(&self) -> ConversationSnapshot {
+        let mut snapshot = self.snapshot();
+        let (next_terminal_id, terminals) = self.terminals.persisted_state();
+        snapshot.session.next_terminal_id = next_terminal_id;
+        snapshot.session.terminals = terminals;
+        snapshot
+    }
+
+    pub(crate) fn running_terminals(&self) -> Vec<TerminalRecord> {
+        self.terminals.running_records()
+    }
+
+    pub(crate) fn running_terminal_count(&self) -> usize {
+        self.terminals.running_records().len()
+    }
+
+    pub(crate) fn terminal_output(&self, terminal_id: &str) -> Result<TerminalOutputSnapshot> {
+        self.terminals.output(terminal_id)
+    }
+
+    pub(crate) fn close_terminal(&self, terminal_id: &str) -> Result<()> {
+        self.terminals.close(terminal_id).map(|_| ())
+    }
+
+    pub(crate) fn close_terminals(&self) -> Result<()> {
+        self.terminals.close_all()
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -398,7 +456,7 @@ impl ConversationHandle {
 
     pub(crate) fn live_state(&self) -> ConversationLiveState {
         ConversationLiveState {
-            snapshot: self.snapshot(),
+            snapshot: self.snapshot_with_terminal_state(),
             observation: self.observation(),
             lifecycle: self.lifecycle(),
         }
@@ -1420,6 +1478,37 @@ impl ConversationManager {
         {
             handle.cancel();
         }
+    }
+
+    pub(crate) fn active_terminal_count(&self) -> usize {
+        self.conversations
+            .read()
+            .expect("conversation manager lock poisoned")
+            .values()
+            .map(ConversationHandle::running_terminal_count)
+            .sum()
+    }
+
+    pub(crate) fn close_all_terminals(&self) -> Result<()> {
+        let handles = self
+            .conversations
+            .read()
+            .expect("conversation manager lock poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for handle in handles {
+            if let Err(error) = handle.close_terminals()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn observation_hub(&self) -> ObservationHub {

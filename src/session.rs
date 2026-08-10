@@ -787,6 +787,7 @@ pub(crate) struct SessionSummary {
     pub model: String,
     pub depth: usize,
     pub descendant_count: usize,
+    pub active_terminal_count: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -919,6 +920,7 @@ impl SessionStore {
                 model: session.model,
                 depth: 0,
                 descendant_count: 0,
+                active_terminal_count: 0,
             });
         }
         sessions.sort_by_key(|session| std::cmp::Reverse((session.created_at, session.id)));
@@ -1610,6 +1612,7 @@ mod tests {
             columns: 120,
             rows: 40,
             state: crate::terminal::TerminalProcessState::Running,
+            origin_activity_id: Some("call-3".into()),
             exit_code: None,
             latest_snapshot: None,
             latest_observation: crate::terminal::ObservationClassification::Unchanged,
@@ -1921,6 +1924,7 @@ mod tests {
                 model: "model".into(),
                 depth: 99,
                 descendant_count: 99,
+                active_terminal_count: 0,
             }
         }
 

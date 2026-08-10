@@ -277,3 +277,147 @@ describe("OpenAI usage", () => {
     );
   });
 });
+
+describe("managed terminal processes", () => {
+  function response(body) {
+    return { ok: true, status: 200, json: async () => body };
+  }
+
+  function workspaceState() {
+    return {
+      live_revision: 1,
+      project: "/workspace",
+      filesystem_root: "/",
+      session: {
+        id: "session-1",
+        title: "Process test",
+        provider: "openai",
+        model: "gpt-test",
+        reasoning_effort: null,
+        service_tier: null,
+        messages: [],
+        activities: [],
+        turns: [],
+        goals: [],
+        branch_nodes: [],
+        active_message_ids: []
+      },
+      projects: [{
+        root: "/workspace",
+        sessions: [{
+          id: "session-1",
+          title: "Process test",
+          model: "gpt-test",
+          active_terminal_count: 1
+        }]
+      }],
+      skills: [],
+      models: [],
+      providers: [],
+      workers: [],
+      usage: { available: false },
+      cron: null
+    };
+  }
+
+  test("opens from /processes and keeps output visible after stopping", async () => {
+    const createdAt = new Date(Date.now() - 3_000).toISOString();
+    const process = {
+      terminal_id: "terminal_1",
+      command: "long-running-command",
+      created_at: createdAt,
+      origin_activity_id: "call-shell"
+    };
+    let stopped = false;
+    let stopBody;
+    let chatRequested = false;
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url === "/api/state") return response(workspaceState());
+      if (url === "/api/completions") return response(null);
+      if (url.startsWith("/api/processes/terminal_1")) {
+        return response({
+          ...process,
+          process_state: stopped ? "closed" : "running",
+          completed_at: stopped ? new Date().toISOString() : null,
+          exit_code: null,
+          screen_sequence: 2,
+          rows: 24,
+          columns: 80,
+          lines: [{
+            spans: [{
+              text: "colored output",
+              style: {
+                foreground: "#00ff00",
+                background: "#000000",
+                bold: true,
+                faint: false,
+                italic: false,
+                underline: "none",
+                reverse: false,
+                strikethrough: false
+              }
+            }]
+          }]
+        });
+      }
+      if (url.startsWith("/api/processes?")) {
+        return response(stopped ? [] : [process]);
+      }
+      if (url === "/api/processes/stop") {
+        stopBody = JSON.parse(options.body);
+        stopped = true;
+        return response({
+          ...process,
+          process_state: "closed",
+          completed_at: new Date().toISOString(),
+          exit_code: null,
+          screen_sequence: 3,
+          rows: 24,
+          columns: 80,
+          lines: []
+        });
+      }
+      if (url === "/api/chat") chatRequested = true;
+      throw new Error(`offline test: ${url}`);
+    }));
+
+    mountApp();
+    await vi.waitFor(() =>
+      expect(root.querySelector('button[aria-label^="Open 1 active process"]')).not.toBeNull()
+    );
+    const composer = get('textarea[aria-label="Message CodeCrab"]');
+    composer.value = "/processes";
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    get('button[aria-label="Send message"]').click();
+
+    await vi.waitFor(() =>
+      expect(get('[data-testid="processes-modal"]').textContent).toContain("long-running-command")
+    );
+    expect(chatRequested).toBe(false);
+    get('button[aria-label="View output"]').click();
+    await vi.waitFor(() =>
+      expect(get('[data-testid="processes-modal"]').textContent).toContain("colored output")
+    );
+    expect(get('[data-testid="processes-modal"] span[style]').style.color).toBe("#00ff00");
+
+    [...get('[data-testid="processes-modal"]').querySelectorAll("button")]
+      .find((button) => button.textContent.includes("Stop process"))
+      .click();
+    await nextTick();
+    const confirmationButtons = [...get('[data-testid="processes-modal"]').querySelectorAll("button")]
+      .filter((button) => button.textContent.includes("Stop process"));
+    confirmationButtons.at(-1).click();
+
+    await vi.waitFor(() =>
+      expect(stopBody).toEqual({
+        session_id: "session-1",
+        terminal_id: "terminal_1"
+      })
+    );
+    await vi.waitFor(() =>
+      expect(get('[data-testid="processes-modal"]').textContent).toContain("Stopped")
+    );
+  });
+});

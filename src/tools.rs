@@ -60,6 +60,14 @@ impl ToolBox {
         self.terminals.persisted_state()
     }
 
+    pub(crate) fn terminal_manager(&self) -> TerminalManager {
+        self.terminals.clone()
+    }
+
+    pub(crate) fn set_terminal_origin(&self, terminal_id: &str, activity_id: &str) -> Result<()> {
+        self.terminals.set_origin_activity(terminal_id, activity_id)
+    }
+
     pub(crate) fn close_terminals(&self) -> Result<()> {
         self.terminals.close_all()
     }
