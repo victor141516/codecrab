@@ -27,7 +27,7 @@ use crate::{
     provider::{
         AttachmentBinding, Message, MessagePart, ModelCatalogEntry, ModelSelection,
         OpenAiCompatible, Role, ToolCall, context_length_exceeded, default_model_selection,
-        new_session_model_selection,
+        model_request_is_retryable, new_session_model_selection,
     },
     session::{
         CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
@@ -92,6 +92,19 @@ struct CompactionPreflight<'a> {
     turn_message_index: usize,
     force: bool,
     events: Option<&'a mpsc::UnboundedSender<AgentEvent>>,
+}
+
+#[derive(Debug, Default)]
+struct CompactionOutcome {
+    compacted: bool,
+    failure: Option<String>,
+}
+
+#[derive(Debug)]
+enum CompactionAttempt {
+    NotNeeded,
+    Compacted,
+    Failed(String),
 }
 
 impl Agent {
@@ -487,7 +500,7 @@ impl Agent {
                         {
                             let _ = events.send(AgentEvent::AssistantStreamReset);
                         }
-                        let compacted = self
+                        let compaction = self
                             .compact_until_safe(
                                 CompactionPreflight {
                                     trigger: CompactionTrigger::ContextLengthExceeded,
@@ -503,26 +516,48 @@ impl Agent {
                                 &mut cancellation,
                             )
                             .await?;
-                        if compacted {
+                        if compaction.compacted {
                             continue 'agent_loop;
                         }
-                        retry += 1;
+                        let compaction_error = compaction
+                            .failure
+                            .as_deref()
+                            .unwrap_or("no safe conversation boundary was available");
+                        let error = anyhow::anyhow!(
+                            "{error:#}; emergency context compaction failed: {compaction_error}"
+                        );
                         let error_text = format!("{error:#}");
-                        let retry_sequence = self.session.reserve_event_sequence();
+                        self.diagnostics.error(format!(
+                            "CodeCrab model request failed after emergency context compaction: \
+{error_text}"
+                        ));
+                        preserve_partial_assistant(
+                            &mut self.session.messages,
+                            &streamed_text,
+                            response_sequence,
+                            *response_created_at
+                                .lock()
+                                .expect("response timestamp mutex poisoned"),
+                        );
+                        let error_sequence = self.session.reserve_event_sequence();
                         self.record_activity(
-                            AgentActivity::model_retry(
-                                format!("model-retry-{}", Uuid::new_v4()),
+                            AgentActivity::model_error(
+                                format!("model-error-{}", Uuid::new_v4()),
                                 turn_message_id,
                                 turn_message_index,
-                                retry_sequence,
-                                retry,
-                                MAX_MODEL_RETRIES,
+                                error_sequence,
                                 error_text,
                             ),
                             events.as_ref(),
                         );
+                        self.session.updated_at = Utc::now();
+                        return Err(error);
                     }
-                    Err(error) if retry < MAX_MODEL_RETRIES => {
+                    Err(error)
+                        if !context_length_exceeded(&error)
+                            && model_request_is_retryable(&error)
+                            && retry < MAX_MODEL_RETRIES =>
+                    {
                         retry += 1;
                         let error_text = format!("{error:#}");
                         self.diagnostics.error(format!(
@@ -553,10 +588,14 @@ impl Agent {
                     }
                     Err(error) => {
                         let error_text = format!("{error:#}");
-                        self.diagnostics.error(format!(
-                            "CodeCrab model request failed after {MAX_MODEL_RETRIES} retries: \
-{error_text}"
-                        ));
+                        if retry == 0 {
+                            self.diagnostics
+                                .error(format!("CodeCrab model request failed: {error_text}"));
+                        } else {
+                            self.diagnostics.error(format!(
+                                "CodeCrab model request failed after {retry} retries: {error_text}"
+                            ));
+                        }
                         preserve_partial_assistant(
                             &mut self.session.messages,
                             &streamed_text,
@@ -1052,26 +1091,32 @@ impl Agent {
         &mut self,
         mut preflight: CompactionPreflight<'_>,
         cancellation: &mut watch::Receiver<bool>,
-    ) -> Result<bool> {
-        let mut compacted = false;
+    ) -> Result<CompactionOutcome> {
+        let mut outcome = CompactionOutcome::default();
         for _ in 0..self
             .compaction_tuning
             .maximum_compaction_chunks_per_preflight
         {
-            if !self.maybe_compact(preflight, cancellation).await? {
-                break;
+            match self.maybe_compact(preflight, cancellation).await? {
+                CompactionAttempt::NotNeeded => break,
+                CompactionAttempt::Compacted => {
+                    outcome.compacted = true;
+                    preflight.force = false;
+                }
+                CompactionAttempt::Failed(error) => {
+                    outcome.failure = Some(error);
+                    break;
+                }
             }
-            compacted = true;
-            preflight.force = false;
         }
-        Ok(compacted)
+        Ok(outcome)
     }
 
     async fn maybe_compact(
         &mut self,
         preflight: CompactionPreflight<'_>,
         cancellation: &mut watch::Receiver<bool>,
-    ) -> Result<bool> {
+    ) -> Result<CompactionAttempt> {
         let CompactionPreflight {
             trigger,
             system,
@@ -1084,7 +1129,7 @@ impl Agent {
         let (threshold, metadata_available) = compaction_threshold(model, &self.compaction_tuning);
         let before_tokens = self.estimated_active_tokens(system, pending);
         if !force && before_tokens <= threshold {
-            return Ok(false);
+            return Ok(CompactionAttempt::NotNeeded);
         }
         if !metadata_available && !self.reported_missing_context_metadata {
             self.diagnostics.warning(format!(
@@ -1099,7 +1144,7 @@ because model {:?} publishes no context-window metadata",
                 before_tokens <= base.saturating_add(self.compaction_tuning.hysteresis_tokens)
             })
         {
-            return Ok(false);
+            return Ok(CompactionAttempt::NotNeeded);
         }
 
         let normal_tail = self
@@ -1125,7 +1170,7 @@ because model {:?} publishes no context-window metadata",
             tail_budget,
             &self.compaction_tuning,
         ) else {
-            return Ok(false);
+            return Ok(CompactionAttempt::NotNeeded);
         };
         let summary_input_budget = threshold
             .saturating_sub(self.compaction_tuning.maximum_summary_output_tokens)
@@ -1215,7 +1260,9 @@ summary",
                             Some("the model returned no usable summary"),
                         );
                         self.record_activity(activity, events);
-                        return Ok(false);
+                        return Ok(CompactionAttempt::Failed(
+                            "the model returned no usable summary".into(),
+                        ));
                     }
                     let error = "the model returned no usable summary".to_owned();
                     self.diagnostics.error(format!(
@@ -1239,6 +1286,16 @@ summary",
                 Err(error) => {
                     attempts += 1;
                     let error_text = format!("{error:#}");
+                    if !context_length_exceeded(&error) && !model_request_is_retryable(&error) {
+                        self.compaction_debounce_tokens = Some(before_tokens);
+                        self.diagnostics.error(format!(
+                            "CodeCrab context compaction failed with a non-retryable error: \
+{error_text}"
+                        ));
+                        activity.finish_compaction(false, before_tokens, None, Some(&error_text));
+                        self.record_activity(activity, events);
+                        return Ok(CompactionAttempt::Failed(error_text));
+                    }
                     let reduced = if context_length_exceeded(&error)
                         && attempts <= self.compaction_tuning.maximum_summary_retries
                         && let Some(smaller_end) = reduce_compaction_end(
@@ -1266,7 +1323,7 @@ summary",
                         ));
                         activity.finish_compaction(false, before_tokens, None, Some(&error_text));
                         self.record_activity(activity, events);
-                        return Ok(false);
+                        return Ok(CompactionAttempt::Failed(error_text));
                     }
                     self.diagnostics.error(format!(
                         "CodeCrab context compaction failed; retrying ({attempts}/{}): {error_text}",
@@ -1318,7 +1375,7 @@ summary",
         self.compaction_debounce_tokens = (after_tokens <= threshold).then_some(after_tokens);
         activity.finish_compaction(true, before_tokens, Some(after_tokens), None);
         self.record_activity(activity, events);
-        Ok(true)
+        Ok(CompactionAttempt::Compacted)
     }
 
     fn record_request_usage(
@@ -2492,6 +2549,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_retryable_model_request_error_fails_without_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = crate::test_support::read_http_request(&mut socket).await;
+            let body = json!({"error": {"message": "invalid request"}}).to_string();
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let session = store.create("mock-model".into()).unwrap();
+        let mut agent = test_agent(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+
+        let error = agent.turn("Fail once").await.unwrap_err();
+        assert!(format!("{error:#}").contains("invalid request"));
+        assert!(
+            !agent
+                .session
+                .activities
+                .iter()
+                .any(|activity| { activity.title.starts_with("Retrying model request") })
+        );
+        assert!(agent.session.activities.iter().any(|activity| {
+            activity.title == "Model request failed"
+                && activity.status == crate::events::ActivityStatus::Failed
+        }));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn stops_after_five_retries_and_persists_the_final_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3027,7 +3131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_compaction_preserves_raw_history_and_sends_one_summary_plus_tail() {
+    async fn goal_turn_compaction_preserves_raw_history_and_sends_one_summary_plus_tail() {
         let responses = [
             json!({
                 "choices": [{
@@ -3080,6 +3184,7 @@ mod tests {
         let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
         let store = SessionStore::new(&root).unwrap();
         let mut session = store.create("mock-model".into()).unwrap();
+        let goal_id = session.create_goal("Keep implementing the verified objective".into());
         let old_secret = "old-verified-decision-".repeat(60);
         session
             .messages
@@ -3123,6 +3228,7 @@ mod tests {
             assert_eq!(persisted.tool_call_id, expected.tool_call_id);
         }
         assert_eq!(agent.session.compaction_checkpoints.len(), 1);
+        assert_eq!(agent.session.active_goal().unwrap().id, goal_id);
         let checkpoint = &agent.session.compaction_checkpoints[0];
         assert_eq!(checkpoint.covered_from_message_index, 0);
         assert_eq!(checkpoint.covered_through_message_index, 1);
@@ -3139,6 +3245,7 @@ mod tests {
         assert!(summary_request.contains("compaction-global-rule"));
         assert!(active_request.contains("rolling_conversation_summary"));
         assert!(active_request.contains("compaction-global-rule"));
+        assert!(active_request.contains("Keep implementing the verified objective"));
         assert!(active_request.contains("recent"));
         assert!(!active_request.contains(&old_secret));
         tokio::time::timeout(Duration::from_secs(2), server)
@@ -3862,6 +3969,195 @@ mod tests {
         let _summary_request = request_rx.recv().await.unwrap();
         let active_request = request_rx.recv().await.unwrap();
         assert!(active_request.contains(&old_secret));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_retryable_compaction_error_is_not_replayed() {
+        let responses = [
+            (
+                "400 Bad Request",
+                json!({"error": {"message": "Unsupported parameter"}}).to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Continued without replaying the invalid summary request."
+                        }
+                    }]
+                })
+                .to_string(),
+            ),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = crate::test_support::read_http_request(&mut socket).await;
+                request_tx.send(request).unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        session.messages.push(Message::text(
+            Role::User,
+            "old request that needs summarizing ".repeat(80),
+        ));
+        session.messages.push(Message::text(
+            Role::Assistant,
+            "old answer that needs summarizing ".repeat(80),
+        ));
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        let mut agent = test_agent(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 4_000,
+            safety_reserve_tokens: 100,
+            minimum_output_reserve_tokens: 100,
+            recent_tail_tokens: 200,
+            minimum_recent_tail_tokens: 50,
+            maximum_recent_tail_tokens: 300,
+            maximum_summary_retries: 2,
+            hysteresis_tokens: 100,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let answer = agent.turn("Continue").await.unwrap();
+        assert_eq!(
+            answer,
+            "Continued without replaying the invalid summary request."
+        );
+        assert!(agent.session.compaction_checkpoints.is_empty());
+        assert!(
+            !agent
+                .session
+                .activities
+                .iter()
+                .any(|activity| { activity.title.starts_with("Retrying context compaction") })
+        );
+        let summary_request = request_rx.recv().await.unwrap();
+        let active_request = request_rx.recv().await.unwrap();
+        assert!(String::from_utf8_lossy(&summary_request).contains("max_completion_tokens"));
+        assert!(String::from_utf8_lossy(&active_request).contains("Continue"));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_emergency_compaction_does_not_replay_oversized_context() {
+        let responses = [
+            (
+                "400 Bad Request",
+                json!({
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "maximum context length exceeded"
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "400 Bad Request",
+                json!({"error": {"message": "invalid summary request"}}).to_string(),
+            ),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = crate::test_support::read_http_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("mock-model", format!("http://{address}/v1"));
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        let mut session = store.create("mock-model".into()).unwrap();
+        session
+            .messages
+            .push(Message::text(Role::User, "old request"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "old answer"));
+        session.messages.push(Message::text(Role::User, "recent"));
+        session
+            .messages
+            .push(Message::text(Role::Assistant, "ready"));
+        let mut agent = test_agent(
+            provider,
+            ToolBox::new(root),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+        agent.compaction_tuning = CompactionTuning {
+            fallback_context_window_tokens: 1_000_000,
+            recent_tail_tokens: 10,
+            minimum_recent_tail_tokens: 5,
+            maximum_recent_tail_tokens: 20,
+            maximum_summary_retries: 2,
+            hysteresis_tokens: 0,
+            estimated_characters_per_token: 1,
+            estimated_tokens_per_message: 0,
+            estimated_tokens_per_tool_call: 0,
+            ..CompactionTuning::default()
+        };
+
+        let error = agent.turn("Continue").await.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("maximum context length exceeded"));
+        assert!(error.contains("emergency context compaction failed"));
+        assert!(error.contains("invalid summary request"));
+        assert!(agent.session.compaction_checkpoints.is_empty());
+        assert!(!agent.session.activities.iter().any(|activity| {
+            activity.title.starts_with("Retrying model request")
+                || activity.title.starts_with("Retrying context compaction")
+        }));
+        assert!(agent.session.activities.iter().any(|activity| {
+            activity.title == "Model request failed"
+                && activity.status == crate::events::ActivityStatus::Failed
+        }));
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .unwrap()
