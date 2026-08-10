@@ -470,6 +470,8 @@ pub(crate) struct ScheduledRun {
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Session {
     pub id: Uuid,
+    #[serde(default)]
+    pub scope: SessionScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -505,6 +507,14 @@ pub(crate) struct Session {
     pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub file_changes: Vec<FileChangeSet>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionScope {
+    #[default]
+    Project,
+    NoProject,
 }
 
 fn default_provider() -> String {
@@ -781,13 +791,20 @@ pub(crate) struct SessionSummary {
 
 #[derive(Clone, Serialize)]
 pub(crate) struct SessionProject {
-    pub root: PathBuf,
+    pub root: Option<PathBuf>,
     pub sessions: Vec<SessionSummary>,
+}
+
+impl SessionProject {
+    pub(crate) fn store(&self, no_project_data_root: &Path) -> Result<SessionStore> {
+        SessionStore::for_project_root_in(self.root.as_deref(), no_project_data_root)
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct SessionStore {
     dir: PathBuf,
+    attachment_store: AttachmentStore,
 }
 
 impl SessionStore {
@@ -795,7 +812,33 @@ impl SessionStore {
         let root = normalized_root(root);
         let dir = root.join(".codecrab").join("sessions");
         fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            attachment_store: AttachmentStore::new(&root),
+        })
+    }
+
+    pub(crate) fn no_project_at(root: &Path) -> Result<Self> {
+        let dir = root.join("sessions");
+        fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        Ok(Self {
+            dir,
+            attachment_store: AttachmentStore::no_project(root),
+        })
+    }
+
+    pub(crate) fn for_project_root_in(
+        project_root: Option<&Path>,
+        no_project_data_root: &Path,
+    ) -> Result<Self> {
+        match project_root {
+            Some(root) => Self::new(root),
+            None => Self::no_project_at(no_project_data_root),
+        }
+    }
+
+    pub(crate) fn attachment_store(&self) -> AttachmentStore {
+        self.attachment_store.clone()
     }
 
     #[cfg(test)]
@@ -804,9 +847,19 @@ impl SessionStore {
     }
 
     pub(crate) fn create_for_provider(&self, provider: String, model: String) -> Result<Session> {
+        self.create_for_provider_with_scope(provider, model, SessionScope::Project)
+    }
+
+    pub(crate) fn create_for_provider_with_scope(
+        &self,
+        provider: String,
+        model: String,
+        scope: SessionScope,
+    ) -> Result<Session> {
         let now = Utc::now();
         Ok(Session {
             id: Uuid::new_v4(),
+            scope,
             parent_session_id: None,
             scheduled_run: None,
             created_at: now,
@@ -880,12 +933,7 @@ impl SessionStore {
     pub(crate) fn delete(&self, query: &str) -> Result<Uuid> {
         let id = self.resolve_id(Some(query))?;
         let path = self.dir.join(format!("{id}.json"));
-        let project_root = self
-            .dir
-            .parent()
-            .and_then(Path::parent)
-            .context("session store has no project root")?;
-        let attachment_store = AttachmentStore::new(project_root);
+        let attachment_store = self.attachment_store();
         let attachment_dir = attachment_store.session_dir(id);
         let tombstone = attachment_dir.with_extension(format!("deleting-{}", Uuid::new_v4()));
         let moved_data = if attachment_dir.exists() {
@@ -979,14 +1027,20 @@ pub(crate) fn list_session_projects(
         }
     }
 
-    let mut projects = Vec::new();
+    let mut projects = vec![SessionProject {
+        root: None,
+        sessions: SessionStore::no_project_at(&registry.data_dir()?)?.list()?,
+    }];
     for root in roots {
         if !root.is_dir() {
             continue;
         }
         let store = SessionStore::new(&root)?;
         let sessions = store.list()?;
-        projects.push(SessionProject { root, sessions });
+        projects.push(SessionProject {
+            root: Some(root),
+            sessions,
+        });
     }
     arrange_session_projects(&mut projects);
     Ok(projects)
@@ -1083,7 +1137,7 @@ fn arrange_session_tree(sessions: &mut Vec<SessionSummary>) {
 pub(crate) fn resolve_global_session(
     projects: &[SessionProject],
     query: Option<&str>,
-) -> Result<(PathBuf, Uuid)> {
+) -> Result<(Option<PathBuf>, Uuid)> {
     let mut sessions = projects
         .iter()
         .flat_map(|project| {
@@ -1117,6 +1171,37 @@ pub(crate) fn resolve_global_session(
 mod tests {
     use super::*;
     use crate::events::{ActivityKind, ActivityStatus, AgentActivity};
+
+    #[test]
+    fn no_project_sessions_use_the_global_store_and_resolve_without_a_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let global = temp.path().join("global");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&global).unwrap();
+        let registry = SessionRegistry::at(global.join("config.toml"));
+        let store = SessionStore::no_project_at(&global).unwrap();
+        let session = store
+            .create_for_provider_with_scope(
+                "provider".into(),
+                "model".into(),
+                SessionScope::NoProject,
+            )
+            .unwrap();
+        store.save(&session).unwrap();
+
+        let projects = list_session_projects(&project, &registry).unwrap();
+        assert_eq!(projects[0].root, None);
+        assert_eq!(projects[0].sessions[0].id, session.id);
+        assert_eq!(
+            store.load(Some(&session.id.to_string())).unwrap().scope,
+            SessionScope::NoProject
+        );
+        assert_eq!(
+            resolve_global_session(&projects, Some(&session.id.to_string())).unwrap(),
+            (None, session.id)
+        );
+    }
 
     #[test]
     fn conversation_tree_preserves_branches_and_projects_only_the_active_path() {
@@ -1501,7 +1586,7 @@ mod tests {
         );
         assert_eq!(store.load(None).unwrap().id, older.id);
         let projects = vec![SessionProject {
-            root: temp.path().to_path_buf(),
+            root: Some(temp.path().to_path_buf()),
             sessions,
         }];
         assert_eq!(resolve_global_session(&projects, None).unwrap().1, older.id);
@@ -1721,9 +1806,18 @@ mod tests {
         assert_eq!(persisted_child.parent_session_id, Some(parent.id));
         let registry = SessionRegistry::at(root.path().join("config.toml"));
         let projects = list_session_projects(root.path(), &registry).unwrap();
-        assert_eq!(projects[0].sessions.len(), 1);
-        assert_eq!(projects[0].sessions[0].id, child.id);
-        assert_eq!(projects[0].sessions[0].depth, 0);
+        let project = projects
+            .iter()
+            .find(|project| {
+                project
+                    .root
+                    .as_deref()
+                    .is_some_and(|candidate| paths_equal(candidate, root.path()))
+            })
+            .unwrap();
+        assert_eq!(project.sessions.len(), 1);
+        assert_eq!(project.sessions[0].id, child.id);
+        assert_eq!(project.sessions[0].depth, 0);
     }
 
     #[test]
@@ -1793,11 +1887,24 @@ mod tests {
 
         let projects = list_session_projects(&current, &registry).unwrap();
 
-        assert!(paths_equal(&projects[0].root, &current));
-        assert!(paths_equal(&projects[1].root, &other));
+        assert!(projects.iter().any(|project| {
+            project
+                .root
+                .as_deref()
+                .is_some_and(|root| paths_equal(root, &current))
+        }));
+        assert!(projects.iter().any(|project| {
+            project
+                .root
+                .as_deref()
+                .is_some_and(|root| paths_equal(root, &other))
+        }));
         let (root, id) =
             resolve_global_session(&projects, Some(&other_session.id.to_string()[..8])).unwrap();
-        assert!(paths_equal(&root, &other));
+        assert!(
+            root.as_deref()
+                .is_some_and(|root| paths_equal(root, &other))
+        );
         assert_eq!(id, other_session.id);
     }
 
@@ -1819,7 +1926,7 @@ mod tests {
 
         let mut projects = vec![
             SessionProject {
-                root: PathBuf::from("first"),
+                root: Some(PathBuf::from("first")),
                 sessions: vec![
                     summary(1, None, 1),
                     summary(2, None, 10),
@@ -1831,7 +1938,7 @@ mod tests {
                 ],
             },
             SessionProject {
-                root: PathBuf::from("second"),
+                root: Some(PathBuf::from("second")),
                 sessions: vec![summary(8, Some(1), 8)],
             },
         ];

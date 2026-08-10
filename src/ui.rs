@@ -57,8 +57,8 @@ use crate::{
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{AttachmentBinding, Message, MessagePart, ModelCatalogEntry, ModelSelection, Role},
     session::{
-        AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionProject, SessionStore,
-        list_session_projects,
+        AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionProject, SessionScope,
+        SessionStore, list_session_projects,
     },
     transcription::Transcriber,
 };
@@ -886,6 +886,9 @@ struct App {
     should_quit: bool,
     project: String,
     project_root: PathBuf,
+    runtime_root: PathBuf,
+    session_scope: SessionScope,
+    active_session: bool,
     provider: String,
     model: String,
     reasoning_effort: Option<String>,
@@ -926,9 +929,18 @@ struct BackgroundTurn {
 struct AppServices {
     debug_openai: DebugOutput,
     usage_tracker: Option<UsageTracker>,
+    runtime_root: PathBuf,
 }
 
 impl App {
+    fn attachment_store(&self) -> Result<AttachmentStore> {
+        Ok(SessionStore::for_project_root_in(
+            (self.session_scope == SessionScope::Project).then_some(self.project_root.as_path()),
+            &self.registry.data_dir()?,
+        )?
+        .attachment_store())
+    }
+
     fn new(
         agent: Agent,
         model_catalog: Vec<ModelCatalogEntry>,
@@ -939,7 +951,11 @@ impl App {
         coordinator: SessionCoordinator,
     ) -> Result<Self> {
         let project_root = agent.project_root().to_path_buf();
-        let project = project_root.display().to_string();
+        let session_scope = agent.session().scope;
+        let project = match session_scope {
+            SessionScope::Project => project_root.display().to_string(),
+            SessionScope::NoProject => "No project".into(),
+        };
         let provider = agent.session().provider.clone();
         let model = agent.session().model.clone();
         let reasoning_effort = agent.session().reasoning_effort.clone();
@@ -1045,6 +1061,9 @@ impl App {
             should_quit: false,
             project,
             project_root,
+            runtime_root: services.runtime_root,
+            session_scope,
+            active_session: true,
             provider,
             model,
             reasoning_effort,
@@ -1078,7 +1097,9 @@ impl App {
     }
 
     fn status(&self) -> String {
-        if self.recording.is_some() {
+        if !self.active_session {
+            "○ no session".into()
+        } else if self.recording.is_some() {
             "● recording".into()
         } else if self.transcription.is_some() {
             format!("{} transcribing", SPINNER[self.spinner % SPINNER.len()])
@@ -1336,7 +1357,7 @@ impl App {
 
     async fn import_clipboard_image_path(&mut self, path: &Path) -> Result<()> {
         let snapshot = self.conversation.snapshot();
-        let store = AttachmentStore::new(&self.project_root);
+        let store = self.attachment_store()?;
         let attachment = store.import_path(self.session_id, &snapshot.session.attachments, path)?;
         let (_, attachment) = self.conversation.add_attachment(attachment).await?;
         let reference = store.visible_reference(&attachment);
@@ -1371,7 +1392,7 @@ impl App {
             let width = u32::try_from(image.width).context("clipboard image is too wide")?;
             let height = u32::try_from(image.height).context("clipboard image is too tall")?;
             let snapshot = self.conversation.snapshot();
-            let store = AttachmentStore::new(&self.project_root);
+            let store = self.attachment_store()?;
             let attachment = store.import_rgba(
                 self.session_id,
                 &snapshot.session.attachments,
@@ -1627,6 +1648,7 @@ impl App {
                 .map(|skill| (skill.name.as_str(), skill.description.as_str())),
             self.usage_available(),
             self.completion_request_id,
+            self.session_scope == SessionScope::NoProject,
         );
         self.completion = menu;
         self.completion_search = search;
@@ -1717,7 +1739,13 @@ impl App {
             let is_image = AttachmentStore::path_is_supported_image(&path);
             if is_image {
                 let snapshot = self.conversation.snapshot();
-                let store = AttachmentStore::new(&self.project_root);
+                let store = match self.attachment_store() {
+                    Ok(store) => store,
+                    Err(error) => {
+                        self.error = Some(format!("Could not open attachment storage: {error:#}"));
+                        return false;
+                    }
+                };
                 let imported = match store.import_path(
                     self.session_id,
                     &snapshot.session.attachments,
@@ -1984,7 +2012,9 @@ impl App {
     }
 
     async fn save_active_session(&self) -> Result<()> {
-        self.conversation.persist_if_idle().await?;
+        if self.active_session {
+            self.conversation.persist_if_idle().await?;
+        }
         Ok(())
     }
 
@@ -1997,7 +2027,11 @@ impl App {
         self.visible_goal_id = snapshot.session.visible_goal_id;
         self.session_id = snapshot.session.id;
         self.project_root = snapshot.project_root;
-        self.project = self.project_root.display().to_string();
+        self.session_scope = snapshot.session.scope;
+        self.project = match self.session_scope {
+            SessionScope::Project => self.project_root.display().to_string(),
+            SessionScope::NoProject => "No project".into(),
+        };
         self.provider.clone_from(&snapshot.session.provider);
         self.model.clone_from(&snapshot.session.model);
         self.reasoning_effort
@@ -2403,13 +2437,18 @@ impl App {
 
     async fn open_session_picker(&mut self) -> Result<()> {
         self.save_active_session().await?;
-        let current_id = self.conversation.snapshot().session.id;
+        let current_id = self
+            .active_session
+            .then(|| self.conversation.snapshot().session.id);
         let projects = list_session_projects(&self.project_root, &self.registry)?
             .into_iter()
-            .enumerate()
-            .map(|(index, project)| SessionProjectView {
+            .map(|project| SessionProjectView {
+                expanded: match (&project.root, self.session_scope) {
+                    (None, SessionScope::NoProject) => true,
+                    (Some(root), SessionScope::Project) => paths_equal(root, &self.project_root),
+                    _ => false,
+                },
                 project,
-                expanded: index == 0,
             })
             .collect::<Vec<_>>();
         let mut picker = SessionPicker {
@@ -2421,7 +2460,7 @@ impl App {
             matches!(
                 row,
                 SessionPickerRow::Session(project, session)
-                    if picker.projects[*project].project.sessions[*session].id == current_id
+                    if Some(picker.projects[*project].project.sessions[*session].id) == current_id
             )
         }) {
             picker.selected = selected;
@@ -2512,18 +2551,23 @@ impl App {
         };
         self.park_current_turn();
         let mut catalog_error = None;
-        self.model_catalogs.insert(
-            self.conversation.snapshot().session.id,
-            self.model_catalog.clone(),
-        );
+        if self.active_session {
+            self.model_catalogs.insert(
+                self.conversation.snapshot().session.id,
+                self.model_catalog.clone(),
+            );
+        }
         self.conversation = if let Some(existing) = self.conversations.get(id) {
             self.model_catalogs
                 .entry(id)
                 .or_insert_with(|| existing.snapshot().model_catalog);
             existing
         } else {
-            let session = SessionStore::new(&root)?.load(Some(&id.to_string()))?;
-            let mut agent = self.coordinator.build_agent(&root, session)?;
+            let session =
+                SessionStore::for_project_root_in(root.as_deref(), &self.registry.data_dir()?)?
+                    .load(Some(&id.to_string()))?;
+            let execution_root = root.as_deref().unwrap_or(&self.runtime_root);
+            let mut agent = self.coordinator.build_agent(execution_root, session)?;
             let catalog = match agent.fetch_models().await {
                 Ok(catalog) => {
                     agent.resolve_auto_model(&catalog);
@@ -2551,6 +2595,9 @@ impl App {
     }
 
     fn park_current_turn(&mut self) {
+        if !self.active_session {
+            return;
+        }
         if self.running.is_none()
             && self.prompt_queue.items.is_empty()
             && self.queued_prompt_edit.is_none()
@@ -2673,10 +2720,17 @@ impl App {
             let project = &picker.projects[project_index].project;
             (project.root.clone(), project.sessions[session_index].id)
         };
-        let store = SessionStore::new(&root)?;
+        let store = SessionStore::for_project_root_in(root.as_deref(), &self.registry.data_dir()?)?;
         let active_snapshot = self.conversation.snapshot();
-        let deleting_active =
-            id == active_snapshot.session.id && paths_equal(&root, &active_snapshot.project_root);
+        let deleting_active = self.active_session
+            && id == active_snapshot.session.id
+            && match (&root, active_snapshot.session.scope) {
+                (None, SessionScope::NoProject) => true,
+                (Some(root), SessionScope::Project) => {
+                    paths_equal(root, &active_snapshot.project_root)
+                }
+                _ => false,
+            };
         if let Some(conversation) = self.conversations.take_if_idle(id)? {
             conversation.shutdown().await?;
         }
@@ -2685,17 +2739,31 @@ impl App {
         store.delete(&id.to_string())?;
 
         if deleting_active {
-            let mut session =
-                store.create_for_provider(active_snapshot.session.provider, self.model.clone())?;
-            session.reasoning_effort.clone_from(&self.reasoning_effort);
-            session.service_tier.clone_from(&self.service_tier);
-            let agent = self.coordinator.build_agent(&root, session)?;
-            self.conversation = self.conversations.install(agent)?;
-            self.model_catalogs.insert(
-                self.conversation.snapshot().session.id,
-                self.model_catalog.clone(),
-            );
-            self.sync_active_session();
+            if let Some(summary) = store.list()?.first() {
+                self.conversation = if let Some(existing) = self.conversations.get(summary.id) {
+                    existing
+                } else {
+                    let session = store.load(Some(&summary.id.to_string()))?;
+                    let execution_root = root.as_deref().unwrap_or(&self.runtime_root);
+                    let agent = self.coordinator.build_agent(execution_root, session)?;
+                    self.conversations.install(agent)?
+                };
+                self.model_catalog = self
+                    .model_catalogs
+                    .get(&summary.id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.sync_active_session();
+            } else {
+                self.active_session = false;
+                self.transcript.clear();
+                self.transcript_node_ids.clear();
+                self.live_messages.clear();
+                self.activities.clear();
+                self.turns.clear();
+                self.goals.clear();
+                self.visible_goal_id = None;
+            }
         }
 
         let projects = list_session_projects(&self.project_root, &self.registry)?;
@@ -2720,7 +2788,11 @@ impl App {
             projects: projects
                 .into_iter()
                 .map(|project| SessionProjectView {
-                    expanded: expanded.iter().any(|root| paths_equal(root, &project.root)),
+                    expanded: expanded.iter().any(|root| match (root, &project.root) {
+                        (Some(left), Some(right)) => paths_equal(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    }),
                     project,
                 })
                 .collect(),
@@ -2729,11 +2801,13 @@ impl App {
         };
         picker.selected = selected.min(picker.rows().len().saturating_sub(1));
         self.session_picker = Some(picker);
-        self.error = None;
+        self.error =
+            (!self.active_session).then(|| "No saved sessions remain in this group.".to_owned());
         Ok(())
     }
 
     fn sync_active_session(&mut self) {
+        self.active_session = true;
         self.apply_snapshot(self.conversation.snapshot());
         self.sync_usage_provider();
         self.live_messages.clear();
@@ -3271,6 +3345,22 @@ impl App {
             }
             return Ok(());
         }
+        if !self.active_session {
+            if matches!(
+                prompt.as_str(),
+                "/sessions" | "/no-project" | "/help" | "/quit"
+            ) {
+                self.clear_composer_text();
+                self.preferred_column = None;
+                self.close_completion();
+                return self.command(&prompt).await;
+            }
+            self.error = Some(
+                "There is no active session. Resume one with /sessions or create one with /no-project."
+                    .into(),
+            );
+            return Ok(());
+        }
         if self.queued_prompt_edit.is_some() {
             self.finish_queued_prompt_edit(prompt);
             return Ok(());
@@ -3646,6 +3736,7 @@ impl App {
             "/model" | "/models" => self.open_model_picker(),
             "/skills" => self.open_skill_picker(),
             "/sessions" => self.open_session_picker().await?,
+            "/no-project" => self.create_no_project_session().await?,
             "/branches" => self.open_branch_navigator(),
             "/goals" => self.open_goal_picker(),
             "/usage" if self.usage_available() => {
@@ -3657,6 +3748,31 @@ impl App {
             }
             _ => self.error = Some(format!("Unknown command: {command}")),
         }
+        Ok(())
+    }
+
+    async fn create_no_project_session(&mut self) -> Result<()> {
+        self.save_active_session().await?;
+        self.park_current_turn();
+        let session = self.coordinator.create_no_project_session()?;
+        let id = session.id;
+        let mut agent = self.coordinator.build_agent(&self.runtime_root, session)?;
+        let catalog = match agent.fetch_models().await {
+            Ok(catalog) => {
+                agent.resolve_new_session_model(&catalog);
+                catalog
+            }
+            Err(error) => {
+                self.error = Some(format!("Could not load the model catalog: {error:#}"));
+                Vec::new()
+            }
+        };
+        self.conversation = self.conversations.install(agent)?;
+        self.conversation.persist().await?;
+        self.model_catalogs.insert(id, catalog.clone());
+        self.model_catalog = catalog;
+        self.sync_active_session();
+        self.error = None;
         Ok(())
     }
 
@@ -3950,13 +4066,14 @@ impl App {
 
 pub(crate) async fn interactive(
     mut agent: Agent,
-    registry: &SessionRegistry,
+    runtime_root: PathBuf,
     debug_openai: DebugOutput,
     diagnostics: DiagnosticLog,
     config: Config,
     new_session: bool,
     coordinator: SessionCoordinator,
 ) -> Result<()> {
+    let registry = coordinator.registry();
     let (model_catalog, catalog_error) = match agent.fetch_models().await {
         Ok(catalog) => {
             if new_session {
@@ -3997,9 +4114,10 @@ pub(crate) async fn interactive(
             AppServices {
                 debug_openai,
                 usage_tracker: None,
+                runtime_root,
             },
             config,
-            registry.clone(),
+            registry,
             coordinator,
         )?,
     )
@@ -5399,6 +5517,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  /cron      manage scheduled agent tasks"),
         Line::from("  /goal ...  start a persistent goal"),
         Line::from("  /goals     manage persistent goals"),
+        Line::from("  /no-project create a session without a project"),
         Line::from("  /model     choose model, thinking, and speed"),
         Line::from("  /sessions  resume or delete saved sessions"),
         Line::from("  /skills    show available skills"),
@@ -5614,7 +5733,9 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .selected
         .saturating_sub(available.saturating_sub(1))
         .min(rows.len().saturating_sub(available));
-    let current_id = Some(app.conversation.snapshot().session.id);
+    let current_id = app
+        .active_session
+        .then(|| app.conversation.snapshot().session.id);
     let mut lines = vec![
         Line::from(Span::styled(
             "↑↓ select  •  ← parent/collapse  •  → expand  •  Enter resume  •  Del delete",
@@ -5627,7 +5748,17 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let line = match *row {
             SessionPickerRow::Project(project_index) => {
                 let project = &picker.projects[project_index];
-                let active = paths_equal(&project.project.root, &app.project_root);
+                let active = match (&project.project.root, app.session_scope) {
+                    (None, SessionScope::NoProject) => true,
+                    (Some(root), SessionScope::Project) => paths_equal(root, &app.project_root),
+                    _ => false,
+                };
+                let project_label = project
+                    .project
+                    .root
+                    .as_ref()
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| "No project".into());
                 Line::from(vec![
                     Span::styled(
                         if selected { " › " } else { "   " },
@@ -5638,7 +5769,7 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         Style::default().fg(CRAB),
                     ),
                     Span::styled(
-                        compact_path(&project.project.root.display().to_string(), 54),
+                        compact_path(&project_label, 54),
                         Style::default()
                             .fg(if selected { Color::White } else { CRAB })
                             .add_modifier(Modifier::BOLD),
@@ -5656,11 +5787,15 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
             SessionPickerRow::Session(project_index, session_index) => {
                 let session = &picker.projects[project_index].project.sessions[session_index];
                 let collapsed = picker.collapsed_sessions.contains(&session.id);
-                let active = Some(session.id) == current_id
-                    && paths_equal(
-                        &picker.projects[project_index].project.root,
-                        &app.project_root,
-                    );
+                let active_group = match (
+                    &picker.projects[project_index].project.root,
+                    app.session_scope,
+                ) {
+                    (None, SessionScope::NoProject) => true,
+                    (Some(root), SessionScope::Project) => paths_equal(root, &app.project_root),
+                    _ => false,
+                };
+                let active = Some(session.id) == current_id && active_group;
                 let lifecycle = app
                     .conversations
                     .statuses()
@@ -6371,7 +6506,14 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
         if project.sessions.is_empty() {
             continue;
         }
-        println!("\n{}", project.root.display());
+        println!(
+            "\n{}",
+            project
+                .root
+                .as_ref()
+                .map(|root| root.display().to_string())
+                .unwrap_or_else(|| "No project".into())
+        );
         println!(
             "  {:<10}  {:<10}  {:<20}  {:<20}  {:<18}  TITLE",
             "ID", "PARENT", "CREATED", "UPDATED", "MODEL"
@@ -6422,7 +6564,7 @@ mod tests {
     };
 
     fn test_registry(root: &Path) -> SessionRegistry {
-        SessionRegistry::at(root.join("test-global-config.toml"))
+        SessionRegistry::at(root.join(".test-global-config").join("config.toml"))
     }
 
     fn test_app(root: &std::path::Path) -> App {
@@ -6447,6 +6589,7 @@ mod tests {
             registry.clone(),
             DebugOutput::default(),
             DiagnosticLog::default(),
+            root.to_path_buf(),
             root.join(".test-global-config").join("AGENTS.md"),
         );
         let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
@@ -6465,6 +6608,7 @@ mod tests {
             AppServices {
                 debug_openai: DebugOutput::default(),
                 usage_tracker: Some(UsageTracker::test(false, None).unwrap()),
+                runtime_root: root.to_path_buf(),
             },
             config,
             registry,
@@ -8974,6 +9118,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_project_command_switches_scope_and_uses_global_session_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime");
+        fs::create_dir(&root).unwrap();
+        let mut app = test_app(&root);
+
+        app.create_no_project_session().await.unwrap();
+
+        let snapshot = app.conversation.snapshot();
+        assert_eq!(snapshot.session.scope, SessionScope::NoProject);
+        assert_eq!(app.project, "No project");
+        assert!(paths_equal(&snapshot.project_root, &root));
+        let store = SessionStore::no_project_at(&app.registry.data_dir().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .load(Some(&snapshot.session.id.to_string()))
+                .unwrap()
+                .scope,
+            SessionScope::NoProject
+        );
+
+        app.open_session_picker().await.unwrap();
+        let row = app
+            .session_picker
+            .as_ref()
+            .unwrap()
+            .rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    SessionPickerRow::Session(project, session)
+                        if app.session_picker.as_ref().unwrap().projects[*project].project.sessions[*session].id
+                            == snapshot.session.id
+                )
+            })
+            .unwrap();
+        app.session_picker.as_mut().unwrap().selected = row;
+        app.delete_session_selection().await.unwrap();
+        assert!(!app.active_session);
+        assert!(app.transcript.is_empty());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn session_picker_navigates_projects_and_switches_the_agent_root() {
         let temp = tempfile::tempdir().unwrap();
         let current_root = temp.path().join("current-project");
@@ -9006,31 +9195,59 @@ mod tests {
 
         app.open_session_picker().await.unwrap();
         let picker = app.session_picker.as_ref().unwrap();
-        assert!(paths_equal(&picker.projects[0].project.root, &current_root));
-        assert!(picker.projects[0].expanded);
+        assert!(picker.projects.iter().any(|project| {
+            project
+                .project
+                .root
+                .as_deref()
+                .is_some_and(|root| paths_equal(root, &current_root))
+        }));
+        let current_project = picker
+            .projects
+            .iter()
+            .position(|project| {
+                project
+                    .project
+                    .root
+                    .as_deref()
+                    .is_some_and(|root| paths_equal(root, &current_root))
+            })
+            .unwrap();
+        let other_project = picker
+            .projects
+            .iter()
+            .position(|project| {
+                project
+                    .project
+                    .root
+                    .as_deref()
+                    .is_some_and(|root| paths_equal(root, &other_root))
+            })
+            .unwrap();
+        assert!(picker.projects[current_project].expanded);
         assert!(matches!(
             picker.selected_row(),
-            Some(SessionPickerRow::Session(0, _))
+            Some(SessionPickerRow::Session(project, _)) if project == current_project
         ));
 
         app.move_session_left();
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Project(0))
+            Some(SessionPickerRow::Project(project)) if project == current_project
         ));
         app.move_session_left();
-        assert!(!app.session_picker.as_ref().unwrap().projects[0].expanded);
+        assert!(!app.session_picker.as_ref().unwrap().projects[current_project].expanded);
         app.move_session_selection(1);
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Project(1))
+            Some(SessionPickerRow::Project(project)) if project == other_project
         ));
         app.move_session_right();
-        assert!(app.session_picker.as_ref().unwrap().projects[1].expanded);
+        assert!(app.session_picker.as_ref().unwrap().projects[other_project].expanded);
         app.move_session_selection(1);
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Session(1, _))
+            Some(SessionPickerRow::Session(project, _)) if project == other_project
         ));
         let picker = app.session_picker.as_ref().unwrap();
         let selected = picker.selected_row().unwrap();
@@ -9038,11 +9255,11 @@ mod tests {
             unreachable!();
         };
         assert_eq!(
-            picker.projects[1].project.sessions[selected_index].id,
+            picker.projects[other_project].project.sessions[selected_index].id,
             saved.id
         );
         assert_eq!(
-            picker.projects[1].project.sessions[selected_index].descendant_count,
+            picker.projects[other_project].project.sessions[selected_index].descendant_count,
             2
         );
 
@@ -9060,7 +9277,7 @@ mod tests {
                 .unwrap()
                 .rows()
                 .iter()
-                .filter(|row| matches!(row, SessionPickerRow::Session(1, _)))
+                .filter(|row| matches!(row, SessionPickerRow::Session(project, _) if *project == other_project))
                 .count(),
             1
         );
@@ -9101,8 +9318,8 @@ mod tests {
         app.move_session_selection(1);
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Session(1, session))
-                if app.session_picker.as_ref().unwrap().projects[1].project.sessions[session].id == child.id
+            Some(SessionPickerRow::Session(project, session))
+                if project == other_project && app.session_picker.as_ref().unwrap().projects[other_project].project.sessions[session].id == child.id
         ));
         app.move_session_left();
         assert!(
@@ -9115,8 +9332,8 @@ mod tests {
         app.move_session_left();
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Session(1, session))
-                if app.session_picker.as_ref().unwrap().projects[1].project.sessions[session].id == saved.id
+            Some(SessionPickerRow::Session(project, session))
+                if project == other_project && app.session_picker.as_ref().unwrap().projects[other_project].project.sessions[session].id == saved.id
         ));
 
         app.accept_session_selection().await.unwrap();
@@ -9161,10 +9378,10 @@ mod tests {
         app.delete_session_selection().await.unwrap();
 
         let replacement = app.conversation.snapshot().session;
-        assert_ne!(replacement.id, saved.id);
+        assert!([child.id, grandchild.id].contains(&replacement.id));
         assert_eq!(replacement.model, "restored-model");
-        assert_eq!(replacement.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(replacement.service_tier.as_deref(), Some("priority"));
+        assert_eq!(replacement.reasoning_effort, None);
+        assert_eq!(replacement.service_tier, None);
         assert!(replacement.messages.is_empty());
         assert!(other_store.load(Some(&saved.id.to_string())).is_err());
         assert!(app.session_picker.is_some());

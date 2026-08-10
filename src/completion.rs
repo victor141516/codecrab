@@ -25,6 +25,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("models", "Alias for /model"),
     ("skills", "Open the interactive skill picker"),
     ("sessions", "Browse, resume, or delete saved sessions"),
+    ("no-project", "Create a session without a project"),
     ("branches", "Browse conversation branches"),
     ("providers", "List configured provider profiles"),
     ("provider", "Add, select, or remove a provider profile"),
@@ -135,7 +136,27 @@ pub(crate) fn complete<'a>(
     skills: impl IntoIterator<Item = (&'a str, &'a str)>,
     usage_available: bool,
 ) -> Option<CompletionMenu> {
-    if let Some(context) = file_completion_context(input, cursor, working_directory) {
+    complete_with_policy(
+        input,
+        cursor,
+        working_directory,
+        skills,
+        usage_available,
+        false,
+    )
+}
+
+pub(crate) fn complete_with_policy<'a>(
+    input: &str,
+    cursor: usize,
+    working_directory: &Path,
+    skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+    usage_available: bool,
+    absolute_only: bool,
+) -> Option<CompletionMenu> {
+    if let Some(context) =
+        file_completion_context_with_policy(input, cursor, working_directory, absolute_only)
+    {
         let items = file_completion_items(&context);
         return (!items.is_empty()).then_some(CompletionMenu {
             items,
@@ -235,6 +256,16 @@ struct ScopedGitignore {
 }
 
 impl FilePriorityIndex {
+    fn minimal(root: &Path) -> Self {
+        let project_root = normalize_absolute(root);
+        let (global, _) = GitignoreBuilder::new(&project_root).build_global();
+        Self {
+            project_root,
+            global,
+            rules: Vec::new(),
+        }
+    }
+
     fn load(project_root: &Path) -> Self {
         let project_root = normalize_absolute(project_root);
         let (global, _) = GitignoreBuilder::new(&project_root).build_global();
@@ -348,10 +379,20 @@ fn path_has_hidden_component(path: &Path) -> bool {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn file_completion_context(
     input: &str,
     cursor: usize,
     working_directory: &Path,
+) -> Option<FileCompletionContext> {
+    file_completion_context_with_policy(input, cursor, working_directory, false)
+}
+
+pub(crate) fn file_completion_context_with_policy(
+    input: &str,
+    cursor: usize,
+    working_directory: &Path,
+    absolute_only: bool,
 ) -> Option<FileCompletionContext> {
     let before = input.get(..cursor)?;
     let start = before.rfind('@')?;
@@ -365,6 +406,14 @@ pub(crate) fn file_completion_context(
     }
     let typed = &input[start + 1..cursor];
     if typed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let typed = if absolute_only && typed.is_empty() {
+        filesystem_root(working_directory).display().to_string()
+    } else {
+        typed.to_owned()
+    };
+    if absolute_only && !Path::new(&typed).is_absolute() {
         return None;
     }
     let normalized = typed.replace('\\', "/");
@@ -394,8 +443,27 @@ pub(crate) fn file_completion_context(
         dir_prefix,
         name_prefix,
         directory,
-        priority: file_priority_index(working_directory),
+        priority: if absolute_only {
+            Arc::new(FilePriorityIndex::minimal(working_directory))
+        } else {
+            file_priority_index(working_directory)
+        },
     })
+}
+
+pub(crate) fn filesystem_root(path: &Path) -> PathBuf {
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => root.push(component.as_os_str()),
+            Component::CurDir | Component::ParentDir | Component::Normal(_) => break,
+        }
+    }
+    if root.as_os_str().is_empty() {
+        PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+    } else {
+        root
+    }
 }
 
 pub(crate) fn complete_progressive<'a>(
@@ -405,8 +473,11 @@ pub(crate) fn complete_progressive<'a>(
     skills: impl IntoIterator<Item = (&'a str, &'a str)>,
     usage_available: bool,
     request_id: u64,
+    absolute_only: bool,
 ) -> (Option<CompletionMenu>, Option<CompletionSearch>) {
-    if let Some(context) = file_completion_context(input, cursor, working_directory) {
+    if let Some(context) =
+        file_completion_context_with_policy(input, cursor, working_directory, absolute_only)
+    {
         let items = file_completion_items(&context);
         let menu = (!items.is_empty()).then(|| CompletionMenu {
             items: items.clone(),
@@ -427,10 +498,12 @@ pub(crate) fn recursive_file_completion_available(
     input: &str,
     cursor: usize,
     working_directory: &Path,
+    absolute_only: bool,
 ) -> bool {
-    file_completion_context(input, cursor, working_directory).is_some_and(|context| {
-        context.name_prefix.chars().count() >= RECURSIVE_SEARCH_POLICY.minimum_query_characters
-    })
+    file_completion_context_with_policy(input, cursor, working_directory, absolute_only)
+        .is_some_and(|context| {
+            context.name_prefix.chars().count() >= RECURSIVE_SEARCH_POLICY.minimum_query_characters
+        })
 }
 
 pub(crate) fn start_file_completion_search(
@@ -438,8 +511,10 @@ pub(crate) fn start_file_completion_search(
     cursor: usize,
     working_directory: &Path,
     request_id: u64,
+    absolute_only: bool,
 ) -> Option<CompletionSearch> {
-    let context = file_completion_context(input, cursor, working_directory)?;
+    let context =
+        file_completion_context_with_policy(input, cursor, working_directory, absolute_only)?;
     let local_items = file_completion_items(&context);
     start_recursive_file_completion(context, local_items, request_id)
 }
@@ -962,6 +1037,19 @@ fn is_completion_name_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_project_file_completion_starts_at_the_filesystem_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let working_directory = temp.path().canonicalize().unwrap();
+        let context =
+            file_completion_context_with_policy("@", 1, &working_directory, true).unwrap();
+
+        assert_eq!(context.directory, filesystem_root(&working_directory));
+        assert!(
+            file_completion_context_with_policy("@relative", 9, &working_directory, true).is_none()
+        );
+    }
 
     #[test]
     fn slash_completion_combines_commands_and_contextual_skills() {

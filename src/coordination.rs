@@ -18,7 +18,7 @@ use crate::{
     cron::{CronDaemonStatus, CronJob, CronStore, OverlapPolicy, action_token, proposal_token},
     diagnostics::{DebugOutput, DiagnosticLog},
     provider::{OpenAiCompatible, Role},
-    session::{Session, SessionStore, TurnOutcome, list_session_projects},
+    session::{Session, SessionScope, SessionStore, TurnOutcome, list_session_projects},
     skills::SkillRegistry,
     tools::ToolBox,
 };
@@ -34,6 +34,7 @@ struct SessionCoordinatorInner {
     registry: SessionRegistry,
     debug_openai: DebugOutput,
     diagnostics: DiagnosticLog,
+    runtime_root: PathBuf,
     global_instructions_path: PathBuf,
 }
 
@@ -42,6 +43,7 @@ pub(crate) struct SessionControl {
     coordinator: Weak<SessionCoordinatorInner>,
     caller_session_id: Uuid,
     caller_project_root: PathBuf,
+    caller_scope: SessionScope,
 }
 
 impl SessionCoordinator {
@@ -50,6 +52,7 @@ impl SessionCoordinator {
         registry: SessionRegistry,
         debug_openai: DebugOutput,
         diagnostics: DiagnosticLog,
+        runtime_root: PathBuf,
         global_instructions_path: PathBuf,
     ) -> Self {
         Self {
@@ -59,6 +62,7 @@ impl SessionCoordinator {
                 registry,
                 debug_openai,
                 diagnostics,
+                runtime_root: normalized_root(&runtime_root),
                 global_instructions_path,
             }),
         }
@@ -66,6 +70,10 @@ impl SessionCoordinator {
 
     pub(crate) fn manager(&self) -> ConversationManager {
         self.inner.manager.clone()
+    }
+
+    pub(crate) fn registry(&self) -> SessionRegistry {
+        self.inner.registry.clone()
     }
 
     pub(crate) fn update_config(&self, config: Config) {
@@ -89,11 +97,22 @@ impl SessionCoordinator {
             coordinator: Arc::downgrade(&self.inner),
             caller_session_id: session.id,
             caller_project_root: normalized_root(root),
+            caller_scope: session.scope,
         };
+        let no_project = session.scope == SessionScope::NoProject;
         Agent::new(
             provider,
-            ToolBox::with_session_control(normalized_root(root), config.shell.clone(), control),
-            SkillRegistry::discover(root),
+            ToolBox::with_session_control_mode(
+                normalized_root(root),
+                config.shell.clone(),
+                control,
+                no_project,
+            ),
+            if no_project {
+                SkillRegistry::discover_global()
+            } else {
+                SkillRegistry::discover(root)
+            },
             session,
             self.inner.global_instructions_path.clone(),
             self.inner.diagnostics.clone(),
@@ -115,15 +134,34 @@ impl SessionCoordinator {
             .create_for_provider(config.active_provider.clone(), provider.model.clone())
     }
 
-    fn locate_session(&self, id: Uuid, caller_root: &Path) -> Result<(PathBuf, Session)> {
+    pub(crate) fn create_no_project_session(&self) -> Result<Session> {
+        let config = self
+            .inner
+            .config
+            .read()
+            .expect("session coordinator config lock poisoned");
+        let provider = config.provider(&config.active_provider)?;
+        SessionStore::no_project_at(&self.inner.registry.data_dir()?)?
+            .create_for_provider_with_scope(
+                config.active_provider.clone(),
+                provider.model.clone(),
+                SessionScope::NoProject,
+            )
+    }
+
+    fn locate_session(&self, id: Uuid, caller_root: &Path) -> Result<(Option<PathBuf>, Session)> {
         if let Some(handle) = self.inner.manager.get(id) {
             let snapshot = handle.snapshot();
-            return Ok((snapshot.project_root, snapshot.session));
+            let root =
+                (snapshot.session.scope == SessionScope::Project).then_some(snapshot.project_root);
+            return Ok((root, snapshot.session));
         }
         let projects = list_session_projects(caller_root, &self.inner.registry)?;
         for project in projects {
             if project.sessions.iter().any(|session| session.id == id) {
-                let session = SessionStore::new(&project.root)?.load(Some(&id.to_string()))?;
+                let session = project
+                    .store(&self.inner.registry.data_dir()?)?
+                    .load(Some(&id.to_string()))?;
                 return Ok((project.root, session));
             }
         }
@@ -135,7 +173,8 @@ impl SessionCoordinator {
             return Ok(handle);
         }
         let (root, session) = self.locate_session(id, caller_root)?;
-        let agent = self.build_agent(&root, session)?;
+        let execution_root = root.as_deref().unwrap_or(&self.inner.runtime_root);
+        let agent = self.build_agent(execution_root, session)?;
         self.install(agent)
     }
 
@@ -143,6 +182,7 @@ impl SessionCoordinator {
         &self,
         caller_session_id: Uuid,
         caller_root: &Path,
+        caller_scope: SessionScope,
         args: &Value,
     ) -> Result<Value> {
         let prompt = required_nonempty(args, "prompt")?;
@@ -154,7 +194,22 @@ impl SessionCoordinator {
                 "invalid session relationship {other}; expected \"child\" or \"independent\""
             ),
         };
-        let root = match args.get("project").and_then(Value::as_str) {
+        let explicit_project = args.get("project").and_then(Value::as_str);
+        let no_project = args
+            .get("no_project")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if explicit_project.is_some() && no_project {
+            anyhow::bail!("project and no_project cannot both be set");
+        }
+        let scope = if no_project {
+            SessionScope::NoProject
+        } else if explicit_project.is_some() {
+            SessionScope::Project
+        } else {
+            caller_scope
+        };
+        let root = match explicit_project {
             Some(project) => {
                 let root = normalized_root(&caller_root.join(project));
                 if !root.is_dir() {
@@ -162,15 +217,25 @@ impl SessionCoordinator {
                 }
                 root
             }
+            None if scope == SessionScope::NoProject => self.inner.runtime_root.clone(),
             None => normalized_root(caller_root),
         };
-        let mut session = self.create_session(&root)?;
+        let mut session = match scope {
+            SessionScope::Project => self.create_session(&root)?,
+            SessionScope::NoProject => self.create_no_project_session()?,
+        };
         session.parent_session_id = (relationship == "child").then_some(caller_session_id);
         let session_id = session.id;
         let parent_session_id = session.parent_session_id;
         let agent = self.build_agent(&root, session)?;
-        SessionStore::new(&root)?.save(agent.session())?;
-        self.inner.registry.register(&root)?;
+        SessionStore::for_project_root_in(
+            (scope == SessionScope::Project).then_some(root.as_path()),
+            &self.inner.registry.data_dir()?,
+        )?
+        .save(agent.session())?;
+        if scope == SessionScope::Project {
+            self.inner.registry.register(&root)?;
+        }
         let handle = self.install(agent)?;
         handle.start_new_session_turn(prompt.to_owned())?;
         let observation = handle.observation();
@@ -178,7 +243,8 @@ impl SessionCoordinator {
             "session_id": session_id,
             "relationship": relationship,
             "parent_session_id": parent_session_id,
-            "project_root": root,
+            "scope": scope,
+            "project_root": (scope == SessionScope::Project).then_some(root),
             "lifecycle": observation.lifecycle,
             "observation_revision": observation.revision,
             "catalog_warning": observation.catalog_error,
@@ -189,6 +255,7 @@ impl SessionCoordinator {
         &self,
         caller_session_id: Uuid,
         caller_root: &Path,
+        caller_scope: SessionScope,
         args: &Value,
     ) -> Result<Value> {
         let include_current = args
@@ -203,20 +270,28 @@ impl SessionCoordinator {
         let projects = if all_projects {
             list_session_projects(caller_root, &self.inner.registry)?
         } else {
-            let root = explicit_project
-                .map(|project| normalized_root(&caller_root.join(project)))
-                .unwrap_or_else(|| normalized_root(caller_root));
-            if !root.is_dir() {
+            let requested_root =
+                explicit_project.map(|project| normalized_root(&caller_root.join(project)));
+            if let Some(root) = &requested_root
+                && !root.is_dir()
+            {
                 anyhow::bail!("project directory does not exist: {}", root.display());
             }
-            list_session_projects(&root, &self.inner.registry)?
+            list_session_projects(caller_root, &self.inner.registry)?
                 .into_iter()
-                .filter(|project| paths_equal(&project.root, &root))
+                .filter(|project| match (&project.root, &requested_root) {
+                    (Some(root), Some(requested)) => paths_equal(root, requested),
+                    (None, None) => caller_scope == SessionScope::NoProject,
+                    (Some(root), None) => {
+                        caller_scope == SessionScope::Project && paths_equal(root, caller_root)
+                    }
+                    (None, Some(_)) => false,
+                })
                 .collect()
         };
         let mut sessions = Vec::new();
         for project in projects {
-            let store = SessionStore::new(&project.root)?;
+            let store = project.store(&self.inner.registry.data_dir()?)?;
             for summary in project.sessions {
                 if !include_current && summary.id == caller_session_id {
                     continue;
@@ -239,6 +314,7 @@ impl SessionCoordinator {
                     "session_id": session.id,
                     "title": title,
                     "project_root": project.root,
+                    "scope": session.scope,
                     "parent_session_id": session.parent_session_id,
                     "depth": summary.depth,
                     "descendant_count": summary.descendant_count,
@@ -268,7 +344,7 @@ impl SessionCoordinator {
         let live = self.inner.manager.get(id);
         let observation = live.as_ref().map(ConversationHandle::observation);
         Ok(status_value(
-            &root,
+            root.as_deref(),
             &session,
             observation.as_ref(),
             live.is_some(),
@@ -554,6 +630,7 @@ impl SessionControl {
                     "properties": {
                         "prompt": {"type": "string"},
                         "project": {"type": "string", "description": "Existing project directory; defaults to the caller's project"},
+                        "no_project": {"type": "boolean", "description": "Create without a project. Defaults to the caller's scope and conflicts with project."},
                         "relationship": {
                             "type": "string",
                             "enum": ["child", "independent"],
@@ -703,6 +780,9 @@ impl SessionControl {
     }
 
     pub(crate) async fn execute(&self, name: &str, args: &Value) -> Result<Value> {
+        if self.caller_scope == SessionScope::NoProject && name.starts_with("cron_") {
+            anyhow::bail!("scheduled tasks require a project session");
+        }
         let inner = self
             .coordinator
             .upgrade()
@@ -714,13 +794,17 @@ impl SessionControl {
                     .create_session_from_tool(
                         self.caller_session_id,
                         &self.caller_project_root,
+                        self.caller_scope,
                         args,
                     )
                     .await
             }
-            "session_list" => {
-                coordinator.list_sessions(self.caller_session_id, &self.caller_project_root, args)
-            }
+            "session_list" => coordinator.list_sessions(
+                self.caller_session_id,
+                &self.caller_project_root,
+                self.caller_scope,
+                args,
+            ),
             "session_status" => coordinator.statuses(&self.caller_project_root, args),
             "session_messages" => coordinator.messages(&self.caller_project_root, args),
             "session_send" => {
@@ -822,7 +906,7 @@ fn cron_job_parameters(with_confirmation: bool) -> Value {
 }
 
 fn status_value(
-    root: &Path,
+    root: Option<&Path>,
     session: &Session,
     observation: Option<&ConversationObservation>,
     live: bool,
@@ -832,6 +916,7 @@ fn status_value(
     json!({
         "session_id": session.id,
         "project_root": root,
+        "scope": session.scope,
         "title": observation.title,
         "parent_session_id": session.parent_session_id,
         "live": live,
@@ -1040,6 +1125,7 @@ mod tests {
             registry.clone(),
             DebugOutput::default(),
             DiagnosticLog::stderr(),
+            root.to_path_buf(),
             root.join(".test-global-config").join("AGENTS.md"),
         );
         (coordinator, registry)
@@ -1102,6 +1188,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_no_project_child_uses_the_process_runtime_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().canonicalize().unwrap();
+        let project_root = runtime_root.join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        let config = Config::test("model", "http://127.0.0.1:1/v1");
+        let (coordinator, _) = test_coordinator(&runtime_root, config);
+
+        let created = coordinator
+            .create_session_from_tool(
+                Uuid::new_v4(),
+                &project_root,
+                SessionScope::Project,
+                &json!({"prompt": "global task", "no_project": true}),
+            )
+            .await
+            .unwrap();
+        let id = Uuid::parse_str(created["session_id"].as_str().unwrap()).unwrap();
+        let snapshot = coordinator.manager().get(id).unwrap().snapshot();
+
+        assert_eq!(snapshot.session.scope, SessionScope::NoProject);
+        assert!(paths_equal(&snapshot.project_root, &runtime_root));
+        assert!(created["project_root"].is_null());
+        coordinator.manager().cancel_all();
+        coordinator.manager().shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn child_is_isolated_persisted_observable_cancellable_and_reusable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1155,7 +1269,12 @@ mod tests {
         let mut live_events = coordinator.manager().subscribe_live();
         let caller = Uuid::new_v4();
         let created = coordinator
-            .create_session_from_tool(caller, &root, &json!({"prompt": "isolated task"}))
+            .create_session_from_tool(
+                caller,
+                &root,
+                SessionScope::Project,
+                &json!({"prompt": "isolated task"}),
+            )
             .await
             .unwrap();
         let child = Uuid::parse_str(created["session_id"].as_str().unwrap()).unwrap();
@@ -1339,6 +1458,7 @@ mod tests {
             .create_session_from_tool(
                 caller,
                 &root,
+                SessionScope::Project,
                 &json!({"prompt": "detached task", "relationship": "independent"}),
             )
             .await

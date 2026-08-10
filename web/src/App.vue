@@ -1136,7 +1136,7 @@ function applyServerState(nextState, { selectActiveProject = false } = {}) {
   expandedProjects.value = expandKnownProject(
     expandedProjects.value,
     effective.projects ?? [],
-    selectActiveProject ? effective.project : null
+    selectActiveProject ? effective.project : undefined
   );
 }
 
@@ -1206,7 +1206,7 @@ function applyLiveCatalog(message) {
   expandedProjects.value = expandKnownProject(
     expandedProjects.value,
     message.projects ?? [],
-    null
+    undefined
   );
 }
 
@@ -1420,6 +1420,7 @@ async function handleHistoryNavigation() {
 }
 
 function projectName(root) {
+  if (root == null) return "No project";
   const trimmed = root?.replace(/[\\/]+$/, "") ?? "";
   return trimmed.split(/[\\/]/).at(-1) || trimmed;
 }
@@ -3028,12 +3029,12 @@ async function acquireBrowserAttachment(file, target) {
     throw new Error(body.error || `Attachment preflight failed with ${preflight.status}`);
   }
   const query = new URLSearchParams({
-    project: target.project,
     session_id: target.sessionId,
     sha256,
     name: file.name || "pasted-image",
     mime_type: file.type || "application/octet-stream"
   });
+  if (target.project != null) query.set("project", target.project);
   const upload = await fetch(`/api/attachments/upload?${query}`, {
     method: "POST",
     headers: { "Content-Type": file.type || "application/octet-stream" },
@@ -3051,7 +3052,7 @@ async function insertBrowserFiles(files) {
     project: state.value?.project,
     sessionId: session.value?.id
   };
-  if (!target.project || !target.sessionId || !files.length) return;
+  if (!target.sessionId || !files.length) return;
   uploadingAttachments.value = true;
   error.value = "";
   try {
@@ -3599,11 +3600,16 @@ function scheduleEditorStatusRefresh() {
   }
 }
 
+function editorRoot() {
+  return state.value?.project || state.value?.filesystem_root || null;
+}
+
 async function refreshEditorStatus() {
-  if (!state.value?.project || !editorActivated.value) return;
+  const root = editorRoot();
+  if (!root || !editorActivated.value) return;
   try {
     editorStatus.value = await editorRequest(
-      `status?project=${encodeURIComponent(state.value.project)}`
+      `status?project=${encodeURIComponent(root)}`
     );
   } catch (cause) {
     editorStatus.value = { status: "failed", message: cause.message };
@@ -3612,13 +3618,14 @@ async function refreshEditorStatus() {
 }
 
 async function startEditor(restart = false) {
-  if (!state.value?.project) return;
+  const root = editorRoot();
+  if (!root) return;
   editorActivated.value = true;
   editorStatus.value = { status: "starting" };
   try {
     editorStatus.value = await editorRequest(restart ? "restart" : "start", {
       method: "POST",
-      body: JSON.stringify({ project: state.value.project })
+      body: JSON.stringify({ project: root })
     });
     scheduleEditorStatusRefresh();
   } catch (cause) {
@@ -3642,7 +3649,8 @@ async function openFileChange(changeId, options) {
 }
 
 async function openFileChanges(changeIds, { manual = true } = {}) {
-  if (!changeIds.length || !session.value?.id || !state.value?.project) return;
+  const root = editorRoot();
+  if (!changeIds.length || !session.value?.id || !root) return;
   editorOpen.value = true;
   editorActivated.value = true;
   const previousStatus = editorStatus.value;
@@ -3650,7 +3658,8 @@ async function openFileChanges(changeIds, { manual = true } = {}) {
     editorStatus.value = await editorRequest("open-change", {
       method: "POST",
       body: JSON.stringify({
-        project: state.value.project,
+        project: root,
+        no_project: state.value?.project == null,
         session_id: session.value.id,
         change_ids: changeIds
       })
@@ -4373,7 +4382,7 @@ onBeforeUnmount(() => {
                   {{ projectName(project.root) }}
                 </span>
                 <span class="mt-0.5 block truncate font-mono text-[9px] text-zinc-500">
-                  {{ project.root }}
+                  {{ project.root || "Global sessions" }}
                 </span>
               </span>
               <span class="font-mono text-[10px] text-zinc-500">
@@ -4507,7 +4516,7 @@ onBeforeUnmount(() => {
             {{ session?.title || "No session" }}
           </h1>
           <p class="mt-0.5 truncate font-mono text-[10px] text-zinc-400">
-            {{ state?.project }}
+            {{ state?.project || "No project" }}
           </p>
         </div>
 

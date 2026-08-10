@@ -351,6 +351,7 @@ async fn main() -> Result<()> {
                 registry.clone(),
                 debug_openai,
                 DiagnosticLog::stderr(),
+                root.clone(),
                 Config::instructions_path()?,
             );
             let session = coordinator.create_session(&root)?;
@@ -383,7 +384,8 @@ async fn main() -> Result<()> {
         Some(Command::Resume { id }) => {
             let projects = list_session_projects(&root, &registry)?;
             let (session_root, session_id) = resolve_global_session(&projects, id.as_deref())?;
-            let session_store = SessionStore::new(&session_root)?;
+            let session_store =
+                SessionStore::for_project_root_in(session_root.as_deref(), &registry.data_dir()?)?;
             let session = session_store.load(Some(&session_id.to_string()))?;
             let diagnostics = DiagnosticLog::tui(cli.error_log.clone());
             let coordinator = SessionCoordinator::new(
@@ -391,12 +393,14 @@ async fn main() -> Result<()> {
                 registry.clone(),
                 debug_openai.clone(),
                 diagnostics.clone(),
+                root.clone(),
                 Config::instructions_path()?,
             );
-            let agent = coordinator.build_agent(&session_root, session)?;
+            let execution_root = session_root.as_deref().unwrap_or(&root);
+            let agent = coordinator.build_agent(execution_root, session)?;
             ui::interactive(
                 agent,
-                &registry,
+                root.clone(),
                 debug_openai,
                 diagnostics,
                 config.clone(),
@@ -412,13 +416,14 @@ async fn main() -> Result<()> {
                 registry.clone(),
                 debug_openai.clone(),
                 diagnostics.clone(),
+                root.clone(),
                 Config::instructions_path()?,
             );
             let session = coordinator.create_session(&root)?;
             let agent = coordinator.build_agent(&root, session)?;
             ui::interactive(
                 agent,
-                &registry,
+                root.clone(),
                 debug_openai,
                 diagnostics,
                 config.clone(),

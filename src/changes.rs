@@ -18,7 +18,8 @@ use crate::{
 
 #[derive(Clone)]
 pub(crate) struct ChangeStore {
-    project_root: PathBuf,
+    project_root: Option<PathBuf>,
+    data_dir: PathBuf,
     session_id: Uuid,
 }
 
@@ -75,16 +76,22 @@ pub(crate) struct ReconstructedFileChange {
 impl ChangeStore {
     pub(crate) fn new(project_root: &Path, session_id: Uuid) -> Self {
         Self {
-            project_root: project_root.to_path_buf(),
+            project_root: Some(project_root.to_path_buf()),
+            data_dir: project_root.join(".codecrab").join("session-data"),
             session_id,
         }
     }
 
+    pub(crate) fn no_project_at(data_root: &Path, session_id: Uuid) -> Result<Self> {
+        Ok(Self {
+            project_root: None,
+            data_dir: data_root.join("session-data"),
+            session_id,
+        })
+    }
+
     pub(crate) fn session_dir(&self) -> PathBuf {
-        self.project_root
-            .join(".codecrab")
-            .join("session-data")
-            .join(self.session_id.to_string())
+        self.data_dir.join(self.session_id.to_string())
     }
 
     fn write_artifact(&self, change_id: Uuid, name: &str, content: &str) -> Result<PathBuf> {
@@ -159,8 +166,12 @@ impl ChangeStore {
     }
 
     fn reconstruct_git(&self, change: &GitFileChange) -> Result<(String, String)> {
+        let project_root = self
+            .project_root
+            .as_ref()
+            .context("Git reconstruction requires a project")?;
         let output = Command::new("git")
-            .args(["-C", self.project_root.to_string_lossy().as_ref(), "show"])
+            .args(["-C", project_root.to_string_lossy().as_ref(), "show"])
             .arg(format!(
                 "{}:{}",
                 change.commit,
@@ -195,6 +206,15 @@ impl ChangeTracker {
             turn_message_id: None,
             turn_files: HashMap::new(),
         }
+    }
+
+    pub(crate) fn no_project_at(data_root: &Path, session_id: Uuid) -> Result<Self> {
+        Ok(Self {
+            store: ChangeStore::no_project_at(data_root, session_id)?,
+            git_project: None,
+            turn_message_id: None,
+            turn_files: HashMap::new(),
+        })
     }
 
     pub(crate) fn begin_turn(&mut self, turn_message_id: Uuid, previous_changes: &[FileChangeSet]) {
@@ -451,14 +471,17 @@ impl ChangeTracker {
         let Some(_) = &self.git_project else {
             return Ok(None);
         };
-        let Ok(relative_path) = path.strip_prefix(&self.store.project_root) else {
+        let Some(project_root) = self.store.project_root.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(relative_path) = path.strip_prefix(project_root) else {
             return Ok(None);
         };
         let relative = relative_path.to_string_lossy().replace('\\', "/");
         let ignored = Command::new("git")
             .args([
                 "-C",
-                self.store.project_root.to_string_lossy().as_ref(),
+                project_root.to_string_lossy().as_ref(),
                 "check-ignore",
                 "--no-index",
                 "--quiet",
@@ -474,7 +497,7 @@ impl ChangeTracker {
         let head_output = Command::new("git")
             .args([
                 "-C",
-                self.store.project_root.to_string_lossy().as_ref(),
+                project_root.to_string_lossy().as_ref(),
                 "rev-parse",
                 "HEAD",
             ])
@@ -490,7 +513,7 @@ impl ChangeTracker {
         let exists = Command::new("git")
             .args([
                 "-C",
-                self.store.project_root.to_string_lossy().as_ref(),
+                project_root.to_string_lossy().as_ref(),
                 "cat-file",
                 "-e",
                 &format!("{}:{relative}", head),
@@ -505,7 +528,7 @@ impl ChangeTracker {
         let output = Command::new("git")
             .args([
                 "-C",
-                self.store.project_root.to_string_lossy().as_ref(),
+                project_root.to_string_lossy().as_ref(),
                 "show",
                 &format!("{}:{relative}", head),
             ])

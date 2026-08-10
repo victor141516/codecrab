@@ -17,6 +17,7 @@ use crate::{
 
 pub(crate) struct ToolBox {
     root: PathBuf,
+    absolute_paths_only: bool,
     terminals: TerminalManager,
     session_control: Option<SessionControl>,
 }
@@ -32,18 +33,21 @@ impl ToolBox {
         Self {
             terminals: TerminalManager::new(root.clone(), shell),
             root,
+            absolute_paths_only: false,
             session_control: None,
         }
     }
 
-    pub(crate) fn with_session_control(
+    pub(crate) fn with_session_control_mode(
         root: PathBuf,
         shell: Option<String>,
         session_control: SessionControl,
+        absolute_paths_only: bool,
     ) -> Self {
         Self {
             terminals: TerminalManager::new(root.clone(), shell),
             root,
+            absolute_paths_only,
             session_control: Some(session_control),
         }
     }
@@ -78,17 +82,31 @@ impl ToolBox {
     }
 
     pub(crate) fn definitions(&self) -> Vec<Value> {
+        let path_rule = if self.absolute_paths_only {
+            "An absolute path is required in a no-project session."
+        } else {
+            "Relative paths start at the working directory; parent and absolute paths are allowed."
+        };
+        let search_required = if self.absolute_paths_only {
+            vec!["query", "path"]
+        } else {
+            vec!["query"]
+        };
+        let mut list_parameters = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": path_rule},
+                "max_depth": {"type": "integer", "minimum": 1, "maximum": 8}
+            }
+        });
+        if self.absolute_paths_only {
+            list_parameters["required"] = json!(["path"]);
+        }
         let mut definitions = vec![
             tool(
                 "list_files",
-                "List files and directories. Relative paths start at the working directory; parent and absolute paths are allowed.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Directory path, defaults to the working directory"},
-                        "max_depth": {"type": "integer", "minimum": 1, "maximum": 8}
-                    }
-                }),
+                &format!("List files and directories. {path_rule}"),
+                list_parameters,
             ),
             tool(
                 "read_file",
@@ -105,14 +123,14 @@ impl ToolBox {
             ),
             tool(
                 "search",
-                "Search text recursively in files. Relative paths start at the working directory; parent and absolute paths are allowed.",
+                &format!("Search text recursively in files. {path_rule}"),
                 json!({
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "path": {"type": "string", "description": "File or directory path, defaults to the working directory"}
+                        "path": {"type": "string", "description": path_rule}
                     },
-                    "required": ["query"]
+                    "required": search_required
                 }),
             ),
             tool(
@@ -209,6 +227,13 @@ impl ToolBox {
         ];
         if self.session_control.is_some() {
             definitions.extend(SessionControl::definitions());
+        }
+        if self.absolute_paths_only {
+            definitions.retain(|definition| {
+                !definition["function"]["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("cron_"))
+            });
         }
         definitions
     }
@@ -456,6 +481,9 @@ impl ToolBox {
     }
 
     fn existing_path(&self, path: &str) -> Result<PathBuf> {
+        if self.absolute_paths_only && !Path::new(path).is_absolute() {
+            anyhow::bail!("no-project sessions require an absolute path: {path}");
+        }
         let path = self
             .root
             .join(path)
@@ -465,10 +493,16 @@ impl ToolBox {
     }
 
     fn new_path(&self, path: &str) -> Result<PathBuf> {
+        if self.absolute_paths_only && !Path::new(path).is_absolute() {
+            anyhow::bail!("no-project sessions require an absolute path: {path}");
+        }
         Ok(self.root.join(path))
     }
 
     fn display_path(&self, path: &Path) -> String {
+        if self.absolute_paths_only {
+            return path.display().to_string();
+        }
         path.strip_prefix(&self.root)
             .unwrap_or(path)
             .display()
@@ -698,6 +732,42 @@ mod tests {
             "path": "a.txt", "old": "same", "new": "different"
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_project_file_tools_require_absolute_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let toolbox = ToolBox {
+            terminals: TerminalManager::new(root.clone(), None),
+            root: root.clone(),
+            absolute_paths_only: true,
+            session_control: None,
+        };
+
+        let error = toolbox
+            .write_file(&json!({"path": "relative.txt", "content": "blocked"}))
+            .unwrap_err();
+        assert!(error.to_string().contains("require an absolute path"));
+
+        let absolute = root.join("absolute.txt");
+        toolbox
+            .write_file(&json!({"path": absolute, "content": "allowed"}))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("absolute.txt")).unwrap(),
+            "allowed"
+        );
+
+        let definitions = toolbox.definitions();
+        let list_files = definitions
+            .iter()
+            .find(|definition| definition["function"]["name"] == "list_files")
+            .unwrap();
+        assert_eq!(
+            list_files["function"]["parameters"]["required"],
+            json!(["path"])
+        );
     }
 
     #[tokio::test]

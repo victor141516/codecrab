@@ -565,6 +565,13 @@ impl SessionRegistry {
         Ok(config.session_directories)
     }
 
+    pub(crate) fn data_dir(&self) -> Result<PathBuf> {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .context("global configuration path has no parent directory")
+    }
+
     pub(crate) fn register(&self, root: &Path) -> Result<()> {
         let _guard = self
             .mutation_lock

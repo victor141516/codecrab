@@ -28,12 +28,20 @@ test("server state prunes removed projects and expands the active one", () => {
   );
 
   assert.deepEqual([...expanded], ["/kept", "/active"]);
+
+  const collapsedGlobal = expandKnownProject(
+    new Set(),
+    [{ root: null }],
+    undefined
+  );
+  assert.deepEqual([...collapsedGlobal], []);
 });
 
 test("new sessions always target the chosen project exactly", () => {
   assert.deepEqual(newSessionPayload("C:\\work\\other"), {
     project: "C:\\work\\other"
   });
+  assert.deepEqual(newSessionPayload(null), { no_project: true });
 });
 
 test("session expansion is isolated and hides every recursive descendant", () => {

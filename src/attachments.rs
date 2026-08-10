@@ -63,19 +63,27 @@ pub(crate) enum ImageDetail {
 #[derive(Clone)]
 pub(crate) struct AttachmentStore {
     root: PathBuf,
+    data_prefix: PathBuf,
 }
 
 impl AttachmentStore {
     pub(crate) fn new(project_root: &Path) -> Self {
         Self {
             root: project_root.to_path_buf(),
+            data_prefix: PathBuf::from(".codecrab").join("session-data"),
+        }
+    }
+
+    pub(crate) fn no_project(data_root: &Path) -> Self {
+        Self {
+            root: data_root.to_path_buf(),
+            data_prefix: PathBuf::from("session-data"),
         }
     }
 
     pub(crate) fn session_dir(&self, session_id: Uuid) -> PathBuf {
         self.root
-            .join(".codecrab")
-            .join("session-data")
+            .join(&self.data_prefix)
             .join(session_id.to_string())
     }
 
@@ -228,7 +236,7 @@ impl AttachmentStore {
         }
         let mime_type =
             normalize_mime(declared_mime).unwrap_or_else(|| "application/octet-stream".into());
-        let relative = original_relative_path(session_id, &hash);
+        let relative = self.original_relative_path(session_id, &hash);
         self.publish_bytes(&relative, bytes)?;
         Ok(Attachment {
             id: Uuid::new_v4(),
@@ -259,12 +267,13 @@ impl AttachmentStore {
     ) -> Result<Attachment> {
         let (width, height) = image.dimensions();
         validate_dimensions(width, height)?;
-        let original_relative = original_relative_path(session_id, &hash);
+        let original_relative = self.original_relative_path(session_id, &hash);
         self.publish_bytes(&original_relative, &original_bytes)?;
         let preview_image = bounded(&image, DEFAULT_IMAGE_EDGE);
         let (preview_bytes, preview_mime, extension) = encode_model_image(&preview_image)?;
-        let preview_relative =
-            attachment_relative_dir(session_id, &hash).join(format!("preview.{extension}"));
+        let preview_relative = self
+            .attachment_relative_dir(session_id, &hash)
+            .join(format!("preview.{extension}"));
         self.publish_bytes(&preview_relative, &preview_bytes)?;
         let (preview_width, preview_height) = preview_image.dimensions();
         Ok(Attachment {
@@ -356,6 +365,18 @@ impl AttachmentStore {
         };
         Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
     }
+
+    fn attachment_relative_dir(&self, session_id: Uuid, hash: &str) -> PathBuf {
+        self.data_prefix
+            .join(session_id.to_string())
+            .join("attachments")
+            .join(hash)
+    }
+
+    fn original_relative_path(&self, session_id: Uuid, hash: &str) -> PathBuf {
+        self.attachment_relative_dir(session_id, hash)
+            .join("original")
+    }
 }
 
 pub(crate) fn validate_sha256(value: &str) -> Result<()> {
@@ -390,18 +411,6 @@ fn normalize_mime(value: Option<&str>) -> Option<String> {
     let value = value?.trim().to_ascii_lowercase();
     (value.len() <= 255 && value.contains('/') && value.bytes().all(|byte| byte.is_ascii_graphic()))
         .then_some(value)
-}
-
-fn attachment_relative_dir(session_id: Uuid, hash: &str) -> PathBuf {
-    PathBuf::from(".codecrab")
-        .join("session-data")
-        .join(session_id.to_string())
-        .join("attachments")
-        .join(hash)
-}
-
-fn original_relative_path(session_id: Uuid, hash: &str) -> PathBuf {
-    attachment_relative_dir(session_id, hash).join("original")
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {

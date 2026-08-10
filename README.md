@@ -113,7 +113,7 @@ codecrab -C path/to/project
 
 ## Choose your interface
 
-All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists are grouped by project and arranged as trees: roots and siblings are ordered by creation time, newest first, while children stay beneath their parent. Activity updates do not move an existing session. The terminal picker shows creation (`C`) and last-update (`U`) times, while the denser web sidebar keeps each session to one title row. `codecrab sessions` prints `PARENT`, `CREATED`, and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
+All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists include a global **No project** group followed by project groups, and each group is arranged as a tree: roots and siblings are ordered by creation time, newest first, while children stay beneath their parent. Activity updates do not move an existing session. The terminal picker shows creation (`C`) and last-update (`U`) times, while the denser web sidebar keeps each session to one title row. `codecrab sessions` prints `PARENT`, `CREATED`, and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
 
 ### Interactive terminal
 
@@ -130,6 +130,7 @@ Useful composer controls:
 | `/` at the beginning | Complete built-in commands and skills |
 | `/` after existing text | Complete skills only |
 | `@path` | Find and reference a file or directory |
+| `/no-project` | Start a new session without selecting a project |
 | `Ctrl+V`, `Alt+V`, `Command+V` when reported | Paste clipboard files or image pixels; terminals may consume `Command+V` before CodeCrab sees it |
 | `Enter` | Complete the selected item or send |
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | Insert a newline (`Alt+Enter` or `Ctrl+J` on macOS) |
@@ -193,9 +194,9 @@ codecrab serve --open-browser app-http
 
 Without a value, `--open-browser` opens HTTPS in the operating system's default browser. `http` opens the HTTP URL instead. The `app` and `app-http` modes make a best-effort launch of the default HTTPS or HTTP browser, respectively, with its `--app=<url>` flag for a standalone, PWA-like window. CodeCrab passes that flag to the selected browser without checking its brand or engine, so a browser that does not support app windows may ignore or reject it. If the default handler cannot be resolved or launched, CodeCrab reports an error suggesting the matching non-app mode instead of silently choosing another browser. Omitting `--open-browser` keeps the previous behavior and does not open anything. Automatically selected port values are resolved before the URL is opened.
 
-The frontend is embedded in the Rust executable and calls relative `/api` URLs, so it works from the same origin and behind a reverse proxy. HTTP and HTTPS stream assistant deltas, activity, cancellation, and session updates rather than waiting for a final response.
+The frontend is embedded in the Rust executable and calls relative `/api` URLs, so it works from the same origin and behind a reverse proxy. HTTP and HTTPS stream assistant deltas, activity, cancellation, and session updates rather than waiting for a final response. A freshly started server opens without an active project or session; use the **No project** row or any registered project row to create one.
 
-The web header also has separate **Code panel** and **Follow changes** controls. Opening the panel lazily starts one managed [`code-server`](https://github.com/coder/code-server#getting-started) process per project, proxied below the same CodeCrab origin with HTTP and WebSocket support. The panel is drag-resizable on wide screens and full-screen on compact screens. Its width is browser-local, while following is remembered per browser and project. Manual editor navigation suspends following; re-enabling it jumps to the latest pending batch and focuses the largest contiguous change. The explorer starts at the selected project, shows normally hidden entries such as `.git`, and retains CodeCrab's no-sandbox filesystem policy: users may open any path available to the server's operating-system account.
+The web header also has separate **Code panel** and **Follow changes** controls. Opening the panel lazily starts one managed [`code-server`](https://github.com/coder/code-server#getting-started) process per project, proxied below the same CodeCrab origin with HTTP and WebSocket support. The panel is drag-resizable on wide screens and full-screen on compact screens. Its width is browser-local, while following is remembered per browser and project. Manual editor navigation suspends following; re-enabling it jumps to the latest pending batch and focuses the largest contiguous change. The explorer starts at the selected project, or at the filesystem root for a No project session, shows normally hidden entries such as `.git`, and retains CodeCrab's no-sandbox filesystem policy: users may open any path available to the server's operating-system account.
 
 `code-server` is optional and is never downloaded or installed by CodeCrab. Install it yourself or set `code_server_path` in the global config. CodeCrab was tested with `code-server 4.131.0`, but compatibility is detected by loading the bundled CodeCrab extension rather than requiring that exact version. The managed integration supports platforms where `code-server` runs natively and is unavailable on native Windows; CodeCrab does not invoke WSL. It uses a persistent profile under CodeCrab's global data directory, separate from the user's ordinary VS Code/code-server profile. Settings, themes, and user-installed extensions in that isolated profile are retained. On every managed start, CodeCrab republishes and re-registers its bundled extension so upgrades repair stale integration metadata without removing unrelated extensions.
 
@@ -212,7 +213,7 @@ Press `Ctrl+C` once for graceful shutdown. If requests or connections keep the p
 
 ### Sessions and projects
 
-CodeCrab saves project-local JSON sessions under `.codecrab/sessions/` and maintains a global registry so both clients can browse work across projects.
+CodeCrab saves project-local JSON sessions under `.codecrab/sessions/` and maintains a global registry so both clients can browse work across projects. No project sessions are stored in CodeCrab's global data directory and do not persist the process working directory.
 
 ```bash
 codecrab sessions
@@ -220,7 +221,7 @@ codecrab resume
 codecrab resume <session-id-or-prefix>
 ```
 
-The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches. On desktop, the web sidebar can be hidden completely from its header and reopened from the workspace header; that browser-local preference survives reloads, while the compact mobile drawer remains transient. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact `child of` hint. Deleting a parent does not delete or rewrite its descendants.
+The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy, including the top-level **No project** group. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches. On desktop, the web sidebar can be hidden completely from its header and reopened from the workspace header; that browser-local preference survives reloads, while the compact mobile drawer remains transient. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact `child of` hint. Deleting a parent does not delete or rewrite its descendants.
 
 The web composer keeps model, reasoning, and speed selection beside its attachment, dictation, and send actions. Switching sessions also switches the agent's working directory, tools, file completion, skills, and `AGENTS.md` context. A turn can keep running in one session while you open or start another; returning restores its live stream.
 
@@ -246,6 +247,7 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | `/model` | Choose a provider-returned model, reasoning level, and speed |
 | `/skills` | Browse installed Agent Skills |
 | `/sessions` | Browse, resume, or delete sessions across projects |
+| `/no-project` | Start a new session without a project |
 | `/cron` | Browse, run, pause, edit, or delete scheduled agent tasks |
 | `/branches` | Preview and select conversation branches |
 | `/providers` | List configured provider profiles |
@@ -460,7 +462,7 @@ ChatGPT OAuth tokens and provider API keys are stored as plain text in the globa
 
 ## Filesystem, shell, and terminal access
 
-Relative tool paths start at the selected working directory, but parent paths, absolute paths, other drives, and symbolic links are valid. CodeCrab deliberately has no sandbox or project boundary.
+Relative tool paths start at the selected working directory, but parent paths, absolute paths, other drives, and symbolic links are valid. In No project sessions, structured file tools and `@` completion require absolute paths; bare `@` begins at the platform filesystem root. Shells still start in the directory where the CodeCrab process was launched (or the effective `-C` directory). CodeCrab deliberately has no sandbox or project boundary.
 
 The agent can:
 
