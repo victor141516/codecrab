@@ -142,6 +142,8 @@ Useful composer controls:
 
 Run `/help` or press `F1` for the complete keyboard reference. The terminal handles Unicode-aware soft wrapping, international keyboard layouts including AltGr, Markdown and code highlighting, mouse selection, native clipboard copy, and explicit image/file clipboard paste.
 
+Long shell commands are limited to one terminal activity row and end with an ellipsis only when they exceed the available width; copying the activity still returns the complete command. The web client keeps its expand/collapse control, while `codecrab run` prints complete command activity.
+
 Sending a new turn while the agent is idle jumps the terminal conversation to the bottom and resumes automatic following. You can keep typing while an agent turn runs; sending then adds an editable follow-up to a queue without changing a manually scrolled position. **Steer** cancels the current turn and sends one selected follow-up next without reordering the rest.
 
 ### One-shot CLI
