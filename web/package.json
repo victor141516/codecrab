@@ -1,12 +1,12 @@
 {
   "name": "codecrab-web",
   "private": true,
-  "version": "1.12.0",
+  "version": "1.13.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --check ../code-server-extension/extension.js && node --test src/*.test.js && vitest run src/*.spec.js"
+    "test": "node --check ../code-server-extension/extension.js && node --test src/*.test.js && vitest run src/App.spec.js"
   },
   "dependencies": {
     "@lucide/vue": "^1.27.0",

@@ -946,6 +946,7 @@ pub(crate) async fn run_daemon(
         registry,
         debug_openai,
         DiagnosticLog::stderr(),
+        std::env::current_dir()?,
         Config::instructions_path()?,
     );
     let mut state = store.load_state()?;
@@ -2252,6 +2253,7 @@ mod tests {
             SessionRegistry::at(temp.path().join("global-config.toml")),
             DebugOutput::default(),
             DiagnosticLog::stderr(),
+            temp.path().to_path_buf(),
             temp.path().join("AGENTS.md"),
         );
         let mut recurring = job("* * * * *");
@@ -2313,6 +2315,7 @@ mod tests {
             SessionRegistry::at(temp.path().join("global-config.toml")),
             DebugOutput::default(),
             DiagnosticLog::stderr(),
+            temp.path().to_path_buf(),
             temp.path().join("AGENTS.md"),
         );
         let now = Utc::now();

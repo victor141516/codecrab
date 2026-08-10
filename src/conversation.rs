@@ -1536,8 +1536,15 @@ fn conversation_skills(skills: &[Skill]) -> Vec<ConversationSkill> {
 
 fn persist(agent: &Agent, registry: &SessionRegistry) -> Result<()> {
     let root = agent.project_root();
-    SessionStore::new(root)?.save(agent.session())?;
-    registry.register(root)
+    SessionStore::for_project_root_in(
+        (agent.session().scope == crate::session::SessionScope::Project).then_some(root),
+        &registry.data_dir()?,
+    )?
+    .save(agent.session())?;
+    if agent.session().scope == crate::session::SessionScope::Project {
+        registry.register(root)?;
+    }
+    Ok(())
 }
 
 fn spawn_worker(future: impl Future<Output = ()> + Send + 'static) -> Result<()> {

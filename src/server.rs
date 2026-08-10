@@ -43,8 +43,9 @@ use crate::{
     changes::ChangeStore,
     code_server::{CodeServerManager, EditorStatus, ExtensionAction, ExtensionDiffFile},
     completion::{
-        CompletionItem, complete as complete_input, file_completion_context,
-        recursive_file_completion_available, slash_completion_range, start_file_completion_search,
+        CompletionItem, complete_with_policy as complete_input,
+        file_completion_context_with_policy, filesystem_root, recursive_file_completion_available,
+        slash_completion_range, start_file_completion_search,
     },
     config::{
         Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry, paths_equal,
@@ -105,6 +106,7 @@ pub(crate) struct ServerState {
 }
 
 pub(crate) struct ServerInner {
+    runtime_root: PathBuf,
     coordinator: SessionCoordinator,
     config: RwLock<Config>,
     registry: SessionRegistry,
@@ -121,6 +123,7 @@ pub(crate) struct ServerInner {
 
 struct ServerWorkspace {
     root: PathBuf,
+    project_selected: bool,
     selected_session: Option<Uuid>,
     conversation: Option<ConversationHandle>,
 }
@@ -134,7 +137,8 @@ struct CatalogState {
 #[derive(Serialize)]
 struct StateResponse {
     live_revision: u64,
-    project: String,
+    project: Option<String>,
+    filesystem_root: PathBuf,
     session: Option<WebSession>,
     projects: Vec<SessionProject>,
     skills: Vec<SkillResponse>,
@@ -247,14 +251,14 @@ struct ChatRequest {
 
 #[derive(Deserialize)]
 struct AttachmentPreflightRequest {
-    project: PathBuf,
+    project: Option<PathBuf>,
     session_id: Uuid,
     sha256: String,
 }
 
 #[derive(Deserialize)]
 struct AttachmentUploadQuery {
-    project: PathBuf,
+    project: Option<PathBuf>,
     session_id: Uuid,
     sha256: String,
     name: String,
@@ -302,7 +306,9 @@ struct SessionRequest {
 
 #[derive(Deserialize)]
 struct NewSessionRequest {
-    project: PathBuf,
+    project: Option<PathBuf>,
+    #[serde(default)]
+    no_project: bool,
 }
 
 #[derive(Deserialize)]
@@ -437,7 +443,7 @@ enum ChatStreamMessage {
 
 #[derive(Serialize)]
 struct SessionLiveView {
-    project_root: PathBuf,
+    project_root: Option<PathBuf>,
     lifecycle: ConversationLifecycle,
     observation_revision: u64,
     session: WebSession,
@@ -445,8 +451,10 @@ struct SessionLiveView {
 
 impl From<ConversationLiveState> for SessionLiveView {
     fn from(state: ConversationLiveState) -> Self {
+        let project_root = (state.snapshot.session.scope == crate::session::SessionScope::Project)
+            .then_some(state.snapshot.project_root);
         Self {
-            project_root: state.snapshot.project_root,
+            project_root,
             lifecycle: state.lifecycle,
             observation_revision: state.observation.revision,
             session: WebSession::live(state.snapshot.session, state.observation),
@@ -490,36 +498,23 @@ pub(crate) async fn serve(
     open_browser: Option<OpenBrowserMode>,
     debug_openai: DebugOutput,
 ) -> Result<()> {
-    let store = SessionStore::new(&root)?;
     let registry = SessionRegistry::global()?;
     let oauth_logged_in = OAuthStore::new()?.is_logged_in();
-    let active = config.provider(&config.active_provider)?;
-    let session =
-        store.create_for_provider(config.active_provider.clone(), active.model.clone())?;
     let coordinator = SessionCoordinator::new(
         config.clone(),
         registry.clone(),
         debug_openai.clone(),
         DiagnosticLog::stderr(),
+        root.clone(),
         default_instructions_path(&root)?,
     );
-    let mut agent = coordinator.build_agent(&root, session)?;
-    let (models, catalog_error) = match agent.fetch_models().await {
-        Ok(models) => {
-            agent.resolve_new_session_model(&models);
-            (models, None)
-        }
-        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
-    };
     list_session_projects(&root, &registry)?;
-
-    let initial_handle = coordinator.install(agent)?;
-    let initial_id = initial_handle.snapshot().session.id;
     let manager = coordinator.manager();
     let code_server_path = config.code_server_path.clone();
     let usage = UsageTracker::new(debug_openai.clone())?;
     let state = ServerState {
         inner: Arc::new(ServerInner {
+            runtime_root: root.clone(),
             coordinator,
             config: RwLock::new(config),
             registry: registry.clone(),
@@ -528,17 +523,12 @@ pub(crate) async fn serve(
             workspace_transition: Mutex::new(()),
             workspace: Mutex::new(ServerWorkspace {
                 root,
-                selected_session: Some(initial_id),
-                conversation: Some(initial_handle),
+                project_selected: false,
+                selected_session: None,
+                conversation: None,
             }),
             conversations: manager,
-            catalogs: RwLock::new(HashMap::from([(
-                initial_id,
-                CatalogState {
-                    models,
-                    error: catalog_error,
-                },
-            )])),
+            catalogs: RwLock::new(HashMap::new()),
             cron: CronStore::default()?,
             usage,
             code_server: CodeServerManager::new(code_server_path)?,
@@ -835,10 +825,12 @@ async fn install_conversation(
     root: PathBuf,
     agent: Agent,
 ) -> Result<ConversationHandle> {
+    let project_selected = agent.session().scope == crate::session::SessionScope::Project;
     let conversation = state.inner.conversations.install(agent)?;
     let session_id = conversation.snapshot().session.id;
     let mut workspace = state.inner.workspace.lock().await;
     workspace.root = root;
+    workspace.project_selected = project_selected;
     workspace.selected_session = Some(session_id);
     workspace.conversation = Some(conversation.clone());
     Ok(conversation)
@@ -848,9 +840,9 @@ fn resolve_session_root(
     current_root: &std::path::Path,
     registry: &SessionRegistry,
     request: &SessionRequest,
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     if let Some(project) = &request.project {
-        return Ok(project.clone());
+        return Ok(Some(project.clone()));
     }
     let projects = list_session_projects(current_root, registry)?;
     resolve_global_session(&projects, Some(&request.id)).map(|(root, _)| root)
@@ -886,9 +878,16 @@ fn live_session_projects(
             depth: 0,
             descendant_count: 0,
         };
-        if let Some(project) = projects
-            .iter_mut()
-            .find(|project| paths_equal(&project.root, &live.snapshot.project_root))
+        let live_root = (session.scope == crate::session::SessionScope::Project)
+            .then_some(&live.snapshot.project_root);
+        if let Some(project) =
+            projects
+                .iter_mut()
+                .find(|project| match (project.root.as_ref(), live_root) {
+                    (Some(root), Some(live_root)) => paths_equal(root, live_root),
+                    (None, None) => true,
+                    _ => false,
+                })
         {
             if let Some(existing) = project
                 .sessions
@@ -901,7 +900,7 @@ fn live_session_projects(
             }
         } else {
             projects.push(SessionProject {
-                root: live.snapshot.project_root,
+                root: live_root.cloned(),
                 sessions: vec![summary],
             });
         }
@@ -912,10 +911,11 @@ fn live_session_projects(
 
 async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<StateResponse> {
     let live_revision = state.inner.conversations.live_revision();
-    let (workspace_root, selected_id) = {
+    let (workspace_root, project_selected, selected_id) = {
         let workspace = state.inner.workspace.lock().await;
         (
             workspace.root.clone(),
+            workspace.project_selected,
             requested.or(workspace.selected_session),
         )
     };
@@ -942,7 +942,12 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
             })
             .collect()
     } else {
-        SkillRegistry::discover(&root)
+        let skills = if project_selected {
+            SkillRegistry::discover(&root)
+        } else {
+            SkillRegistry::discover_global()
+        };
+        skills
             .skills()
             .iter()
             .map(|skill| SkillResponse {
@@ -953,10 +958,13 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
             .collect()
     };
     let projects = live_session_projects(&root, &state.inner)?;
-    let project = projects
-        .first()
-        .map(|project| project.root.display().to_string())
-        .unwrap_or_else(|| root.display().to_string());
+    let project = conversation_snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            (snapshot.session.scope == crate::session::SessionScope::Project)
+                .then(|| snapshot.project_root.display().to_string())
+        })
+        .or_else(|| project_selected.then(|| root.display().to_string()));
     let config = state.inner.config.read().unwrap().clone();
     let dictation_available = session.as_ref().is_some_and(|session| {
         Transcriber::is_available_with_oauth(
@@ -983,6 +991,7 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
     Ok(StateResponse {
         live_revision,
         project,
+        filesystem_root: filesystem_root(&root),
         session,
         projects,
         skills,
@@ -1170,7 +1179,9 @@ async fn completions(
             )
         })?;
     let snapshot = conversation.snapshot();
-    let recursive = recursive_file_completion_available(&input, cursor, &snapshot.project_root);
+    let absolute_only = snapshot.session.scope == crate::session::SessionScope::NoProject;
+    let recursive =
+        recursive_file_completion_available(&input, cursor, &snapshot.project_root, absolute_only);
     let slash_range = slash_completion_range(&input, cursor);
     let skills = if let (Some(refresh_id), Some(_)) = (request.skill_refresh_id, slash_range) {
         conversation.queue_skill_refresh_once(refresh_id)?
@@ -1189,12 +1200,18 @@ async fn completions(
             .iter()
             .map(|skill| (skill.name.as_str(), skill.description.as_str())),
         usage_available,
+        absolute_only,
     );
     let (items, token_start, token_end) = match menu {
         Some(menu) => (menu.items, menu.token_start, menu.token_end),
         None if recursive => {
-            let context = file_completion_context(&input, cursor, &snapshot.project_root)
-                .expect("recursive availability requires a file completion context");
+            let context = file_completion_context_with_policy(
+                &input,
+                cursor,
+                &snapshot.project_root,
+                absolute_only,
+            )
+            .expect("recursive availability requires a file completion context");
             (Vec::new(), context.start, context.end)
         }
         None if slash_range.is_some() => {
@@ -1228,8 +1245,13 @@ async fn recursive_completions(
             )
         })?;
     let snapshot = conversation.snapshot();
-    let search =
-        start_file_completion_search(&input, cursor, &snapshot.project_root, request.request_id);
+    let search = start_file_completion_search(
+        &input,
+        cursor,
+        &snapshot.project_root,
+        request.request_id,
+        snapshot.session.scope == crate::session::SessionScope::NoProject,
+    );
     let (output_tx, output_rx) = mpsc::channel::<std::result::Result<Bytes, Infallible>>(8);
     tokio::spawn(async move {
         if let Some(mut search) = search {
@@ -1329,9 +1351,9 @@ async fn transcribe(
 
 fn attachment_conversation(
     state: &ServerState,
-    project: &std::path::Path,
+    project: Option<&std::path::Path>,
     session_id: Uuid,
-) -> std::result::Result<(ConversationHandle, PathBuf), ApiError> {
+) -> std::result::Result<(ConversationHandle, AttachmentStore), ApiError> {
     let conversation = state.inner.conversations.get(session_id).ok_or_else(|| {
         ApiError::message(
             StatusCode::CONFLICT,
@@ -1339,13 +1361,26 @@ fn attachment_conversation(
         )
     })?;
     let snapshot = conversation.snapshot();
-    if snapshot.session.id != session_id || !paths_equal(&snapshot.project_root, project) {
+    let matches_scope = match (snapshot.session.scope, project) {
+        (crate::session::SessionScope::NoProject, None) => true,
+        (crate::session::SessionScope::Project, Some(project)) => {
+            paths_equal(&snapshot.project_root, project)
+        }
+        _ => false,
+    };
+    if snapshot.session.id != session_id || !matches_scope {
         return Err(ApiError::message(
             StatusCode::CONFLICT,
             "attachment project and session do not match",
         ));
     }
-    Ok((conversation, snapshot.project_root))
+    let store = SessionStore::for_project_root_in(
+        (snapshot.session.scope == crate::session::SessionScope::Project)
+            .then_some(snapshot.project_root.as_path()),
+        &state.inner.registry.data_dir()?,
+    )?
+    .attachment_store();
+    Ok((conversation, store))
 }
 
 async fn attachment_preflight(
@@ -1356,13 +1391,13 @@ async fn attachment_preflight(
         status: StatusCode::BAD_REQUEST,
         error,
     })?;
-    let (conversation, root) =
-        attachment_conversation(&state, &request.project, request.session_id)?;
+    let (conversation, store) =
+        attachment_conversation(&state, request.project.as_deref(), request.session_id)?;
     let snapshot = conversation.snapshot();
     let attachment = AttachmentStore::find_by_hash(&snapshot.session.attachments, &request.sha256)
         .cloned()
         .ok_or_else(|| ApiError::message(StatusCode::NOT_FOUND, "attachment hash is not stored"))?;
-    let reference = AttachmentStore::new(&root).visible_reference(&attachment);
+    let reference = store.visible_reference(&attachment);
     Ok(Json(AttachmentResponse {
         attachment,
         reference,
@@ -1379,10 +1414,9 @@ async fn upload_attachment(
         status: StatusCode::BAD_REQUEST,
         error,
     })?;
-    let (conversation, root) =
-        attachment_conversation(&state, &request.project, request.session_id)?;
+    let (conversation, store) =
+        attachment_conversation(&state, request.project.as_deref(), request.session_id)?;
     let snapshot = conversation.snapshot();
-    let store = AttachmentStore::new(&root);
     if let Some(attachment) =
         AttachmentStore::find_by_hash(&snapshot.session.attachments, &request.sha256).cloned()
     {
@@ -1938,11 +1972,29 @@ async fn new_session(
         let workspace = state.inner.workspace.lock().await;
         (workspace.root.clone(), workspace.conversation.clone())
     };
-    let root = existing_directory(&workspace_root, &request.project)?;
+    if request.no_project && request.project.is_some() {
+        return Err(ApiError::message(
+            StatusCode::BAD_REQUEST,
+            "project and no_project cannot both be set",
+        ));
+    }
+    let root = if request.no_project {
+        state.inner.runtime_root.clone()
+    } else {
+        let project = request
+            .project
+            .as_deref()
+            .ok_or_else(|| ApiError::message(StatusCode::BAD_REQUEST, "project is required"))?;
+        existing_directory(&workspace_root, project)?
+    };
     if let Some(current) = current {
         current.persist_if_idle().await?;
     }
-    let session = configured_new_session(&state, &root)?;
+    let session = if request.no_project {
+        state.inner.coordinator.create_no_project_session()?
+    } else {
+        configured_new_session(&state, &root)?
+    };
     let mut agent = state.inner.coordinator.build_agent(&root, session)?;
     let catalog = load_catalog(&mut agent, true).await;
     let conversation = install_conversation(&state, root, agent).await?;
@@ -1968,12 +2020,17 @@ async fn resume_session(
     if let Some(current) = current {
         current.persist_if_idle().await?;
     }
-    let root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
-    let store = SessionStore::new(&root)?;
+    let session_root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
+    let store = SessionStore::for_project_root_in(
+        session_root.as_deref(),
+        &state.inner.registry.data_dir()?,
+    )?;
     let session = store.load(Some(&request.id))?;
+    let root = session_root.unwrap_or_else(|| state.inner.runtime_root.clone());
     if let Some(existing) = state.inner.conversations.get(session.id) {
         let mut workspace = state.inner.workspace.lock().await;
         workspace.root = root;
+        workspace.project_selected = session.scope == crate::session::SessionScope::Project;
         workspace.selected_session = Some(session.id);
         workspace.conversation = Some(existing);
         drop(workspace);
@@ -1995,8 +2052,12 @@ async fn delete_session(
         let workspace = state.inner.workspace.lock().await;
         (workspace.root.clone(), workspace.selected_session)
     };
-    let root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
-    let store = SessionStore::new(&root)?;
+    let session_root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
+    let store = SessionStore::for_project_root_in(
+        session_root.as_deref(),
+        &state.inner.registry.data_dir()?,
+    )?;
+    let root = session_root.unwrap_or_else(|| state.inner.runtime_root.clone());
     let sessions = store.list()?;
     let target = store.load(Some(&request.id))?;
     let target_id = target.id;
@@ -2029,6 +2090,7 @@ async fn delete_session(
             if let Some(existing) = state.inner.conversations.get(session.id) {
                 let mut workspace = state.inner.workspace.lock().await;
                 workspace.root.clone_from(&root);
+                workspace.project_selected = session.scope == crate::session::SessionScope::Project;
                 workspace.selected_session = Some(session.id);
                 workspace.conversation = Some(existing);
             } else {
@@ -2040,6 +2102,7 @@ async fn delete_session(
         } else {
             let mut workspace = state.inner.workspace.lock().await;
             workspace.root.clone_from(&root);
+            workspace.project_selected = target.scope == crate::session::SessionScope::Project;
             workspace.selected_session = None;
             workspace.conversation = None;
         }
@@ -2080,6 +2143,7 @@ async fn open_project(
     state.inner.registry.register(&root)?;
     let mut workspace = state.inner.workspace.lock().await;
     workspace.root = root;
+    workspace.project_selected = true;
     workspace.selected_session = None;
     workspace.conversation = None;
     drop(workspace);
@@ -2278,6 +2342,8 @@ struct OpenFileChangeRequest {
     project: PathBuf,
     session_id: Uuid,
     #[serde(default)]
+    no_project: bool,
+    #[serde(default)]
     change_ids: Vec<Uuid>,
 }
 
@@ -2334,12 +2400,24 @@ async fn open_file_change(
             ));
         }
     };
-    let store = ChangeStore::new(&request.project, request.session_id);
+    let store = if request.no_project {
+        ChangeStore::no_project_at(&state.inner.registry.data_dir()?, request.session_id)?
+    } else {
+        ChangeStore::new(&request.project, request.session_id)
+    };
     let conversation = state
         .inner
         .conversations
         .get(request.session_id)
-        .filter(|handle| paths_equal(&handle.snapshot().project_root, &request.project));
+        .filter(|handle| {
+            let snapshot = handle.snapshot();
+            if request.no_project {
+                snapshot.session.scope == crate::session::SessionScope::NoProject
+            } else {
+                snapshot.session.scope == crate::session::SessionScope::Project
+                    && paths_equal(&snapshot.project_root, &request.project)
+            }
+        });
     let live_activities = conversation
         .as_ref()
         .map(|handle| handle.observation().activities)
@@ -2348,7 +2426,11 @@ async fn open_file_change(
         .map(|handle| handle.snapshot().session)
         .map(Ok)
         .unwrap_or_else(|| {
-            SessionStore::new(&request.project)?.load(Some(&request.session_id.to_string()))
+            SessionStore::for_project_root_in(
+                (!request.no_project).then_some(request.project.as_path()),
+                &state.inner.registry.data_dir()?,
+            )?
+            .load(Some(&request.session_id.to_string()))
         })?;
     let mut files = Vec::new();
     let mut title = "Operation changes".to_owned();
@@ -2797,10 +2879,13 @@ mod tests {
 
         assert_eq!(value["type"], "sync");
         assert_eq!(value["revision"], 7);
-        assert_eq!(
-            value["projects"][0]["sessions"].as_array().unwrap().len(),
-            2
-        );
+        let project = value["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|project| project["root"].is_string())
+            .unwrap();
+        assert_eq!(project["sessions"].as_array().unwrap().len(), 2);
         assert_eq!(value["workers"].as_array().unwrap().len(), 2);
         assert_eq!(value["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(value["sessions"][0]["lifecycle"], "idle");
@@ -2812,7 +2897,7 @@ mod tests {
         conversation: ConversationHandle,
         oauth_logged_in: bool,
     ) -> ServerState {
-        let registry = SessionRegistry::at(root.join("test-global-config.toml"));
+        let registry = SessionRegistry::at(root.join(".test-global-config").join("config.toml"));
         test_state_with_registry(config, root, conversation, oauth_logged_in, registry)
     }
 
@@ -2848,10 +2933,12 @@ mod tests {
             registry.clone(),
             DebugOutput::default(),
             DiagnosticLog::stderr(),
+            root.clone(),
             root.join(".test-global-config").join("AGENTS.md"),
         );
         ServerState {
             inner: Arc::new(ServerInner {
+                runtime_root: root.clone(),
                 coordinator,
                 config: RwLock::new(config),
                 registry: registry.clone(),
@@ -2860,6 +2947,7 @@ mod tests {
                 workspace_transition: Mutex::new(()),
                 workspace: Mutex::new(ServerWorkspace {
                     root: root.clone(),
+                    project_selected: true,
                     selected_session: Some(session_id),
                     conversation: Some(conversation.clone()),
                 }),
@@ -2986,7 +3074,10 @@ mod tests {
 
         assert!(response.cron.is_none());
         assert!(response.cron_error.unwrap().contains("not valid cron JSON"));
-        assert!(paths_equal(Path::new(&response.project), &root));
+        assert!(paths_equal(
+            Path::new(response.project.as_ref().unwrap()),
+            &root
+        ));
     }
 
     #[test]
@@ -4222,7 +4313,12 @@ mod tests {
         .0;
 
         assert_eq!(response.session.as_ref().unwrap().id, other.id);
-        assert!(paths_equal(&response.projects[0].root, &other_root));
+        assert!(response.projects.iter().any(|project| {
+            project
+                .root
+                .as_deref()
+                .is_some_and(|root| paths_equal(root, &other_root))
+        }));
         assert_eq!(current_store.list().unwrap()[0].id, current_id);
         assert!(paths_equal(
             &state.inner.workspace.lock().await.root,
@@ -4290,12 +4386,13 @@ mod tests {
             &state.inner.workspace.lock().await.root,
             &empty
         ));
-        assert!(
-            response
-                .projects
-                .iter()
-                .any(|project| paths_equal(&project.root, &empty) && project.sessions.is_empty())
-        );
+        assert!(response.projects.iter().any(|project| {
+            project
+                .root
+                .as_deref()
+                .is_some_and(|root| paths_equal(root, &empty))
+                && project.sessions.is_empty()
+        }));
         assert!(
             registry
                 .directories()
@@ -4384,7 +4481,8 @@ mod tests {
         let response = new_session(
             State(state.clone()),
             Json(NewSessionRequest {
-                project: target.clone(),
+                project: Some(target.clone()),
+                no_project: false,
             }),
         )
         .await
@@ -4401,12 +4499,58 @@ mod tests {
             SessionStore::new(&target).unwrap().list().unwrap()[0].id,
             created.id
         );
+        assert!(response.projects.iter().any(|project| {
+            project
+                .root
+                .as_deref()
+                .is_some_and(|root| paths_equal(root, &target))
+        }));
+    }
+
+    #[tokio::test]
+    async fn new_web_session_can_enter_no_project_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create("model".into())
+            .unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+        {
+            let mut workspace = state.inner.workspace.lock().await;
+            workspace.project_selected = false;
+            workspace.selected_session = None;
+            workspace.conversation = None;
+        }
+        let neutral = snapshot(&state).await.unwrap();
+        assert_eq!(neutral.project, None);
+        assert!(neutral.session.is_none());
+
+        let response = new_session(
+            State(state.clone()),
+            Json(NewSessionRequest {
+                project: None,
+                no_project: true,
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+
+        let created = response.session.unwrap();
+        assert_eq!(created.scope, crate::session::SessionScope::NoProject);
+        assert_eq!(response.project, None);
+        assert!(response.projects[0].root.is_none());
         assert!(
-            response
-                .projects
+            response.projects[0]
+                .sessions
                 .iter()
-                .any(|project| paths_equal(&project.root, &target))
+                .any(|session| session.id == created.id)
         );
+        assert!(paths_equal(&state.inner.workspace.lock().await.root, &root));
     }
 
     #[tokio::test]

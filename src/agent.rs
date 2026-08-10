@@ -31,7 +31,7 @@ use crate::{
     },
     session::{
         CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
-        Session, TurnOutcome,
+        Session, SessionScope, SessionStore, TurnOutcome,
     },
     skills::{Skill, SkillRegistry},
     tools::ToolBox,
@@ -46,6 +46,7 @@ pub(crate) struct Agent {
     model_catalog: Vec<ModelCatalogEntry>,
     compaction_tuning: CompactionTuning,
     change_tracker: ChangeTracker,
+    no_project_data_root: PathBuf,
     diagnostics: DiagnosticLog,
     reported_missing_context_metadata: bool,
     compaction_debounce_tokens: Option<u64>,
@@ -116,6 +117,10 @@ impl Agent {
         global_instructions_path: PathBuf,
         diagnostics: DiagnosticLog,
     ) -> Result<Self> {
+        let no_project_data_root = global_instructions_path
+            .parent()
+            .context("global instructions path has no parent directory")?
+            .to_path_buf();
         tools.restore_terminals(&session.terminals, session.next_terminal_id);
         let (next_terminal_id, terminals) = tools.terminal_state();
         session.next_terminal_id = next_terminal_id;
@@ -125,9 +130,15 @@ impl Agent {
             reasoning_effort: session.reasoning_effort.clone(),
             service_tier: session.service_tier.clone(),
         });
+        let project_root = (session.scope == SessionScope::Project).then_some(tools.root());
         let instructions =
-            AgentInstructions::load(tools.root(), global_instructions_path, &diagnostics)?;
-        let change_tracker = ChangeTracker::new(tools.root(), session.id);
+            AgentInstructions::load(project_root, global_instructions_path, &diagnostics)?;
+        let change_tracker = match session.scope {
+            SessionScope::Project => ChangeTracker::new(tools.root(), session.id),
+            SessionScope::NoProject => {
+                ChangeTracker::no_project_at(&no_project_data_root, session.id)?
+            }
+        };
         Ok(Self {
             provider,
             tools,
@@ -137,6 +148,7 @@ impl Agent {
             model_catalog: Vec::new(),
             compaction_tuning: CompactionTuning::default(),
             change_tracker,
+            no_project_data_root,
             diagnostics,
             reported_missing_context_metadata: false,
             compaction_debounce_tokens: None,
@@ -149,6 +161,14 @@ impl Agent {
 
     pub(crate) fn project_root(&self) -> &Path {
         self.tools.root()
+    }
+
+    pub(crate) fn attachment_store(&self) -> Result<AttachmentStore> {
+        Ok(SessionStore::for_project_root_in(
+            (self.session.scope == SessionScope::Project).then_some(self.tools.root()),
+            &self.no_project_data_root,
+        )?
+        .attachment_store())
     }
 
     pub(crate) async fn fetch_models(&mut self) -> Result<Vec<ModelCatalogEntry>> {
@@ -807,7 +827,11 @@ impl Agent {
     fn system_context(&self, explicit_skills: &str) -> String {
         format!(
             "{}{}{}{}",
-            system_prompt(self.tools.root(), self.session.parent_session_id),
+            system_prompt(
+                self.tools.root(),
+                self.session.scope,
+                self.session.parent_session_id,
+            ),
             self.skills.catalog_prompt(),
             explicit_skills,
             goal_prompt(&self.session)
@@ -815,7 +839,9 @@ impl Agent {
     }
 
     fn instruction_context(&self) -> Option<Message> {
-        self.instructions.context_message(self.tools.root())
+        self.instructions.context_message(
+            (self.session.scope == SessionScope::Project).then_some(self.tools.root()),
+        )
     }
 
     fn model_projection(
@@ -852,7 +878,7 @@ impl Agent {
         }
         let mut bindings = bindings.to_vec();
         bindings.sort_by_key(|binding| (binding.start, binding.end));
-        let store = AttachmentStore::new(self.tools.root());
+        let store = self.attachment_store()?;
         let mut parts = Vec::new();
         let mut cursor = 0;
         let mut has_images = false;
@@ -943,7 +969,7 @@ impl Agent {
         if !self.selected_model_supports_images() {
             anyhow::bail!("the selected model does not declare image input support");
         }
-        let store = AttachmentStore::new(self.tools.root());
+        let store = self.attachment_store()?;
         for part in &mut messages[index].parts {
             let MessagePart::Attachment {
                 attachment_id,
@@ -1017,7 +1043,7 @@ impl Agent {
             if attachment.kind != AttachmentKind::Image {
                 anyhow::bail!("attachment {id} is not an image");
             }
-            let reference = AttachmentStore::new(self.tools.root()).visible_reference(attachment);
+            let reference = self.attachment_store()?.visible_reference(attachment);
             Ok((
                 json!({
                     "ok": true,
@@ -1704,38 +1730,59 @@ fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
 
 const STABLE_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
 
-fn system_prompt(root: &Path, parent_session_id: Option<Uuid>) -> String {
+fn system_prompt(root: &Path, scope: SessionScope, parent_session_id: Option<Uuid>) -> String {
     let lineage = parent_session_id.map_or_else(String::new, |parent| {
         format!(
             "\nSession lineage:\n- This session is a child of persistent session {parent}. This is lineage metadata only; no parent transcript or access boundary is implied.\n"
         )
     });
+    let directory = match scope {
+        SessionScope::Project => {
+            format!(
+                "- Session mode: Project\n- Working directory: {}",
+                root.display()
+            )
+        }
+        SessionScope::NoProject => format!(
+            "- Session mode: No project\n- Shell working directory: {}\n- Structured file tools require absolute paths.",
+            root.display()
+        ),
+    };
     format!(
         "{}\n\nRuntime environment:
 - Operating system: {}
 - CPU architecture: {}
-- Working directory: {}
+{}
 {}",
         STABLE_SYSTEM_PROMPT.trim_end(),
         std::env::consts::OS,
         std::env::consts::ARCH,
-        root.display(),
+        directory,
         lineage,
     )
 }
 
 impl AgentInstructions {
-    fn load(root: &Path, global_path: PathBuf, diagnostics: &DiagnosticLog) -> Result<Self> {
-        let project_path = root.join("AGENTS.md");
-        let same_candidate = paths_equal(&global_path, &project_path);
+    fn load(
+        root: Option<&Path>,
+        global_path: PathBuf,
+        diagnostics: &DiagnosticLog,
+    ) -> Result<Self> {
         let global = load_global_instructions(&global_path, diagnostics);
-        let same_loaded_source = global
-            .as_ref()
-            .is_some_and(|source| paths_equal(&source.path, &project_path));
-        let project = if same_candidate || same_loaded_source {
-            None
-        } else {
-            load_project_instructions(root)?
+        let project = match root {
+            None => None,
+            Some(root) => {
+                let project_path = root.join("AGENTS.md");
+                let same_candidate = paths_equal(&global_path, &project_path);
+                let same_loaded_source = global
+                    .as_ref()
+                    .is_some_and(|source| paths_equal(&source.path, &project_path));
+                if same_candidate || same_loaded_source {
+                    None
+                } else {
+                    load_project_instructions(root)?
+                }
+            }
         };
         Ok(Self { global, project })
     }
@@ -1752,14 +1799,16 @@ impl AgentInstructions {
         }
     }
 
-    fn context_message(&self, root: &Path) -> Option<Message> {
+    fn context_message(&self, root: Option<&Path>) -> Option<Message> {
         self.combined_content().map(|content| {
+            let source = root
+                .map(|root| root.display().to_string())
+                .unwrap_or_else(|| "global CodeCrab configuration".into());
             Message::hidden_text(
                 Role::User,
                 format!(
                     "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-                    root.display(),
-                    content
+                    source, content
                 ),
             )
         })
@@ -2003,11 +2052,32 @@ mod tests {
         .unwrap();
 
         let instructions =
-            AgentInstructions::load(&root, global_path, &DiagnosticLog::default()).unwrap();
+            AgentInstructions::load(Some(&root), global_path, &DiagnosticLog::default()).unwrap();
         assert_eq!(
             instructions.combined_content().unwrap(),
             "Global rule.\n\n--- project-doc ---\n\nFirst project rule.\n\n---\n\nLast project rule.\n"
         );
+    }
+
+    #[test]
+    fn no_project_instructions_skip_the_working_directory_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("runtime");
+        let global_path = temp.path().join("global").join("AGENTS.md");
+        fs::create_dir_all(&runtime_root).unwrap();
+        fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+        fs::write(runtime_root.join("AGENTS.md"), "must not be loaded").unwrap();
+        fs::write(&global_path, "global rule").unwrap();
+
+        let instructions =
+            AgentInstructions::load(None, global_path, &DiagnosticLog::default()).unwrap();
+
+        assert_eq!(
+            instructions.combined_content().as_deref(),
+            Some("global rule")
+        );
+        assert!(instructions.global.is_some());
+        assert!(instructions.project.is_none());
     }
 
     #[test]
@@ -2018,7 +2088,8 @@ mod tests {
         fs::write(project.join("AGENTS.md"), "project only\n").unwrap();
         let missing_global = temp.path().join("missing").join("AGENTS.md");
         let project_only =
-            AgentInstructions::load(&project, missing_global, &DiagnosticLog::default()).unwrap();
+            AgentInstructions::load(Some(&project), missing_global, &DiagnosticLog::default())
+                .unwrap();
         assert_eq!(project_only.combined_content().unwrap(), "project only\n");
 
         let global_only_project = temp.path().join("global-only-project");
@@ -2027,7 +2098,7 @@ mod tests {
         fs::create_dir_all(global_only_path.parent().unwrap()).unwrap();
         fs::write(&global_only_path, "\n global only \n").unwrap();
         let global_only = AgentInstructions::load(
-            &global_only_project,
+            Some(&global_only_project),
             global_only_path,
             &DiagnosticLog::default(),
         )
@@ -2039,7 +2110,8 @@ mod tests {
         let shared_path = global_root.join("AGENTS.md");
         fs::write(&shared_path, "\n shared once \n").unwrap();
         let deduplicated =
-            AgentInstructions::load(&global_root, shared_path, &DiagnosticLog::default()).unwrap();
+            AgentInstructions::load(Some(&global_root), shared_path, &DiagnosticLog::default())
+                .unwrap();
         assert_eq!(deduplicated.combined_content().unwrap(), "shared once");
         assert!(deduplicated.global.is_some());
         assert!(deduplicated.project.is_none());
@@ -2059,7 +2131,7 @@ mod tests {
             }),
         };
 
-        let message = instructions.context_message(root).unwrap();
+        let message = instructions.context_message(Some(root)).unwrap();
         assert!(matches!(message.role, Role::User));
         assert!(message.hidden);
         assert_eq!(
@@ -2220,7 +2292,7 @@ mod tests {
     fn system_prompt_combines_stable_communication_policy_with_runtime_context() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let prompt = system_prompt(&root, None);
+        let prompt = system_prompt(&root, SessionScope::Project, None);
 
         assert!(prompt.contains("language of the user's latest message"));
         assert!(prompt.contains("Before the first tool call"));
@@ -2243,7 +2315,7 @@ mod tests {
         assert!(!prompt.contains("AGENTS.md instructions"));
 
         let parent = Uuid::new_v4();
-        let child_prompt = system_prompt(&root, Some(parent));
+        let child_prompt = system_prompt(&root, SessionScope::Project, Some(parent));
         assert!(child_prompt.contains("Session lineage:"));
         assert!(child_prompt.contains(&parent.to_string()));
         assert!(child_prompt.contains("no parent transcript"));

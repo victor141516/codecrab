@@ -11,6 +11,7 @@ let desktopViewport;
 beforeEach(() => {
   desktopViewport = true;
   localStorage.clear();
+  window.history.replaceState({}, "", "/");
   vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("offline test"))));
   vi.stubGlobal("matchMedia", (query) => ({
     matches: desktopViewport && query === "(min-width: 1024px)",
@@ -92,6 +93,62 @@ describe("desktop project sidebar", () => {
     await nextTick();
     expect(sidebar.classList).toContain("lg:-translate-x-full");
     expect(get("main.workspace-shell").classList).not.toContain("lg:pl-72");
+  });
+});
+
+describe("No project sessions", () => {
+  test("renders the global group and creates a session without a project path", async () => {
+    const neutralState = {
+      live_revision: 1,
+      project: null,
+      filesystem_root: "C:\\",
+      session: null,
+      projects: [{ root: null, sessions: [] }],
+      skills: [],
+      models: [],
+      providers: [],
+      workers: [],
+      usage: { available: false },
+      cron: null
+    };
+    let creationBody;
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url === "/api/state") {
+        return { ok: true, status: 200, json: async () => neutralState };
+      }
+      if (url === "/api/sessions") {
+        creationBody = JSON.parse(options.body);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ...neutralState,
+            live_revision: 2,
+            session: {
+              id: "global-session",
+              title: "New conversation",
+              provider: "openai",
+              model: "gpt-test",
+              messages: [],
+              activities: [],
+              turns: [],
+              goals: [],
+              branch_nodes: [],
+              active_message_ids: []
+            }
+          })
+        };
+      }
+      throw new Error("offline test");
+    }));
+
+    mountApp();
+    await vi.waitFor(() =>
+      expect(root.textContent).toContain("Global sessions")
+    );
+    get('button[aria-label="New session in No project"]').click();
+    await vi.waitFor(() => expect(creationBody).toEqual({ no_project: true }));
   });
 });
 

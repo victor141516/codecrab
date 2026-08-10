@@ -15,7 +15,7 @@ export function expandKnownProject(expanded, projects, root) {
 }
 
 export function newSessionPayload(projectRoot) {
-  return { project: projectRoot };
+  return projectRoot == null ? { no_project: true } : { project: projectRoot };
 }
 
 export function toggleSessionExpansion(collapsed, sessionId) {

@@ -55,7 +55,11 @@ struct Frontmatter {
 
 impl SkillRegistry {
     pub(crate) fn discover(project_root: &Path) -> Self {
-        Self::from_roots(discovery_roots(project_root))
+        Self::from_roots(discovery_roots(Some(project_root)))
+    }
+
+    pub(crate) fn discover_global() -> Self {
+        Self::from_roots(discovery_roots(None))
     }
 
     fn from_roots(roots: Vec<(PathBuf, SkillScope)>) -> Self {
@@ -283,19 +287,21 @@ impl SkillRegistry {
     }
 }
 
-fn discovery_roots(project_root: &Path) -> Vec<(PathBuf, SkillScope)> {
+fn discovery_roots(project_root: Option<&Path>) -> Vec<(PathBuf, SkillScope)> {
     let mut roots = Vec::new();
-    let repo_root = project_root
-        .ancestors()
-        .find(|path| path.join(".git").exists())
-        .unwrap_or(project_root);
-    for directory in project_root.ancestors() {
-        roots.push((
-            directory.join(".agents").join("skills"),
-            SkillScope::Project,
-        ));
-        if directory == repo_root {
-            break;
+    if let Some(project_root) = project_root {
+        let repo_root = project_root
+            .ancestors()
+            .find(|path| path.join(".git").exists())
+            .unwrap_or(project_root);
+        for directory in project_root.ancestors() {
+            roots.push((
+                directory.join(".agents").join("skills"),
+                SkillScope::Project,
+            ));
+            if directory == repo_root {
+                break;
+            }
         }
     }
 
