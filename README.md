@@ -338,7 +338,7 @@ Delegation is process-local and uses the same operating-system account and files
 
 ### Automatic context compaction
 
-CodeCrab uses provider-reported context metadata to compact long conversations automatically. It keeps recent complete turns verbatim and rolls older history into a structured summary, while preserving the full canonical transcript and tool activity in session JSON. Both clients display compaction activity, and a failed or cancelled compaction never replaces the previous projection.
+CodeCrab uses provider-reported context metadata to compact long conversations automatically. It keeps recent complete turns verbatim and rolls older history into a structured summary, while preserving the full canonical transcript and tool activity in session JSON. Both clients display compaction activity, and a failed or cancelled compaction never replaces the previous projection. Provider-specific output limits are sent only when the selected protocol supports them. Deterministic request-validation failures are not replayed, and if emergency compaction cannot recover from a context-window rejection, CodeCrab stops that turn instead of resending the unchanged oversized request.
 
 ## Authentication and providers
 

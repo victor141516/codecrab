@@ -194,7 +194,11 @@ pub(crate) fn summarizer_messages(
             &tool_calls,
         );
     }
-    let mut request = vec![Message::text(Role::System, SUMMARY_SYSTEM_PROMPT)];
+    let summary_system_prompt = format!(
+        "{SUMMARY_SYSTEM_PROMPT}\n\nKeep the summary below approximately {} output tokens. Prefer concise durable facts over reproducing source text.",
+        tuning.maximum_summary_output_tokens
+    );
+    let mut request = vec![Message::text(Role::System, summary_system_prompt)];
     request.extend(instruction_context.cloned());
     request.push(Message::text(Role::User, input));
     request

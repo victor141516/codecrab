@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -403,6 +403,25 @@ enum Backend {
     },
 }
 
+#[derive(Debug)]
+struct ModelHttpError {
+    source: &'static str,
+    status: StatusCode,
+    detail: String,
+}
+
+impl fmt::Display for ModelHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} returned {}: {}",
+            self.source, self.status, self.detail
+        )
+    }
+}
+
+impl Error for ModelHttpError {}
+
 pub(crate) struct OpenAiCompatible {
     client: Client,
     backend: Backend,
@@ -632,14 +651,8 @@ impl OpenAiCompatible {
                 .await
             }
             Backend::ChatGptSubscription { auth } => {
-                self.complete_subscription(
-                    auth,
-                    messages,
-                    tools,
-                    maximum_output_tokens,
-                    &mut on_text_delta,
-                )
-                .await
+                self.complete_subscription(auth, messages, tools, &mut on_text_delta)
+                    .await
             }
         }
     }
@@ -683,7 +696,12 @@ impl OpenAiCompatible {
         if !status.is_success() {
             let body = read_response_body(response, self.stream_idle_timeout).await?;
             http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
-            anyhow::bail!("model returned {status}: {}", compact_error(&body));
+            return Err(ModelHttpError {
+                source: "model",
+                status,
+                detail: compact_error(&body),
+            }
+            .into());
         }
         if !is_event_stream(&headers) {
             let body = read_response_body(response, self.stream_idle_timeout).await?;
@@ -719,7 +737,6 @@ impl OpenAiCompatible {
         auth: &OAuthStore,
         messages: &[Message],
         tools: &[Value],
-        maximum_output_tokens: Option<u64>,
         on_text_delta: &mut impl FnMut(&str),
     ) -> Result<Completion> {
         let payload = responses_payload(
@@ -728,7 +745,6 @@ impl OpenAiCompatible {
             self.service_tier.as_deref(),
             messages,
             tools,
-            maximum_output_tokens,
             self.session_id,
         );
         let credentials = auth.credentials().await?;
@@ -748,10 +764,12 @@ impl OpenAiCompatible {
         if !status.is_success() {
             let body = read_response_body(response, self.stream_idle_timeout).await?;
             http_debug::response(&self.debug_openai, &url, version, status, &headers, &body)?;
-            anyhow::bail!(
-                "ChatGPT subscription returned {status}: {}",
-                compact_error(&body)
-            );
+            return Err(ModelHttpError {
+                source: "ChatGPT subscription",
+                status,
+                detail: compact_error(&body),
+            }
+            .into());
         }
         let mut stream = ResponsesStream::default();
         let body = read_sse(response, self.stream_idle_timeout, |data| {
@@ -826,7 +844,6 @@ fn responses_payload(
     service_tier: Option<&str>,
     messages: &[Message],
     tools: &[Value],
-    maximum_output_tokens: Option<u64>,
     session_id: Uuid,
 ) -> Value {
     let instructions = messages
@@ -916,9 +933,6 @@ fn responses_payload(
     }
     if let Some(tier) = service_tier {
         payload["service_tier"] = json!(tier);
-    }
-    if let Some(maximum_output_tokens) = maximum_output_tokens {
-        payload["max_output_tokens"] = json!(maximum_output_tokens);
     }
     payload
 }
@@ -1533,6 +1547,17 @@ pub(crate) fn context_length_exceeded(error: &anyhow::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+pub(crate) fn model_request_is_retryable(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<ModelHttpError>() else {
+        return true;
+    };
+    error.status.is_server_error()
+        || matches!(
+            error.status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::CONFLICT | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
 fn completed_message(text: String, calls: Vec<ToolCall>, empty_error: &str) -> Result<Message> {
     if text.is_empty() && calls.is_empty() {
         anyhow::bail!("{empty_error}");
@@ -1610,15 +1635,8 @@ mod tests {
             service_tier: None,
         })
         .unwrap();
-        let responses = responses_payload(
-            "gpt-test",
-            None,
-            None,
-            &messages,
-            &definitions,
-            None,
-            Uuid::nil(),
-        );
+        let responses =
+            responses_payload("gpt-test", None, None, &messages, &definitions, Uuid::nil());
         for name in [
             "session_create",
             "session_list",
@@ -1723,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_chat_history_to_responses_tool_items() {
+    fn subscription_payload_omits_unsupported_output_limit() {
         let messages = vec![
             Message::text(Role::System, "system"),
             Message::text(Role::User, "inspect"),
@@ -1761,7 +1779,6 @@ mod tests {
             Some("fast"),
             &messages,
             &[],
-            Some(8_000),
             Uuid::nil(),
         );
         assert_eq!(payload["instructions"], "system");
@@ -1770,7 +1787,54 @@ mod tests {
         assert_eq!(payload["parallel_tool_calls"], true);
         assert_eq!(payload["reasoning"]["effort"], "high");
         assert_eq!(payload["service_tier"], "fast");
-        assert_eq!(payload["max_output_tokens"], 8_000);
+        assert!(payload.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn chat_completions_payload_keeps_supported_output_limit() {
+        let payload = serde_json::to_value(ChatRequest {
+            model: "gpt-test",
+            messages: vec![ChatMessage::from(&Message::text(Role::User, "hello"))],
+            tools: &[],
+            tool_choice: "auto",
+            parallel_tool_calls: true,
+            stream: true,
+            stream_options: ChatStreamOptions {
+                include_usage: true,
+            },
+            max_completion_tokens: Some(8_000),
+            reasoning_effort: None,
+            service_tier: None,
+        })
+        .unwrap();
+
+        assert_eq!(payload["max_completion_tokens"], 8_000);
+    }
+
+    #[test]
+    fn request_validation_errors_are_not_retryable() {
+        let invalid = anyhow::Error::new(ModelHttpError {
+            source: "ChatGPT subscription",
+            status: StatusCode::BAD_REQUEST,
+            detail: "Unsupported parameter".into(),
+        });
+        let rate_limited = anyhow::Error::new(ModelHttpError {
+            source: "ChatGPT subscription",
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "slow down".into(),
+        });
+        let unavailable = anyhow::Error::new(ModelHttpError {
+            source: "model",
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "try again".into(),
+        });
+
+        assert!(!model_request_is_retryable(&invalid));
+        assert!(model_request_is_retryable(&rate_limited));
+        assert!(model_request_is_retryable(&unavailable));
+        assert!(model_request_is_retryable(&anyhow::anyhow!(
+            "transport failed"
+        )));
     }
 
     #[test]
@@ -1811,15 +1875,7 @@ mod tests {
             json!({"type": "text", "text": " after"})
         );
 
-        let responses = responses_payload(
-            "image-model",
-            None,
-            None,
-            &[message],
-            &[],
-            None,
-            Uuid::nil(),
-        );
+        let responses = responses_payload("image-model", None, None, &[message], &[], Uuid::nil());
         assert_eq!(responses["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(responses["input"][0]["content"][1]["type"], "input_image");
         assert_eq!(responses["input"][0]["content"][2]["text"], " after");
@@ -1866,15 +1922,7 @@ mod tests {
             hidden: false,
         };
 
-        let responses = responses_payload(
-            "image-model",
-            None,
-            None,
-            &[message],
-            &[],
-            None,
-            Uuid::nil(),
-        );
+        let responses = responses_payload("image-model", None, None, &[message], &[], Uuid::nil());
 
         assert_eq!(responses["input"][0]["type"], "function_call_output");
         assert_eq!(responses["input"][0]["call_id"], "image-call");
@@ -1893,8 +1941,7 @@ mod tests {
             Message::text(Role::User, "visible request"),
         ];
 
-        let responses =
-            responses_payload("gpt-test", None, None, &messages, &[], None, Uuid::nil());
+        let responses = responses_payload("gpt-test", None, None, &messages, &[], Uuid::nil());
         assert_eq!(responses["instructions"], "stable system policy");
         assert!(
             !responses["instructions"]
