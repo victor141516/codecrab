@@ -142,7 +142,7 @@ Useful composer controls:
 
 Run `/help` or press `F1` for the complete keyboard reference. The terminal handles Unicode-aware soft wrapping, international keyboard layouts including AltGr, Markdown and code highlighting, mouse selection, native clipboard copy, and explicit image/file clipboard paste.
 
-You can keep typing while an agent turn runs. Sending adds an editable follow-up to a queue; **Steer** cancels the current turn and sends one selected follow-up next without reordering the rest.
+Sending a new turn while the agent is idle jumps the terminal conversation to the bottom and resumes automatic following. You can keep typing while an agent turn runs; sending then adds an editable follow-up to a queue without changing a manually scrolled position. **Steer** cancels the current turn and sends one selected follow-up next without reordering the rest.
 
 ### One-shot CLI
 

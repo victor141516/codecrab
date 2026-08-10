@@ -3441,7 +3441,9 @@ impl App {
             return self.command(&prompt).await;
         }
 
-        self.start_turn(prompt, attachments, true)
+        self.start_turn(prompt, attachments, true)?;
+        self.auto_scroll = true;
+        Ok(())
     }
 
     fn start_turn(
@@ -7212,6 +7214,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submitting_a_new_turn_scrolls_to_the_bottom_and_resumes_following() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.scroll = 7;
+        app.max_scroll = 20;
+        app.auto_scroll = false;
+        app.input = "Start a new turn".into();
+        app.cursor = app.input.len();
+
+        app.submit().await.unwrap();
+
+        assert!(app.auto_scroll);
+        app.running.take().unwrap().abort();
+    }
+
+    #[tokio::test]
     async fn submitting_while_the_agent_works_queues_multiple_messages() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
@@ -7220,6 +7238,9 @@ mod tests {
             let _ = finish_rx.await;
             anyhow::bail!("test turn remains pending")
         }));
+        app.scroll = 7;
+        app.max_scroll = 20;
+        app.auto_scroll = false;
         app.input = "Follow up after this turn".into();
         app.cursor = app.input.len();
 
@@ -7238,6 +7259,8 @@ mod tests {
         );
         assert!(app.input.is_empty());
         assert!(app.is_running());
+        assert_eq!(app.scroll, 7);
+        assert!(!app.auto_scroll);
         app.running.take().unwrap().abort();
     }
 
