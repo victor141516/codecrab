@@ -77,6 +77,7 @@ const MARKDOWN_FENCE: Color = Color::Rgb(105, 115, 130);
 const USER_MESSAGE_BG: Color = Color::Rgb(13, 31, 49);
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const WAVEFORM: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 256;
 struct SkillView {
     name: String,
     description: String,
@@ -4816,6 +4817,7 @@ async fn run_tui(
     if app.active_goal_id().is_some() {
         app.start_goal_continuation()?;
     }
+    let mut terminal_events = Vec::new();
     loop {
         app.drain_agent_events();
         app.drain_completion_updates();
@@ -4835,8 +4837,14 @@ async fn run_tui(
         if app.should_quit && !app.is_busy() {
             break;
         }
-        if event::poll(Duration::from_millis(70))? {
-            match event::read()? {
+        collect_terminal_events(
+            &mut terminal_events,
+            Duration::from_millis(70),
+            event::poll,
+            event::read,
+        )?;
+        for terminal_event in terminal_events.drain(..) {
+            match terminal_event {
                 Event::Key(key) => app.handle_key(key).await?,
                 Event::Paste(text) => {
                     app.handle_paste(&text);
@@ -4859,6 +4867,23 @@ async fn run_tui(
     }
     app.conversations.shutdown_all().await?;
     Ok(session_id.to_string())
+}
+
+fn collect_terminal_events(
+    events: &mut Vec<Event>,
+    timeout: Duration,
+    mut poll: impl FnMut(Duration) -> io::Result<bool>,
+    mut read: impl FnMut() -> io::Result<Event>,
+) -> io::Result<()> {
+    events.clear();
+    if !poll(timeout)? {
+        return Ok(());
+    }
+    events.push(read()?);
+    while events.len() < MAX_TERMINAL_EVENTS_PER_FRAME && poll(Duration::ZERO)? {
+        events.push(read()?);
+    }
+    Ok(())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -7698,6 +7723,7 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         fs,
         path::{Path, PathBuf},
     };
@@ -7716,6 +7742,106 @@ mod tests {
         skills::SkillRegistry,
         tools::ToolBox,
     };
+
+    #[test]
+    fn issue_87_terminal_event_burst_is_drained_before_the_next_render() {
+        let pending = RefCell::new(
+            (0..64)
+                .map(|_| {
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::ScrollUp,
+                        column: 40,
+                        row: 12,
+                        modifiers: KeyModifiers::NONE,
+                    })
+                })
+                .collect::<VecDeque<_>>(),
+        );
+
+        let mut events = Vec::new();
+        collect_terminal_events(
+            &mut events,
+            Duration::ZERO,
+            |_| Ok(!pending.borrow().is_empty()),
+            || {
+                pending.borrow_mut().pop_front().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "event queue empty")
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.len(),
+            64,
+            "a wheel burst must be drained before another full conversation render"
+        );
+        assert!(
+            pending.borrow().is_empty(),
+            "queued wheel events would otherwise replay across later frames"
+        );
+    }
+
+    #[test]
+    fn terminal_event_batches_wait_once_then_poll_without_blocking() {
+        let pending = RefCell::new(VecDeque::from([
+            Event::FocusGained,
+            Event::FocusLost,
+            Event::Resize(100, 30),
+        ]));
+        let timeouts = RefCell::new(Vec::new());
+        let mut events = Vec::new();
+
+        collect_terminal_events(
+            &mut events,
+            Duration::from_millis(70),
+            |timeout| {
+                timeouts.borrow_mut().push(timeout);
+                Ok(!pending.borrow().is_empty())
+            },
+            || {
+                pending.borrow_mut().pop_front().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "event queue empty")
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            *timeouts.borrow(),
+            [
+                Duration::from_millis(70),
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_event_batches_are_bounded_to_keep_rendering_live() {
+        let pending = RefCell::new(VecDeque::from(vec![
+            Event::FocusGained;
+            MAX_TERMINAL_EVENTS_PER_FRAME + 5
+        ]));
+        let mut events = Vec::new();
+
+        collect_terminal_events(
+            &mut events,
+            Duration::ZERO,
+            |_| Ok(!pending.borrow().is_empty()),
+            || {
+                pending.borrow_mut().pop_front().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "event queue empty")
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), MAX_TERMINAL_EVENTS_PER_FRAME);
+        assert_eq!(pending.borrow().len(), 5);
+    }
 
     fn test_registry(root: &Path) -> SessionRegistry {
         SessionRegistry::at(root.join(".test-global-config").join("config.toml"))
