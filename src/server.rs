@@ -2045,9 +2045,6 @@ async fn new_session(
             .ok_or_else(|| ApiError::message(StatusCode::BAD_REQUEST, "project is required"))?;
         existing_directory(&workspace_root, project)?
     };
-    if let Some(current) = current {
-        current.persist_if_idle().await?;
-    }
     let session = if request.no_project {
         state.inner.coordinator.create_no_project_session()?
     } else {
@@ -2055,6 +2052,13 @@ async fn new_session(
     };
     let mut agent = state.inner.coordinator.build_agent(&root, session)?;
     let catalog = load_catalog(&mut agent, true).await;
+    if let Some(current) = current {
+        state
+            .inner
+            .conversations
+            .prepare_for_navigation(current.snapshot().session.id)
+            .await?;
+    }
     let conversation = install_conversation(&state, root, agent).await?;
     let session_id = conversation.snapshot().session.id;
     install_catalog(&state.inner, session_id, catalog);
@@ -2075,15 +2079,21 @@ async fn resume_session(
         let workspace = state.inner.workspace.lock().await;
         (workspace.root.clone(), workspace.conversation.clone())
     };
-    if let Some(current) = current {
-        current.persist_if_idle().await?;
-    }
     let session_root = resolve_session_root(&current_root, &state.inner.registry, &request)?;
     let store = SessionStore::for_project_root_in(
         session_root.as_deref(),
         &state.inner.registry.data_dir()?,
     )?;
     let session = store.load(Some(&request.id))?;
+    if let Some(current) = current
+        && current.snapshot().session.id != session.id
+    {
+        state
+            .inner
+            .conversations
+            .prepare_for_navigation(current.snapshot().session.id)
+            .await?;
+    }
     let root = session_root.unwrap_or_else(|| state.inner.runtime_root.clone());
     if let Some(existing) = state.inner.conversations.get(session.id) {
         let mut workspace = state.inner.workspace.lock().await;
@@ -2193,7 +2203,7 @@ async fn delete_session(
         conversation.shutdown().await?;
     }
 
-    store.delete(&request.id)?;
+    store.discard(target_id)?;
     state.inner.catalogs.write().unwrap().remove(&target_id);
     let remaining = store.list()?;
     if deleting_active {
@@ -2253,10 +2263,14 @@ async fn open_project(
         let workspace = state.inner.workspace.lock().await;
         (workspace.root.clone(), workspace.conversation.clone())
     };
-    if let Some(current) = current {
-        current.persist_if_idle().await?;
-    }
     let root = existing_directory(&current_root, &request.path)?;
+    if let Some(current) = current {
+        state
+            .inner
+            .conversations
+            .prepare_for_navigation(current.snapshot().session.id)
+            .await?;
+    }
     state.inner.registry.register(&root)?;
     let mut workspace = state.inner.workspace.lock().await;
     workspace.root = root;
@@ -4660,7 +4674,8 @@ mod tests {
                 .as_deref()
                 .is_some_and(|root| paths_equal(root, &other_root))
         }));
-        assert_eq!(current_store.list().unwrap()[0].id, current_id);
+        assert!(current_store.list().unwrap().is_empty());
+        assert!(state.inner.conversations.get(current_id).is_none());
         assert!(paths_equal(
             &state.inner.workspace.lock().await.root,
             &other_root
@@ -4701,6 +4716,8 @@ mod tests {
             .unwrap()
             .create("model".into())
             .unwrap();
+        let initial_session_id = session.id;
+        SessionStore::new(&current).unwrap().save(&session).unwrap();
         let agent = build_agent(&current, &config, false, session).unwrap();
         let registry = SessionRegistry::at(temp.path().join("config.toml"));
         let state = test_state_with_registry(
@@ -4723,6 +4740,12 @@ mod tests {
         .0;
 
         assert!(response.session.is_none());
+        assert!(
+            SessionStore::new(&current)
+                .unwrap()
+                .load(Some(&initial_session_id.to_string()))
+                .is_err()
+        );
         assert!(paths_equal(
             &state.inner.workspace.lock().await.root,
             &empty
@@ -4816,6 +4839,8 @@ mod tests {
             .unwrap()
             .create("model".into())
             .unwrap();
+        let initial_session_id = session.id;
+        SessionStore::new(&current).unwrap().save(&session).unwrap();
         let agent = build_agent(&current, &config, false, session).unwrap();
         let state = test_state(config, current.clone(), test_conversation(agent), false);
 
@@ -4832,6 +4857,12 @@ mod tests {
         .0;
 
         let created = response.session.unwrap();
+        assert!(
+            SessionStore::new(&current)
+                .unwrap()
+                .load(Some(&initial_session_id.to_string()))
+                .is_err()
+        );
         assert!(paths_equal(
             &state.inner.workspace.lock().await.root,
             &target
