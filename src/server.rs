@@ -47,10 +47,7 @@ use crate::{
         file_completion_context_with_policy, filesystem_root, recursive_file_completion_available,
         slash_completion_range, start_file_completion_search,
     },
-    config::{
-        Config, ConfigStore, ProviderConfig, ProviderSummary, SessionRegistry, paths_equal,
-        validate_provider_name,
-    },
+    config::{Config, ProviderSummary, SessionRegistry, paths_equal},
     conversation::{
         ConversationHandle, ConversationLifecycle, ConversationLiveEvent, ConversationLiveState,
         ConversationManager, ConversationObservation, ConversationStatus,
@@ -392,14 +389,9 @@ struct CronEnabledRequest {
 }
 
 #[derive(Deserialize)]
-struct ProviderRequest {
-    name: String,
-    model: Option<String>,
-    base_url: Option<String>,
-    auth: Option<String>,
-    api_key: Option<String>,
-    #[serde(default)]
-    clear_api_key: bool,
+struct ProviderSelectionRequest {
+    session_id: Option<Uuid>,
+    provider: String,
 }
 
 #[derive(Deserialize)]
@@ -670,9 +662,7 @@ fn server_app(state: ServerState) -> Router {
                     post(transcribe).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
                 )
                 .route("/model", put(set_model))
-                .route("/providers", post(save_provider))
-                .route("/providers/use", post(use_provider))
-                .route("/providers/delete", post(delete_provider))
+                .route("/provider", put(set_provider))
                 .route("/branches/preview", post(preview_branch))
                 .route("/branches/select", post(select_branch))
                 .route("/sessions", post(new_session))
@@ -1942,76 +1932,32 @@ async fn set_model(
     Ok(Json(snapshot_for(&state, Some(session_id)).await?))
 }
 
-async fn save_provider(
+async fn set_provider(
     State(state): State<ServerState>,
-    Json(request): Json<ProviderRequest>,
+    Json(request): Json<ProviderSelectionRequest>,
 ) -> ApiResult<StateResponse> {
-    validate_provider_name(&request.name)?;
-    {
-        let store = ConfigStore::global()?;
-        let mut config = store.load()?;
-        let existing = config.providers.get(&request.name);
-        let api_key = if request.clear_api_key {
-            String::new()
-        } else {
-            request
-                .api_key
-                .filter(|key| !key.is_empty())
-                .or_else(|| existing.map(|provider| provider.api_key.clone()))
-                .unwrap_or_default()
-        };
-        let provider = ProviderConfig {
-            model: request.model.unwrap_or_else(|| "auto".into()),
-            base_url: request.base_url.context("base_url is required")?,
-            auth: request.auth.unwrap_or_else(|| "api_key".into()),
-            api_key,
-            ..existing.cloned().unwrap_or_default()
-        };
-        provider.validate(&request.name)?;
-        config.providers.insert(request.name, provider);
-        store.save(&config)?;
-        state.inner.coordinator.update_config(config.clone());
-        *state.inner.config.write().unwrap() = config;
-    }
-    Ok(Json(snapshot(&state).await?))
-}
-
-async fn use_provider(
-    State(state): State<ServerState>,
-    Json(request): Json<ProviderRequest>,
-) -> ApiResult<StateResponse> {
-    {
-        let store = ConfigStore::global()?;
-        let mut config = store.load()?;
-        config.provider(&request.name)?;
-        config.active_provider = request.name;
-        store.save(&config)?;
-        state.inner.coordinator.update_config(config.clone());
-        *state.inner.config.write().unwrap() = config;
-    }
-    Ok(Json(snapshot(&state).await?))
-}
-
-async fn delete_provider(
-    State(state): State<ServerState>,
-    Json(request): Json<ProviderRequest>,
-) -> ApiResult<StateResponse> {
-    {
-        let store = ConfigStore::global()?;
-        let mut config = store.load()?;
-        config.provider(&request.name)?;
-        if config.active_provider == request.name {
-            return Err(ApiError::message(
+    let _transition = state.inner.workspace_transition.lock().await;
+    let conversation = selected_conversation(&state, request.session_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::message(
                 StatusCode::CONFLICT,
-                "select another active provider before deleting this one",
-            ));
-        }
-        config.providers.remove(&request.name);
-        store.save(&config)?;
-        state.inner.coordinator.update_config(config.clone());
-        *state.inner.config.write().unwrap() = config;
-    }
-    Ok(Json(snapshot(&state).await?))
+                "create or resume a session before changing the provider",
+            )
+        })?;
+    let session_id = conversation.snapshot().session.id;
+    let (provider, configured_model) = state.inner.coordinator.build_provider(&request.provider)?;
+    let updated = conversation
+        .set_provider(request.provider, configured_model, provider)
+        .await?;
+    state.inner.catalogs.write().unwrap().insert(
+        session_id,
+        CatalogState {
+            models: updated.model_catalog,
+            error: None,
+        },
+    );
+    Ok(Json(snapshot_for(&state, Some(session_id)).await?))
 }
 
 async fn preview_branch(
@@ -3115,6 +3061,79 @@ mod tests {
         assert!(INDEX_HTML.starts_with(b"<!doctype html>"));
         assert!(APP_JS.len() > 1_000);
         assert!(APP_CSS.len() > 1_000);
+    }
+
+    #[tokio::test]
+    async fn provider_api_switches_only_the_selected_session_and_rolls_back_without_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut config = Config::test("old-model", "http://127.0.0.1:1/v1");
+        let mut local = crate::config::ProviderConfig::test(
+            "local-model".into(),
+            "http://127.0.0.1:2/v1".into(),
+        );
+        local.fetch_models = false;
+        local.model_capabilities.insert(
+            "local-model".into(),
+            crate::config::ModelCapabilitiesConfig::default(),
+        );
+        config.providers.insert("local".into(), local);
+        let mut empty =
+            crate::config::ProviderConfig::test("auto".into(), "http://127.0.0.1:3/v1".into());
+        empty.fetch_models = false;
+        config.providers.insert("empty".into(), empty);
+        let session = SessionStore::new(&root)
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "old-model".into())
+            .unwrap();
+        let session_id = session.id;
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+
+        let response = match set_provider(
+            State(state.clone()),
+            Json(ProviderSelectionRequest {
+                session_id: Some(session_id),
+                provider: "local".into(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.0,
+            Err(error) => panic!("provider switch failed: {:#}", error.error),
+        };
+        let session = response.session.unwrap();
+        assert_eq!(session.provider, "local");
+        assert_eq!(session.model, "local-model");
+        assert_eq!(
+            state.inner.config.read().unwrap().active_provider,
+            crate::config::DEFAULT_PROVIDER
+        );
+        assert_eq!(response.models[0].slug, "local-model");
+
+        let error = match set_provider(
+            State(state.clone()),
+            Json(ProviderSelectionRequest {
+                session_id: Some(session_id),
+                provider: "empty".into(),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("a provider without models must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            format!("{:#}", error.error),
+            crate::agent::NO_PROVIDER_MODELS_MESSAGE
+        );
+        let snapshot = selected_conversation(&state, Some(session_id))
+            .await
+            .unwrap()
+            .snapshot();
+        assert_eq!(snapshot.session.provider, "local");
+        assert_eq!(snapshot.session.model, "local-model");
+        assert_eq!(snapshot.model_catalog[0].slug, "local-model");
     }
 
     #[tokio::test]

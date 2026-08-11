@@ -167,7 +167,7 @@ current draft and all later turns until changed.
   logical-line start/end, and deletion to either line boundary through
   Crossterm modifiers plus traditional Readline sequences, while preserving
   printable AltGr characters.
-- `/model` presents provider-returned model, reasoning, and speed choices as a
+- `/models` presents provider-returned model, reasoning, and speed choices as a
   hierarchy rather than a flat Cartesian-product list.
 - Session management must retain parity: `/sessions` in the terminal and the
   web sidebar must both expose every registered project and its persisted

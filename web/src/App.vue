@@ -30,7 +30,6 @@ import {
   LocateFixed,
   Menu,
   Mic,
-  Settings,
   Pause,
   Paperclip,
   PanelLeftClose,
@@ -140,6 +139,8 @@ const sidebarOpen = ref(false);
 const desktopSidebarCollapsed = ref(loadDesktopSidebarCollapsed());
 const projectSidebar = ref(null);
 const composer = ref(null);
+const providerControl = ref(null);
+const modelControl = ref(null);
 const conversation = ref(null);
 const autoScroll = ref(true);
 const waveformCanvas = ref(null);
@@ -158,7 +159,6 @@ const expandedActivityKeys = ref(new Set());
 const overflowingActivityKeys = ref(new Set());
 const expandedTurnKeys = ref(new Set());
 const goalsOpen = ref(false);
-const providersOpen = ref(false);
 const usageOpen = ref(false);
 const usageRefreshing = ref(false);
 const usageResetting = ref(false);
@@ -182,7 +182,6 @@ const cronDraft = ref(null);
 const cronDraftId = ref("");
 const cronDraftOriginalId = ref("");
 let cronRefreshTimer = null;
-const providerDraft = ref(null);
 const describedGoal = ref(null);
 const editingGoal = ref(null);
 const goalDraft = ref("");
@@ -806,49 +805,6 @@ async function confirmUsageReset() {
   } finally {
     usageResetting.value = false;
   }
-}
-
-function editProvider(provider = null) {
-  providerDraft.value = provider
-    ? { ...provider, api_key: "", clear_api_key: false }
-    : {
-        name: "",
-        model: "auto",
-        base_url: "https://api.openai.com/v1",
-        auth: "api_key",
-        api_key: "",
-        clear_api_key: false
-      };
-}
-
-async function saveProvider() {
-  const draft = providerDraft.value;
-  if (!draft?.name.trim() || !draft.base_url.trim()) return;
-  await runAction(() =>
-    api("/api/providers", {
-      method: "POST",
-      body: JSON.stringify(draft)
-    })
-  );
-  providerDraft.value = null;
-}
-
-async function useProvider(provider) {
-  await runAction(() =>
-    api("/api/providers/use", {
-      method: "POST",
-      body: JSON.stringify({ name: provider.name })
-    })
-  );
-}
-
-async function deleteProvider(provider) {
-  await runAction(() =>
-    api("/api/providers/delete", {
-      method: "POST",
-      body: JSON.stringify({ name: provider.name })
-    })
-  );
 }
 
 async function refreshCron() {
@@ -2245,6 +2201,39 @@ async function toggleDictation() {
   }
 }
 
+async function chooseProvider(event) {
+  if (!session.value || branchesOpen.value || editingMessageNode.value) return;
+  const sessionId = session.value.id;
+  const previousProvider = session.value.provider;
+  error.value = "";
+  try {
+    const nextState = await api("/api/provider", {
+      method: "PUT",
+      body: JSON.stringify({
+        session_id: sessionId,
+        provider: event.target.value
+      })
+    });
+    if (session.value?.id === sessionId) applyServerState(nextState);
+    else setTargetState(sessionId, nextState);
+  } catch (cause) {
+    event.target.value = previousProvider;
+    error.value = cause.message;
+  }
+}
+
+async function activateSelectionControl(control) {
+  await nextTick();
+  control?.focus();
+  if (typeof control?.showPicker === "function") {
+    try {
+      control.showPicker();
+    } catch {
+      // Focusing still makes the local selection control immediately available.
+    }
+  }
+}
+
 async function updateModel(patch) {
   if (!session.value || branchesOpen.value || editingMessageNode.value) return;
   const sessionId = session.value.id;
@@ -2572,6 +2561,14 @@ async function sendPrompt() {
     ) {
       recalledMessageNode.value = nodeId;
     }
+    return;
+  }
+  if (prompt === "/models" || prompt === "/providers") {
+    await clearComposer();
+    closeAutocomplete();
+    await activateSelectionControl(
+      prompt === "/models" ? modelControl.value : providerControl.value
+    );
     return;
   }
   if (prompt === "/usage" && usage.value.available) {
@@ -4383,55 +4380,6 @@ onBeforeUnmount(() => {
     </div>
 
     <div
-      v-if="providersOpen"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
-      @click.self="providersOpen = false"
-    >
-      <section class="flex max-h-[80vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-cyan-400/20 bg-[#15131a] shadow-2xl shadow-black/60">
-        <header class="flex items-center gap-3 border-b border-white/7 px-4 py-3">
-          <Settings class="size-4 text-cyan-300" aria-hidden="true" />
-          <div class="flex-1">
-            <h2 class="text-sm font-semibold text-zinc-100">Providers</h2>
-            <p class="mt-0.5 text-[10px] text-zinc-600">API keys are saved in ~/.config/codecrab/config.toml.</p>
-          </div>
-          <button class="rounded-md px-3 py-1.5 text-xs text-cyan-300 hover:bg-cyan-400/10" @click="editProvider()">Add</button>
-          <button class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-white/5 hover:text-zinc-200" @click="providersOpen = false"><X class="size-4" /></button>
-        </header>
-        <div class="min-h-0 overflow-y-auto p-2">
-          <article v-for="provider in providers" :key="provider.name" class="mb-1 flex items-center gap-3 rounded-lg px-3 py-2.5 hover:bg-white/3">
-            <div class="min-w-0 flex-1">
-              <div class="flex items-center gap-2 text-xs font-semibold text-zinc-200">
-                {{ provider.name }}
-                <span v-if="provider.active" class="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[8px] uppercase text-cyan-300">active</span>
-              </div>
-              <div class="mt-1 truncate font-mono text-[9px] text-zinc-600">{{ provider.model }} · {{ provider.auth }} · key {{ provider.api_key_configured ? 'configured' : 'none' }} · {{ provider.base_url }}</div>
-            </div>
-            <button v-if="!provider.active" class="rounded px-2 py-1 text-[10px] text-cyan-300 hover:bg-cyan-400/10" @click="useProvider(provider)">Use</button>
-            <button class="grid size-7 place-items-center rounded-md text-zinc-500 hover:bg-white/5" @click="editProvider(provider)"><Pencil class="size-3.5" /></button>
-            <button :disabled="provider.active" class="grid size-7 place-items-center rounded-md text-zinc-600 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-25" @click="deleteProvider(provider)"><Trash2 class="size-3.5" /></button>
-          </article>
-        </div>
-      </section>
-    </div>
-
-    <div
-      v-if="providerDraft"
-      class="fixed inset-0 z-[60] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"
-      @click.self="providerDraft = null"
-    >
-      <section class="w-full max-w-lg space-y-3 rounded-xl border border-cyan-400/20 bg-[#15131a] p-4">
-        <h2 class="text-sm font-semibold text-cyan-200">Provider profile</h2>
-        <label class="block text-[10px] text-zinc-500">Name<input v-model="providerDraft.name" :disabled="providers.some(p => p.name === providerDraft.name)" class="control mt-1 w-full" /></label>
-        <label class="block text-[10px] text-zinc-500">Base URL<input v-model="providerDraft.base_url" class="control mt-1 w-full" /></label>
-        <label class="block text-[10px] text-zinc-500">Model<input v-model="providerDraft.model" class="control mt-1 w-full" /></label>
-        <label class="block text-[10px] text-zinc-500">Authentication<select v-model="providerDraft.auth" class="control mt-1 w-full"><option value="auto">auto</option><option value="oauth">oauth</option><option value="api_key">api_key</option><option value="none">none</option></select></label>
-        <label class="block text-[10px] text-zinc-500">API key<input v-model="providerDraft.api_key" type="password" autocomplete="new-password" placeholder="Leave empty to keep the current key" class="control mt-1 w-full" /></label>
-        <label v-if="providerDraft.api_key_configured" class="flex items-center gap-2 text-[10px] text-zinc-500"><input v-model="providerDraft.clear_api_key" type="checkbox" /> Remove configured API key</label>
-        <div class="flex justify-end gap-2 pt-2"><button class="rounded px-3 py-1.5 text-xs text-zinc-500 hover:bg-white/5" @click="providerDraft = null">Cancel</button><button class="rounded bg-cyan-300 px-3 py-1.5 text-xs font-semibold text-cyan-950" @click="saveProvider">Save</button></div>
-      </section>
-    </div>
-
-    <div
       v-if="goalsOpen"
       class="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
       @click.self="goalsOpen = false"
@@ -4969,7 +4917,6 @@ onBeforeUnmount(() => {
             <GitBranch class="size-4" aria-hidden="true" />
           </button>
           <button class="grid size-8 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-amber-300" title="Scheduled tasks" aria-label="Manage scheduled tasks" @click="openCron"><CalendarClock class="size-4" /></button>
-          <button class="grid size-8 place-items-center rounded-md text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200" title="Providers" aria-label="Manage providers" @click="providersOpen = true"><Settings class="size-4" /></button>
         </div>
       </header>
 
@@ -5711,7 +5658,31 @@ onBeforeUnmount(() => {
                   aria-label="Model configuration"
                 >
                   <select
+                    v-if="session && providers.length > 1"
+                    ref="providerControl"
+                    class="control composer-control composer-param-control"
+                    :value="session.provider"
+                    :disabled="branchesOpen || Boolean(editingMessageNode)"
+                    aria-label="Provider"
+                    title="Provider"
+                    @change="chooseProvider"
+                  >
+                    <option v-for="provider in providers" :key="provider.name" :value="provider.name">
+                      {{ provider.name }}
+                    </option>
+                  </select>
+                  <span
+                    v-else-if="session"
+                    ref="providerControl"
+                    class="max-w-32 truncate px-1 text-[10px] font-medium text-zinc-500"
+                    tabindex="-1"
+                    title="Provider"
+                  >
+                    {{ session.provider }}
+                  </span>
+                  <select
                     v-if="session"
+                    ref="modelControl"
                     class="control composer-control composer-model-control"
                     :value="session.model"
                     :disabled="branchesOpen || Boolean(editingMessageNode)"

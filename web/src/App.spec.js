@@ -278,6 +278,111 @@ describe("OpenAI usage", () => {
   });
 });
 
+describe("session provider selection", () => {
+  function response(body) {
+    return { ok: true, status: 200, json: async () => body };
+  }
+
+  function workspaceState(provider = "openai", model = "gpt-test") {
+    return {
+      live_revision: 1,
+      project: "/workspace",
+      filesystem_root: "/",
+      session: {
+        id: "session-1",
+        title: "Provider test",
+        provider,
+        model,
+        reasoning_effort: null,
+        service_tier: null,
+        messages: [],
+        activities: [],
+        turns: [],
+        goals: [],
+        branch_nodes: [],
+        active_message_ids: []
+      },
+      projects: [{ root: "/workspace", sessions: [] }],
+      skills: [],
+      models: [{
+        slug: model,
+        display_name: model,
+        supported_reasoning_levels: [],
+        service_tiers: []
+      }],
+      providers: [
+        { name: "openai", active: true },
+        { name: "local", active: false }
+      ],
+      workers: [],
+      usage: { available: false },
+      cron: null
+    };
+  }
+
+  test("switches the current session and handles plural slash commands locally", async () => {
+    let providerBody;
+    let chatRequested = false;
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url === "/api/state") return response(workspaceState());
+      if (url === "/api/provider") {
+        providerBody = JSON.parse(options.body);
+        return response(workspaceState("local", "local-model"));
+      }
+      if (url === "/api/completions") return response(null);
+      if (url === "/api/chat") chatRequested = true;
+      throw new Error("offline test");
+    }));
+
+    mountApp();
+    await vi.waitFor(() =>
+      expect(root.querySelector('select[aria-label="Provider"]')).not.toBeNull()
+    );
+    const provider = get('select[aria-label="Provider"]');
+    provider.value = "local";
+    provider.dispatchEvent(new Event("change", { bubbles: true }));
+    await vi.waitFor(() =>
+      expect(providerBody).toEqual({ session_id: "session-1", provider: "local" })
+    );
+    await vi.waitFor(() =>
+      expect(get('select[aria-label="Model"]').value).toBe("local-model")
+    );
+
+    const composer = get("textarea");
+    composer.value = "/providers";
+    composer.dispatchEvent(new InputEvent("input", { bubbles: true, data: "s" }));
+    await nextTick();
+    composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await vi.waitFor(() => expect(document.activeElement).toBe(provider));
+    expect(chatRequested).toBe(false);
+
+    composer.value = "/models";
+    composer.dispatchEvent(new InputEvent("input", { bubbles: true, data: "s" }));
+    await nextTick();
+    composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await vi.waitFor(() =>
+      expect(document.activeElement).toBe(get('select[aria-label="Model"]'))
+    );
+    expect(chatRequested).toBe(false);
+  });
+
+  test("renders a single configured provider as static text", async () => {
+    const onlyProvider = workspaceState();
+    onlyProvider.providers = [onlyProvider.providers[0]];
+    vi.stubGlobal("fetch", vi.fn(async (input) => {
+      if (String(input) === "/api/state") return response(onlyProvider);
+      throw new Error("offline test");
+    }));
+
+    mountApp();
+    await vi.waitFor(() =>
+      expect(root.querySelector('span[title="Provider"]')?.textContent.trim()).toBe("openai")
+    );
+    expect(root.querySelector('select[aria-label="Provider"]')).toBeNull();
+  });
+});
+
 describe("managed terminal processes", () => {
   function response(body) {
     return { ok: true, status: 200, json: async () => body };

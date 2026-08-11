@@ -25,7 +25,6 @@ diffy = "0.4"
 rand = "0.9"
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
-rpassword = "7"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }

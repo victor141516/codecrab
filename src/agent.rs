@@ -25,9 +25,9 @@ use crate::{
     diagnostics::DiagnosticLog,
     events::{AgentActivity, AgentEvent},
     provider::{
-        AttachmentBinding, Message, MessagePart, ModelCatalogEntry, ModelSelection,
-        OpenAiCompatible, Role, ToolCall, context_length_exceeded, default_model_selection,
-        model_request_is_retryable, new_session_model_selection,
+        AttachmentBinding, EmptyModelCatalog, Message, MessagePart, ModelCatalogEntry,
+        ModelSelection, OpenAiCompatible, Role, ToolCall, context_length_exceeded,
+        default_model_selection, model_request_is_retryable, new_session_model_selection,
     },
     session::{
         CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
@@ -53,11 +53,23 @@ pub(crate) struct Agent {
     compaction_debounce_tokens: Option<u64>,
 }
 
+pub(crate) struct ProviderRollback {
+    provider: OpenAiCompatible,
+    model_catalog: Vec<ModelCatalogEntry>,
+    name: String,
+    selection: ModelSelection,
+    updated_at: chrono::DateTime<Utc>,
+    reported_missing_context_metadata: bool,
+    compaction_debounce_tokens: Option<u64>,
+}
+
 const GOAL_CONTINUATION_PROMPT: &str = "Continue working toward the active goal. Review the \
 conversation and current workspace state, identify what remains, and make concrete progress. \
 Do not repeat completed work. Call complete_goal only after you have verified every completion \
 criterion. Call block_goal only when an external decision or state genuinely prevents progress.";
 const MAX_MODEL_RETRIES: usize = 5;
+pub(crate) const NO_PROVIDER_MODELS_MESSAGE: &str =
+    "No models were found for this provider. Configure a model manually in config.toml.";
 
 #[derive(Debug)]
 pub(crate) struct TurnCancelled;
@@ -190,6 +202,52 @@ impl Agent {
         self.reported_missing_context_metadata = false;
         self.compaction_debounce_tokens = None;
         self.session.updated_at = Utc::now();
+    }
+
+    pub(crate) async fn set_provider(
+        &mut self,
+        provider_name: String,
+        configured_model: String,
+        mut provider: OpenAiCompatible,
+    ) -> Result<ProviderRollback> {
+        let catalog = provider.fetch_models().await.map_err(|error| {
+            if error.downcast_ref::<EmptyModelCatalog>().is_some() {
+                anyhow::anyhow!(NO_PROVIDER_MODELS_MESSAGE)
+            } else {
+                error
+            }
+        })?;
+        let selection = new_session_model_selection(&configured_model, &catalog)
+            .ok_or_else(|| anyhow::anyhow!(NO_PROVIDER_MODELS_MESSAGE))?;
+
+        provider.set_selection(&selection);
+        let rollback = ProviderRollback {
+            provider: std::mem::replace(&mut self.provider, provider),
+            model_catalog: std::mem::replace(&mut self.model_catalog, catalog),
+            name: std::mem::replace(&mut self.session.provider, provider_name),
+            selection: ModelSelection {
+                model: self.session.model.clone(),
+                reasoning_effort: self.session.reasoning_effort.clone(),
+                service_tier: self.session.service_tier.clone(),
+            },
+            updated_at: self.session.updated_at,
+            reported_missing_context_metadata: self.reported_missing_context_metadata,
+            compaction_debounce_tokens: self.compaction_debounce_tokens,
+        };
+        self.set_model_selection(selection);
+        Ok(rollback)
+    }
+
+    pub(crate) fn rollback_provider(&mut self, rollback: ProviderRollback) {
+        self.provider = rollback.provider;
+        self.model_catalog = rollback.model_catalog;
+        self.session.provider = rollback.name;
+        self.session.model = rollback.selection.model;
+        self.session.reasoning_effort = rollback.selection.reasoning_effort;
+        self.session.service_tier = rollback.selection.service_tier;
+        self.session.updated_at = rollback.updated_at;
+        self.reported_missing_context_metadata = rollback.reported_missing_context_metadata;
+        self.compaction_debounce_tokens = rollback.compaction_debounce_tokens;
     }
 
     pub(crate) fn resolve_auto_model(&mut self, catalog: &[ModelCatalogEntry]) -> bool {
@@ -1900,7 +1958,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::{config::Config, session::SessionStore, tools::ToolBox};
+    use crate::{
+        config::{Config, ModelCapabilitiesConfig, ProviderConfig},
+        session::SessionStore,
+        tools::ToolBox,
+    };
 
     fn test_agent(
         provider: OpenAiCompatible,
@@ -1917,6 +1979,66 @@ mod tests {
             global_instructions_path,
             DiagnosticLog::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn provider_switch_is_atomic_and_uses_the_configured_model() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::test("old-model", "http://127.0.0.1:1/v1");
+        let provider = OpenAiCompatible::new(&config, &config.active_provider).unwrap();
+        let session = SessionStore::new(root.path())
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "old-model".into())
+            .unwrap();
+        let mut agent = test_agent(
+            provider,
+            ToolBox::new(root.path().to_path_buf()),
+            SkillRegistry::default(),
+            session,
+        )
+        .unwrap();
+
+        let mut next_config = config.clone();
+        let mut next_provider =
+            ProviderConfig::test("new-model".into(), "http://127.0.0.1:2/v1".into());
+        next_provider.fetch_models = false;
+        next_provider
+            .model_capabilities
+            .insert("new-model".into(), ModelCapabilitiesConfig::default());
+        next_config.providers.insert("local".into(), next_provider);
+        let replacement = OpenAiCompatible::new(&next_config, "local").unwrap();
+
+        agent
+            .set_provider("local".into(), "new-model".into(), replacement)
+            .await
+            .unwrap();
+        assert_eq!(agent.model_catalog.len(), 1);
+        assert_eq!(agent.session.provider, "local");
+        assert_eq!(agent.session.model, "new-model");
+
+        let mut empty_config = next_config;
+        empty_config.providers.insert(
+            "empty".into(),
+            ProviderConfig::test("auto".into(), "http://127.0.0.1:3/v1".into()),
+        );
+        empty_config
+            .providers
+            .get_mut("empty")
+            .unwrap()
+            .fetch_models = false;
+        let empty = OpenAiCompatible::new(&empty_config, "empty").unwrap();
+        let error = match agent
+            .set_provider("empty".into(), "auto".into(), empty)
+            .await
+        {
+            Ok(_) => panic!("a provider without models must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(format!("{error:#}"), NO_PROVIDER_MODELS_MESSAGE);
+        assert_eq!(agent.session.provider, "local");
+        assert_eq!(agent.session.model, "new-model");
+        assert_eq!(agent.model_catalog[0].slug, "new-model");
     }
 
     fn test_attachment_agent(root: &Path, supports_images: bool) -> (Agent, Attachment, String) {

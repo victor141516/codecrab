@@ -422,6 +422,17 @@ impl fmt::Display for ModelHttpError {
 
 impl Error for ModelHttpError {}
 
+#[derive(Debug)]
+pub(crate) struct EmptyModelCatalog;
+
+impl fmt::Display for EmptyModelCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the provider catalog contains no configured models")
+    }
+}
+
+impl Error for EmptyModelCatalog {}
+
 pub(crate) struct OpenAiCompatible {
     client: Client,
     backend: Backend,
@@ -1014,7 +1025,7 @@ fn merge_model_catalog(
         }
     }
     if models.is_empty() {
-        anyhow::bail!("the provider catalog contains no configured models");
+        return Err(EmptyModelCatalog.into());
     }
     Ok(models)
 }

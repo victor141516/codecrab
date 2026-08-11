@@ -470,6 +470,7 @@ impl ConfigStore {
         Self { path }
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -486,6 +487,7 @@ impl ConfigStore {
         Ok(config)
     }
 
+    #[cfg(test)]
     pub(crate) fn save(&self, config: &Config) -> Result<()> {
         let _guard = global_config_mutation_lock()
             .lock()
