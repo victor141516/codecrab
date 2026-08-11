@@ -37,7 +37,7 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     auth::OAuthStore,
-    config::{Config, ConfigStore, ProviderConfig, SessionRegistry, validate_provider_name},
+    config::{Config, SessionRegistry},
     coordination::SessionCoordinator,
     diagnostics::{DebugOutput, DiagnosticLog},
     session::{SessionStore, list_session_projects, resolve_global_session},
@@ -87,11 +87,8 @@ enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
-    /// Add, inspect, select, or remove provider profiles.
-    Provider {
-        #[command(subcommand)]
-        command: ProviderCommand,
-    },
+    /// List configured provider profiles without exposing API keys.
+    Providers,
     /// Run one prompt, print the answer, and exit.
     Run {
         /// Prompt. If omitted, it is read from stdin.
@@ -161,41 +158,6 @@ enum AuthCommand {
     Logout,
 }
 
-#[derive(Subcommand)]
-enum ProviderCommand {
-    /// Add or replace a provider profile.
-    Add {
-        /// Profile name (letters, numbers, '-' and '_').
-        name: String,
-        /// OpenAI-compatible API base URL.
-        #[arg(long)]
-        base_url: String,
-        /// Authentication mode: auto, oauth, api_key, or none.
-        #[arg(long, default_value = "api_key")]
-        auth: String,
-        /// Default model name.
-        #[arg(long, default_value = "auto")]
-        model: String,
-        /// API key. Prefer omitting this flag and entering it at the hidden prompt.
-        #[arg(long, conflicts_with = "api_key_stdin")]
-        api_key: Option<String>,
-        /// Read the API key from stdin.
-        #[arg(long)]
-        api_key_stdin: bool,
-        /// Make this profile active.
-        #[arg(long)]
-        activate: bool,
-    },
-    /// List provider profiles without exposing API keys.
-    List,
-    /// Show one provider profile without exposing its API key.
-    Show { name: String },
-    /// Select the provider used for new sessions.
-    Use { name: String },
-    /// Remove a provider profile.
-    Remove { name: String },
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -258,11 +220,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Command::Provider { command }) = &cli.command {
-        manage_provider(command)?;
-        return Ok(());
-    }
-
     let registry = SessionRegistry::global()?;
 
     match cli.command {
@@ -272,6 +229,23 @@ async fn main() -> Result<()> {
         }
         Some(Command::Skills) => {
             crate::skills::SkillRegistry::discover(&root).print();
+            return Ok(());
+        }
+        Some(Command::Providers) => {
+            for provider in config.summaries() {
+                println!(
+                    "{}{}  {}  {}  key: {}",
+                    if provider.active { "* " } else { "  " },
+                    provider.name,
+                    provider.model,
+                    provider.base_url,
+                    if provider.api_key_configured {
+                        "configured"
+                    } else {
+                        "none"
+                    }
+                );
+            }
             return Ok(());
         }
         Some(Command::Config) => {
@@ -338,7 +312,7 @@ async fn main() -> Result<()> {
             .await?;
             return Ok(());
         }
-        Some(Command::Auth { .. } | Command::Provider { .. }) => {
+        Some(Command::Auth { .. }) => {
             unreachable!("management commands return before session setup")
         }
         Some(Command::Run { prompt }) => {
@@ -437,101 +411,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn manage_provider(command: &ProviderCommand) -> Result<()> {
-    use std::io::{IsTerminal, Read};
-
-    let store = ConfigStore::global()?;
-    let mut config = store.load()?;
-    match command {
-        ProviderCommand::Add {
-            name,
-            base_url,
-            auth,
-            model,
-            api_key,
-            api_key_stdin,
-            activate,
-        } => {
-            validate_provider_name(name)?;
-            let auth = auth.trim().to_ascii_lowercase();
-            let needs_key = matches!(auth.as_str(), "auto" | "api_key");
-            let key = if let Some(key) = api_key {
-                key.clone()
-            } else if *api_key_stdin {
-                let mut key = String::new();
-                std::io::stdin().read_to_string(&mut key)?;
-                key.trim_end_matches(['\r', '\n']).to_owned()
-            } else if needs_key && std::io::stdin().is_terminal() {
-                rpassword::prompt_password("API key: ")?
-            } else {
-                String::new()
-            };
-            let provider = ProviderConfig {
-                model: model.clone(),
-                base_url: base_url.clone(),
-                auth,
-                api_key: key,
-                ..config.providers.get(name).cloned().unwrap_or_default()
-            };
-            provider.validate(name)?;
-            config.providers.insert(name.clone(), provider);
-            if *activate || config.providers.len() == 1 {
-                config.active_provider.clone_from(name);
-            }
-            store.save(&config)?;
-            println!("Provider {name:?} saved in {}.", store.path().display());
-        }
-        ProviderCommand::List => {
-            for provider in config.summaries() {
-                println!(
-                    "{}{}  {}  {}  key: {}",
-                    if provider.active { "* " } else { "  " },
-                    provider.name,
-                    provider.model,
-                    provider.base_url,
-                    if provider.api_key_configured {
-                        "configured"
-                    } else {
-                        "none"
-                    }
-                );
-            }
-        }
-        ProviderCommand::Show { name } => {
-            let provider = config.provider(name)?;
-            println!("name: {name}");
-            println!("active: {}", config.active_provider == *name);
-            println!("base URL: {}", provider.base_url);
-            println!("model: {}", provider.model);
-            println!("auth: {}", provider.auth);
-            println!(
-                "API key: {}",
-                if provider.api_key.is_empty() {
-                    "not configured"
-                } else {
-                    "configured"
-                }
-            );
-        }
-        ProviderCommand::Use { name } => {
-            config.provider(name)?;
-            config.active_provider.clone_from(name);
-            store.save(&config)?;
-            println!("Provider {name:?} will be used for new sessions.");
-        }
-        ProviderCommand::Remove { name } => {
-            config.provider(name)?;
-            if config.active_provider == *name {
-                anyhow::bail!("cannot remove the active provider; select another provider first");
-            }
-            config.providers.remove(name);
-            store.save(&config)?;
-            println!("Provider {name:?} removed.");
-        }
-    }
-    Ok(())
-}
-
 fn one_shot_prompt(prompt: Option<String>) -> Result<String> {
     use std::io::{IsTerminal, Read};
 
@@ -565,6 +444,13 @@ fn format_config_output(path: &Path, contents: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn providers_is_the_only_provider_management_cli_command() {
+        let cli = Cli::try_parse_from(["codecrab", "providers"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Providers)));
+        assert!(Cli::try_parse_from(["codecrab", "provider", "list"]).is_err());
+    }
 
     #[test]
     fn config_output_separates_the_file_path_from_effective_content() {

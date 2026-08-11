@@ -21,15 +21,13 @@ use tokio::{
 
 pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("help", "Open keyboard and command help"),
-    ("model", "Choose model, reasoning, and speed"),
-    ("models", "Alias for /model"),
+    ("models", "Choose model, reasoning, and speed"),
     ("skills", "Open the interactive skill picker"),
     ("sessions", "Browse, resume, or delete saved sessions"),
     ("processes", "Manage running shell terminals"),
     ("no-project", "Create a session without a project"),
     ("branches", "Browse conversation branches"),
-    ("providers", "List configured provider profiles"),
-    ("provider", "Add, select, or remove a provider profile"),
+    ("providers", "Choose the provider for the current session"),
     ("goal", "Start a persistent goal"),
     ("goals", "Browse and manage persistent goals"),
     ("usage", "Show OpenAI plan usage and reset credits"),
@@ -1088,6 +1086,20 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == CompletionKind::Command && item.name == "usage")
         );
+        assert!(menu.items.iter().any(|item| {
+            item.kind == CompletionKind::Command
+                && item.name == "models"
+                && item.description == "Choose model, reasoning, and speed"
+        }));
+        assert!(
+            menu.items
+                .iter()
+                .any(|item| { item.kind == CompletionKind::Command && item.name == "providers" })
+        );
+        assert!(menu.items.iter().all(|item| {
+            item.kind != CompletionKind::Command
+                || (item.name != "model" && item.name != "provider")
+        }));
         let without_usage = complete("/", 1, root.path(), skills, false).unwrap();
         assert!(without_usage.items.iter().all(|item| item.name != "usage"));
         assert!(

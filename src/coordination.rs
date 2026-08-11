@@ -76,14 +76,6 @@ impl SessionCoordinator {
         self.inner.registry.clone()
     }
 
-    pub(crate) fn update_config(&self, config: Config) {
-        *self
-            .inner
-            .config
-            .write()
-            .expect("session coordinator config lock poisoned") = config;
-    }
-
     pub(crate) fn build_agent(&self, root: &Path, session: Session) -> Result<Agent> {
         let config = self
             .inner
@@ -117,6 +109,18 @@ impl SessionCoordinator {
             self.inner.global_instructions_path.clone(),
             self.inner.diagnostics.clone(),
         )
+    }
+
+    pub(crate) fn build_provider(&self, name: &str) -> Result<(OpenAiCompatible, String)> {
+        let config = self
+            .inner
+            .config
+            .read()
+            .expect("session coordinator config lock poisoned");
+        let configured_model = config.provider(name)?.model.clone();
+        let mut provider = OpenAiCompatible::new(&config, name)?;
+        provider.set_debug_openai(self.inner.debug_openai.clone());
+        Ok((provider, configured_model))
     }
 
     pub(crate) fn install(&self, agent: Agent) -> Result<ConversationHandle> {

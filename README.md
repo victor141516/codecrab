@@ -252,15 +252,14 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | Command | Purpose |
 | --- | --- |
 | `/help` | Open keyboard and command help |
-| `/model` | Choose a provider-returned model, reasoning level, and speed |
+| `/models` | Choose a provider-returned model, reasoning level, and speed |
 | `/processes` | Inspect and stop managed shell processes in the current session |
 | `/skills` | Browse installed Agent Skills |
 | `/sessions` | Browse, resume, or delete sessions across projects |
 | `/no-project` | Start a new session without a project |
 | `/cron` | Browse, run, pause, edit, or delete scheduled agent tasks |
 | `/branches` | Preview and select conversation branches |
-| `/providers` | List configured provider profiles |
-| `/provider` | Add, select, or remove a provider profile |
+| `/providers` | Choose the provider for the current session |
 | `/goal <objective>` | Start a persistent goal |
 | `/goals` | Browse and manage goals |
 | `/usage` | Inspect OpenAI ChatGPT quota and use manual reset credits |
@@ -371,28 +370,30 @@ Quota and reset-credit support uses private ChatGPT subscription endpoints. This
 
 ### API keys and compatible providers
 
-Add and activate a local provider without authentication:
+Provider profiles are managed in the global `config.toml` shown by `codecrab config`. For example, add a local provider without authentication with:
 
-```bash
-codecrab provider add local \
-  --base-url http://localhost:11434/v1 \
-  --auth none \
-  --model local-model \
-  --activate
+```toml
+[providers.local]
+model = "local-model"
+base_url = "http://localhost:11434/v1"
+auth = "none"
+fetch_models = false
+allowed_models = ["local-model"]
+
+[providers.local.model_capabilities.local-model]
+input_modalities = ["text"]
+output_modalities = ["text"]
 ```
 
-Manage profiles with:
+List the configured profiles without exposing their API keys:
 
 ```bash
-codecrab provider list
-codecrab provider show local
-codecrab provider use local
-codecrab provider remove local
+codecrab providers
 ```
 
-Provider authentication modes are `auto`, `oauth`, `api_key`, and `none`. `provider add` prompts for an omitted API key without echo; automation can use `--api-key-stdin`. Avoid `--api-key` when shell history or process listings are a concern.
+Provider authentication modes are `auto`, `oauth`, `api_key`, and `none`. Edit provider secrets directly in `config.toml`; normal configuration and provider-list output omit them.
 
-Profiles keep their base URL, current key, model, discovered or manually declared catalog, reasoning options, service tiers, modalities, and context limits together. Sessions store the profile name and model selection but never copy provider secrets. See [`codecrab.example.toml`](codecrab.example.toml) for complete OpenAI, remote-compatible, and local-provider examples.
+Profiles keep their base URL, current key, model, discovered or manually declared catalog, reasoning options, service tiers, modalities, and context limits together. Sessions store the profile name and model selection but never copy provider secrets. Use `/providers` in the terminal or the provider control above the web composer to change only the current session; the choice survives resume without changing `active_provider` or any other session. See [`codecrab.example.toml`](codecrab.example.toml) for complete OpenAI, remote-compatible, and local-provider examples.
 
 New sessions with `model = "auto"` prefer GPT-5.6 Sol with high reasoning and Fast speed when the live provider catalog offers that combination. Otherwise CodeCrab uses the provider's first model and declared defaults; it does not invent unsupported model variants.
 
@@ -511,9 +512,7 @@ With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription 
 | `POST` | `/api/attachments/upload` | Stream and verify one bounded browser file upload for an explicit project/session |
 | `POST` | `/api/transcribe` | Transcribe uploaded audio |
 | `PUT` | `/api/model` | Change model, reasoning, and service tier |
-| `POST` | `/api/providers` | Add or replace a provider profile |
-| `POST` | `/api/providers/use` | Select the provider for new sessions |
-| `POST` | `/api/providers/delete` | Delete an inactive provider profile |
+| `PUT` | `/api/provider` | Change the provider and valid model selection for the current session |
 | `POST` | `/api/branches/preview` | Preview a conversation path without persistence |
 | `POST` | `/api/branches/select` | Select and persist a conversation path |
 | `POST` | `/api/sessions` | Create and select a session in a project |

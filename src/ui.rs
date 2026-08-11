@@ -43,10 +43,7 @@ use crate::{
         CompletionKind, CompletionMenu, CompletionSearch, builtin_command_from_input,
         complete_progressive, goal_objective_from_input, slash_completion_range,
     },
-    config::{
-        Config, ConfigStore, ProviderConfig, SessionRegistry, normalized_root, paths_equal,
-        validate_provider_name,
-    },
+    config::{Config, SessionRegistry, normalized_root, paths_equal},
     conversation::{
         ConversationHandle, ConversationLifecycle, ConversationManager, ConversationSnapshot,
         ConversationTurn,
@@ -117,6 +114,12 @@ struct ModelPicker {
     model_index: usize,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
+}
+
+struct ProviderPicker {
+    providers: Vec<String>,
+    selected: usize,
+    notice: Option<String>,
 }
 
 struct SessionPicker {
@@ -900,6 +903,7 @@ struct App {
     slash_completion_open: bool,
     model_catalog: Vec<ModelCatalogEntry>,
     model_picker: Option<ModelPicker>,
+    provider_picker: Option<ProviderPicker>,
     session_picker: Option<SessionPicker>,
     process_dialog: Option<ProcessDialog>,
     session_delete_confirm: bool,
@@ -1079,6 +1083,7 @@ impl App {
             slash_completion_open: false,
             model_catalog,
             model_picker: None,
+            provider_picker: None,
             session_picker: None,
             process_dialog: None,
             session_delete_confirm: false,
@@ -1342,6 +1347,7 @@ impl App {
             || self.session_delete_confirm
             || self.exit_confirm
             || self.model_picker.is_some()
+            || self.provider_picker.is_some()
             || self.show_help
             || self.show_skills
         {
@@ -1875,6 +1881,69 @@ impl App {
         self.close_completion();
     }
 
+    fn open_provider_picker(&mut self) {
+        let providers = self.config.providers.keys().cloned().collect::<Vec<_>>();
+        let selected = providers
+            .iter()
+            .position(|provider| provider == &self.provider)
+            .unwrap_or(0);
+        self.provider_picker = Some(ProviderPicker {
+            providers,
+            selected,
+            notice: None,
+        });
+        self.close_completion();
+    }
+
+    fn move_provider_selection(&mut self, delta: isize) {
+        let Some(picker) = &mut self.provider_picker else {
+            return;
+        };
+        let len = picker.providers.len();
+        if len == 0 {
+            return;
+        }
+        picker.selected = (picker.selected as isize + delta).rem_euclid(len as isize) as usize;
+        picker.notice = None;
+    }
+
+    async fn accept_provider_selection(&mut self) -> Result<()> {
+        let Some(name) = self
+            .provider_picker
+            .as_ref()
+            .and_then(|picker| picker.providers.get(picker.selected).cloned())
+        else {
+            return Ok(());
+        };
+        if name == self.provider {
+            self.provider_picker = None;
+            return Ok(());
+        }
+
+        let result = match self.coordinator.build_provider(&name) {
+            Ok((provider, configured_model)) => {
+                self.conversation
+                    .set_provider(name, configured_model, provider)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(snapshot) => {
+                self.apply_snapshot(snapshot);
+                self.sync_usage_provider();
+                self.error = None;
+                self.provider_picker = None;
+            }
+            Err(error) => {
+                if let Some(picker) = &mut self.provider_picker {
+                    picker.notice = Some(format!("{error:#}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn model_picker_item_count(&self) -> usize {
         let Some(picker) = &self.model_picker else {
             return 0;
@@ -2049,6 +2118,11 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        if self.provider != snapshot.session.provider {
+            self.model_catalog.clone_from(&snapshot.model_catalog);
+            self.model_catalogs
+                .insert(snapshot.session.id, snapshot.model_catalog.clone());
+        }
         self.transcript = snapshot.session.messages.to_vec();
         self.transcript_node_ids = snapshot.session.messages.active_node_ids().to_vec();
         self.activities.clone_from(&snapshot.session.activities);
@@ -2121,6 +2195,7 @@ impl App {
         self.show_help = false;
         self.show_skills = false;
         self.model_picker = None;
+        self.provider_picker = None;
         self.session_picker = None;
         self.goal_picker = None;
         self.close_completion();
@@ -2332,6 +2407,7 @@ impl App {
         self.show_help = false;
         self.show_skills = false;
         self.model_picker = None;
+        self.provider_picker = None;
         self.session_picker = None;
         self.close_completion();
     }
@@ -2480,6 +2556,7 @@ impl App {
         self.show_help = false;
         self.show_skills = false;
         self.model_picker = None;
+        self.provider_picker = None;
         self.session_picker = None;
         self.goal_picker = None;
         self.close_completion();
@@ -2742,6 +2819,7 @@ impl App {
         self.show_help = false;
         self.show_skills = false;
         self.model_picker = None;
+        self.provider_picker = None;
         self.close_completion();
         Ok(())
     }
@@ -3377,6 +3455,7 @@ impl App {
             && !self.session_delete_confirm
             && !self.exit_confirm
             && self.model_picker.is_none()
+            && self.provider_picker.is_none()
             && !self.show_help
             && !self.show_skills
         {
@@ -3524,6 +3603,12 @@ impl App {
             }
             MouseEventKind::ScrollDown if self.model_picker.is_some() => {
                 self.move_model_selection(1);
+            }
+            MouseEventKind::ScrollUp if self.provider_picker.is_some() => {
+                self.move_provider_selection(-1);
+            }
+            MouseEventKind::ScrollDown if self.provider_picker.is_some() => {
+                self.move_provider_selection(1);
             }
             MouseEventKind::ScrollUp if self.session_picker.is_some() => {
                 self.move_session_selection(-1);
@@ -3713,11 +3798,19 @@ impl App {
             self.close_completion();
             return self.command(&prompt).await;
         }
-        if prompt == "/providers" || prompt.starts_with("/provider ") {
+        if prompt == "/models" || prompt == "/providers" {
             self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
-            return self.provider_command(&prompt);
+            if self.is_running() {
+                self.error =
+                    Some("Wait for the active turn before changing the model or provider.".into());
+            } else if prompt == "/models" {
+                self.open_model_picker();
+            } else {
+                self.open_provider_picker();
+            }
+            return Ok(());
         }
         if prompt == "/cron" || prompt.starts_with("/cron ") {
             self.clear_composer_text();
@@ -3825,94 +3918,6 @@ impl App {
 
     fn cancel_current_turn(&mut self) {
         self.conversation.cancel();
-    }
-
-    fn provider_command(&mut self, command: &str) -> Result<()> {
-        if self.is_running() {
-            self.error = Some("Wait for the active turn before changing providers.".into());
-            return Ok(());
-        }
-        let parts = command.split_whitespace().collect::<Vec<_>>();
-        let store = ConfigStore::global()?;
-        let mut persisted = store.load()?;
-        match parts.as_slice() {
-            ["/providers"] => {
-                self.error = Some(
-                    persisted
-                        .summaries()
-                        .into_iter()
-                        .map(|provider| {
-                            format!(
-                                "{}{}: {} · {} · key {}",
-                                if provider.active { "* " } else { "" },
-                                provider.name,
-                                provider.model,
-                                provider.base_url,
-                                if provider.api_key_configured {
-                                    "configured"
-                                } else {
-                                    "none"
-                                }
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
-            }
-            ["/provider", "use", name] => {
-                persisted.provider(name)?;
-                persisted.active_provider = (*name).into();
-                store.save(&persisted)?;
-                self.config = persisted.clone();
-                self.coordinator.update_config(persisted);
-                self.error = Some(format!(
-                    "Provider {name:?} selected for new sessions. The current session keeps provider {:?}.",
-                    self.conversation.snapshot().session.provider
-                ));
-            }
-            ["/provider", "remove", name] => {
-                persisted.provider(name)?;
-                if persisted.active_provider == *name {
-                    anyhow::bail!("select another active provider before removing this one");
-                }
-                persisted.providers.remove(*name);
-                store.save(&persisted)?;
-                self.config = persisted.clone();
-                self.coordinator.update_config(persisted);
-                self.error = Some(format!("Provider {name:?} removed."));
-            }
-            [
-                "/provider",
-                "add",
-                name,
-                base_url,
-                model,
-                auth,
-                api_key @ ..,
-            ] if !api_key.is_empty() => {
-                validate_provider_name(name)?;
-                let provider = ProviderConfig {
-                    model: (*model).into(),
-                    base_url: (*base_url).into(),
-                    auth: (*auth).into(),
-                    api_key: api_key.join(" "),
-                    ..persisted.providers.get(*name).cloned().unwrap_or_default()
-                };
-                provider.validate(name)?;
-                persisted.providers.insert((*name).into(), provider);
-                store.save(&persisted)?;
-                self.config = persisted.clone();
-                self.coordinator.update_config(persisted);
-                self.error = Some(format!("Provider {name:?} saved."));
-            }
-            _ => {
-                self.error = Some(
-                    "Usage: /providers | /provider use NAME | /provider remove NAME | /provider add NAME BASE_URL MODEL AUTH API_KEY"
-                        .into(),
-                );
-            }
-        }
-        Ok(())
     }
 
     async fn cron_command(&mut self, command: &str) -> Result<()> {
@@ -4033,7 +4038,7 @@ impl App {
         match command {
             "/quit" => self.request_quit(),
             "/help" => self.show_help = true,
-            "/model" | "/models" => self.open_model_picker(),
+            "/models" => self.open_model_picker(),
             "/skills" => self.open_skill_picker(),
             "/sessions" => self.open_session_picker().await?,
             "/processes" => self.open_processes(),
@@ -4215,6 +4220,18 @@ impl App {
                 KeyCode::PageDown => self.move_model_selection(5),
                 KeyCode::Enter | KeyCode::Tab => self.accept_model_selection().await?,
                 KeyCode::Left | KeyCode::Backspace | KeyCode::Esc => self.back_model_picker(),
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.provider_picker.is_some() {
+            match key.code {
+                KeyCode::Up => self.move_provider_selection(-1),
+                KeyCode::Down => self.move_provider_selection(1),
+                KeyCode::PageUp => self.move_provider_selection(-5),
+                KeyCode::PageDown => self.move_provider_selection(5),
+                KeyCode::Enter | KeyCode::Tab => self.accept_provider_selection().await?,
+                KeyCode::Esc => self.provider_picker = None,
                 _ => {}
             }
             return Ok(());
@@ -4579,6 +4596,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.model_picker.is_some() {
         render_model_picker(frame, app, area);
+    }
+    if app.provider_picker.is_some() {
+        render_provider_picker(frame, app, area);
     }
     if app.session_picker.is_some() {
         render_session_picker(frame, app, area);
@@ -5740,6 +5760,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if !app.show_help
         && !app.show_skills
         && app.model_picker.is_none()
+        && app.provider_picker.is_none()
         && app.session_picker.is_none()
         && app.goal_picker.is_none()
     {
@@ -5910,8 +5931,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  /goal ...  start a persistent goal"),
         Line::from("  /goals     manage persistent goals"),
         Line::from("  /no-project create a session without a project"),
-        Line::from("  /model     choose model, thinking, and speed"),
+        Line::from("  /models    choose model, thinking, and speed"),
         Line::from("  /processes manage running shell terminals"),
+        Line::from("  /providers choose the current session provider"),
         Line::from("  /sessions  resume or delete saved sessions"),
         Line::from("  /skills    show available skills"),
         Line::from("  /quit      save and quit"),
@@ -5988,6 +6010,77 @@ fn render_skills(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .border_style(Style::default().fg(CRAB))
                 .title(Span::styled(
                     format!(" Skills ({}) ", app.skills.len()),
+                    Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        popup,
+    );
+}
+
+fn render_provider_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(picker) = &app.provider_picker else {
+        return;
+    };
+    let notice_height = picker
+        .notice
+        .as_deref()
+        .map_or(0, |notice| notice.lines().count() as u16 + 1);
+    let height = (picker.providers.len().min(12) as u16 + 5 + notice_height)
+        .clamp(8, area.height.saturating_sub(2).max(8));
+    let popup = centered_rect(area, 82, height);
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "↑↓ select  •  Enter/Tab choose  •  Esc close",
+            Style::default().fg(MUTED),
+        )),
+        Line::default(),
+    ];
+    for (index, name) in picker.providers.iter().enumerate() {
+        let selected = index == picker.selected;
+        let detail = app
+            .config
+            .providers
+            .get(name)
+            .map(|provider| format!("{} · {}", provider.model, provider.base_url))
+            .unwrap_or_default();
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    if selected { " › " } else { "   " },
+                    Style::default().fg(CRAB),
+                ),
+                Span::styled(
+                    format!("{name:<18}"),
+                    Style::default()
+                        .fg(if selected { Color::White } else { AQUA })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(compact_text(&detail, 54), Style::default().fg(MUTED)),
+            ])
+            .style(if selected {
+                Style::default().bg(Color::Rgb(42, 48, 58))
+            } else {
+                Style::default()
+            }),
+        );
+    }
+    if let Some(notice) = &picker.notice {
+        lines.push(Line::default());
+        lines.extend(notice.lines().map(|line| {
+            Line::from(Span::styled(
+                line.to_owned(),
+                Style::default().fg(Color::Yellow),
+            ))
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(CRAB))
+                .title(Span::styled(
+                    " Providers ",
                     Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
                 )),
         ),
@@ -7194,7 +7287,7 @@ mod tests {
     use crate::{
         account_usage::{ResetCredit, ResetCredits, UsageSnapshot, UsageWindow, UsageWindowKind},
         completion::{NERD_FOLDER, file_completion_context, file_icon},
-        config::{Config, SessionRegistry, paths_equal},
+        config::{Config, ModelCapabilitiesConfig, ProviderConfig, SessionRegistry, paths_equal},
         provider::{
             FunctionCall, ModelCatalogEntry, OpenAiCompatible, ReasoningOption, ServiceTierOption,
             ToolCall,
@@ -9864,13 +9957,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_picker_switches_only_the_current_session_and_rolls_back_without_models() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::test("old-model", "http://127.0.0.1:1/v1");
+        let mut local = ProviderConfig::test("local-model".into(), "http://127.0.0.1:2/v1".into());
+        local.fetch_models = false;
+        local
+            .model_capabilities
+            .insert("local-model".into(), ModelCapabilitiesConfig::default());
+        config.providers.insert("local".into(), local);
+        let mut empty = ProviderConfig::test("auto".into(), "http://127.0.0.1:3/v1".into());
+        empty.fetch_models = false;
+        config.providers.insert("empty".into(), empty);
+        let session = SessionStore::new(root.path())
+            .unwrap()
+            .create_for_provider(config.active_provider.clone(), "old-model".into())
+            .unwrap();
+        let session_id = session.id;
+        let mut app = test_app_with_session(root.path(), config, session);
+
+        app.open_provider_picker();
+        let initial_selection = app.provider_picker.as_ref().unwrap().selected;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_ne!(
+            app.provider_picker.as_ref().unwrap().selected,
+            initial_selection
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.provider_picker.is_none());
+
+        app.open_provider_picker();
+        let local_index = app
+            .provider_picker
+            .as_ref()
+            .unwrap()
+            .providers
+            .iter()
+            .position(|provider| provider == "local")
+            .unwrap();
+        app.provider_picker.as_mut().unwrap().selected = local_index;
+        app.accept_provider_selection().await.unwrap();
+
+        assert!(app.provider_picker.is_none());
+        assert_eq!(app.provider, "local");
+        assert_eq!(app.model, "local-model");
+        assert_eq!(app.config.active_provider, crate::config::DEFAULT_PROVIDER);
+        let persisted = SessionStore::new(root.path())
+            .unwrap()
+            .load(Some(&session_id.to_string()))
+            .unwrap();
+        assert_eq!(persisted.provider, "local");
+        assert_eq!(persisted.model, "local-model");
+
+        app.open_provider_picker();
+        let empty_index = app
+            .provider_picker
+            .as_ref()
+            .unwrap()
+            .providers
+            .iter()
+            .position(|provider| provider == "empty")
+            .unwrap();
+        app.provider_picker.as_mut().unwrap().selected = empty_index;
+        app.accept_provider_selection().await.unwrap();
+
+        assert_eq!(app.provider, "local");
+        assert_eq!(app.model, "local-model");
+        assert_eq!(
+            app.provider_picker
+                .as_ref()
+                .and_then(|picker| picker.notice.as_deref()),
+            Some(crate::agent::NO_PROVIDER_MODELS_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn provider_picker_renders_at_wide_and_compact_sizes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.config.providers.insert(
+            "local".into(),
+            ProviderConfig::test("local-model".into(), "http://localhost:11434/v1".into()),
+        );
+        app.open_provider_picker();
+        app.provider_picker.as_mut().unwrap().notice =
+            Some(crate::agent::NO_PROVIDER_MODELS_MESSAGE.into());
+
+        for (width, height) in [(100, 24), (50, 12)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Providers"));
+            assert!(rendered.contains("local"));
+            assert!(rendered.contains("No models were found"));
+        }
+    }
+
     #[test]
     fn header_prefixes_the_unified_model_section_when_multiple_providers_exist() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
         app.config
             .providers
-            .insert("local".into(), ProviderConfig::default());
+            .insert("local".into(), crate::config::ProviderConfig::default());
         app.model = "future-model".into();
         app.reasoning_effort = Some("high".into());
         app.service_tier = Some("standard".into());

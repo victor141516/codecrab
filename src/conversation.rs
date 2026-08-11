@@ -21,7 +21,9 @@ use crate::{
     attachments::Attachment,
     config::SessionRegistry,
     events::{ActivityStatus, AgentActivity, AgentEvent},
-    provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection, Role},
+    provider::{
+        AttachmentBinding, Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role,
+    },
     session::{GoalStatus, Session, SessionStore, TurnOutcome},
     skills::{Skill, SkillRegistry},
     terminal::{TerminalManager, TerminalOutputSnapshot, TerminalRecord},
@@ -259,6 +261,12 @@ enum ConversationCommand {
     },
     SetModel {
         selection: ModelSelection,
+        reply: oneshot::Sender<Result<ConversationSnapshot>>,
+    },
+    SetProvider {
+        name: String,
+        configured_model: String,
+        provider: OpenAiCompatible,
         reply: oneshot::Sender<Result<ConversationSnapshot>>,
     },
     ReplaceSkills {
@@ -618,6 +626,22 @@ impl ConversationHandle {
         let (reply, response) = oneshot::channel();
         self.send(ConversationCommand::SetModel { selection, reply })?;
         receive(response, "setting the conversation model").await?
+    }
+
+    pub(crate) async fn set_provider(
+        &self,
+        name: String,
+        configured_model: String,
+        provider: OpenAiCompatible,
+    ) -> Result<ConversationSnapshot> {
+        let (reply, response) = oneshot::channel();
+        self.send(ConversationCommand::SetProvider {
+            name,
+            configured_model,
+            provider,
+            reply,
+        })?;
+        receive(response, "setting the conversation provider").await?
     }
 
     #[cfg(test)]
@@ -984,6 +1008,28 @@ async fn run_worker(
             ConversationCommand::SetModel { selection, reply } => {
                 agent.set_model_selection(selection);
                 reply_snapshot(&agent, &registry, &snapshots, reply);
+                false
+            }
+            ConversationCommand::SetProvider {
+                name,
+                configured_model,
+                provider,
+                reply,
+            } => {
+                let result = match agent.set_provider(name, configured_model, provider).await {
+                    Ok(rollback) => {
+                        let current = snapshot(&agent);
+                        let persisted = persist(&agent, &registry).map(|()| current.clone());
+                        if persisted.is_ok() {
+                            let _ = snapshots.send(current);
+                        } else {
+                            agent.rollback_provider(rollback);
+                        }
+                        persisted
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
                 false
             }
             ConversationCommand::ReplaceSkills { skills, reply } => {
