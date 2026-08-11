@@ -539,6 +539,23 @@ fn default_next_terminal_id() -> u64 {
 }
 
 impl Session {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+            && self.activities.is_empty()
+            && self.turns.is_empty()
+            && self.goals.is_empty()
+            && self.compaction_checkpoints.is_empty()
+            && self.latest_request_usage.is_none()
+            && self.terminals.is_empty()
+            && self.attachments.is_empty()
+            && self.file_changes.is_empty()
+            && self.parent_session_id.is_none()
+            && self.scheduled_run.is_none()
+            && !self.manual_title
+            && self.pinned_at.is_none()
+            && self.archived_at.is_none()
+    }
+
     pub(crate) fn update_metadata(
         &mut self,
         update: SessionMetadataUpdate,
@@ -1080,11 +1097,14 @@ impl SessionStore {
         self.read(&self.dir.join(format!("{id}.json")))
     }
 
-    pub(crate) fn delete(&self, query: &str) -> Result<Uuid> {
-        let id = self.resolve_id(Some(query))?;
+    pub(crate) fn discard(&self, id: Uuid) -> Result<bool> {
         let path = self.dir.join(format!("{id}.json"));
         let attachment_store = self.attachment_store();
         let attachment_dir = attachment_store.session_dir(id);
+        let session_exists = path.exists();
+        if !session_exists && !attachment_dir.exists() {
+            return Ok(false);
+        }
         let tombstone = attachment_dir.with_extension(format!("deleting-{}", Uuid::new_v4()));
         let moved_data = if attachment_dir.exists() {
             fs::rename(&attachment_dir, &tombstone).with_context(|| {
@@ -1097,7 +1117,7 @@ impl SessionStore {
         } else {
             false
         };
-        if let Err(error) = fs::remove_file(&path) {
+        if session_exists && let Err(error) = fs::remove_file(&path) {
             if moved_data {
                 let _ = fs::rename(&tombstone, &attachment_dir);
             }
@@ -1111,7 +1131,7 @@ impl SessionStore {
                 )
             })?;
         }
-        Ok(id)
+        Ok(session_exists)
     }
 
     fn resolve_id(&self, query: Option<&str>) -> Result<Uuid> {
@@ -1966,17 +1986,33 @@ mod tests {
     }
 
     #[test]
-    fn a_session_can_be_deleted_by_prefix() {
+    fn empty_session_detection_ignores_defaults_but_preserves_user_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let session = store.create("test-model".into()).unwrap();
+        assert!(session.is_empty());
+
+        let mut titled = session.clone();
+        titled.rename("Keep this session").unwrap();
+        assert!(!titled.is_empty());
+
+        let mut messaged = session;
+        messaged
+            .messages
+            .push(Message::text(crate::provider::Role::User, "Hello"));
+        assert!(!messaged.is_empty());
+    }
+
+    #[test]
+    fn discarding_a_session_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
         let session = store.create("test-model".into()).unwrap();
         store.save(&session).unwrap();
 
-        let deleted = store.delete(&session.id.to_string()[..8]).unwrap();
-
-        assert_eq!(deleted, session.id);
+        assert!(store.discard(session.id).unwrap());
+        assert!(!store.discard(session.id).unwrap());
         assert!(store.list().unwrap().is_empty());
-        assert!(store.load(Some(&session.id.to_string())).is_err());
     }
 
     #[test]
@@ -1989,7 +2025,7 @@ mod tests {
         fs::create_dir_all(attachment_dir.join("attachments/hash")).unwrap();
         fs::write(attachment_dir.join("attachments/hash/original"), b"data").unwrap();
 
-        store.delete(&session.id.to_string()).unwrap();
+        store.discard(session.id).unwrap();
 
         assert!(!attachment_dir.exists());
         assert!(store.load(Some(&session.id.to_string())).is_err());
@@ -2005,7 +2041,7 @@ mod tests {
         store.save(&parent).unwrap();
         store.save(&child).unwrap();
 
-        store.delete(&parent.id.to_string()).unwrap();
+        store.discard(parent.id).unwrap();
 
         let persisted_child = store.load(Some(&child.id.to_string())).unwrap();
         assert_eq!(persisted_child.parent_session_id, Some(parent.id));

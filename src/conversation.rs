@@ -1129,7 +1129,7 @@ async fn run_worker(
             ConversationCommand::Shutdown { reply } => {
                 let result = agent
                     .shutdown()
-                    .and_then(|()| persist(&agent, &registry).map(|()| snapshot(&agent)));
+                    .and_then(|()| retire(&agent, &registry).map(|()| snapshot(&agent)));
                 if let Ok(current) = &result {
                     let _ = snapshots.send(current.clone());
                 }
@@ -1593,6 +1593,23 @@ impl ConversationManager {
         }
     }
 
+    pub(crate) async fn prepare_for_navigation(&self, id: Uuid) -> Result<()> {
+        let Some(handle) = self.get(id) else {
+            return Ok(());
+        };
+        if handle.is_running() {
+            return Ok(());
+        }
+        if !handle.snapshot().session.is_empty() {
+            handle.persist_if_idle().await?;
+            return Ok(());
+        }
+        if let Some(handle) = self.take_if_idle(id)? {
+            handle.shutdown().await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn active_terminal_count(&self) -> usize {
         self.conversations
             .read()
@@ -1749,6 +1766,23 @@ fn persist(agent: &Agent, registry: &SessionRegistry) -> Result<()> {
     Ok(())
 }
 
+fn retire(agent: &Agent, registry: &SessionRegistry) -> Result<()> {
+    let root = agent.project_root();
+    let store = SessionStore::for_project_root_in(
+        (agent.session().scope == crate::session::SessionScope::Project).then_some(root),
+        &registry.data_dir()?,
+    )?;
+    if agent.session().scope == crate::session::SessionScope::Project {
+        registry.register(root)?;
+    }
+    if agent.session().is_empty() {
+        store.discard(agent.session().id)?;
+    } else {
+        store.save(agent.session())?;
+    }
+    Ok(())
+}
+
 fn spawn_worker(future: impl Future<Output = ()> + Send + 'static) -> Result<()> {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(future);
@@ -1881,6 +1915,49 @@ mod tests {
         let removed = events.recv().await.unwrap();
         assert_eq!(removed.session_id, id);
         assert!(matches!(removed.event, ConversationLiveEvent::Removed));
+    }
+
+    #[tokio::test]
+    async fn preparing_for_navigation_discards_an_empty_session_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::at(root.path().join("manager-global-config.toml"));
+        let manager = ConversationManager::new(registry);
+        let handle = manager.install(test_agent(root.path())).unwrap();
+        let id = handle.snapshot().session.id;
+        handle.persist().await.unwrap();
+        assert!(
+            SessionStore::new(root.path())
+                .unwrap()
+                .load(Some(&id.to_string()))
+                .is_ok()
+        );
+
+        manager.prepare_for_navigation(id).await.unwrap();
+
+        assert!(manager.get(id).is_none());
+        assert!(
+            SessionStore::new(root.path())
+                .unwrap()
+                .load(Some(&id.to_string()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_shutdown_discards_an_empty_session() {
+        let root = tempfile::tempdir().unwrap();
+        let handle = test_handle(root.path());
+        let id = handle.snapshot().session.id;
+        handle.persist().await.unwrap();
+
+        handle.shutdown().await.unwrap();
+
+        assert!(
+            SessionStore::new(root.path())
+                .unwrap()
+                .load(Some(&id.to_string()))
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -219,7 +219,7 @@ Press `Ctrl+C` once for graceful shutdown. If requests, connections, or managed 
 
 ### Sessions and projects
 
-CodeCrab saves project-local JSON sessions under `.codecrab/sessions/` and maintains a global registry so both clients can browse work across projects. No project sessions are stored in CodeCrab's global data directory and do not persist the process working directory.
+CodeCrab saves project-local JSON sessions under `.codecrab/sessions/` and maintains a global registry so both clients can browse work across projects. No project sessions are stored in CodeCrab's global data directory and do not persist the process working directory. A newly opened session remains available while active, but CodeCrab discards it on navigation or clean shutdown if it still has no conversation or other user-created session state.
 
 ```bash
 codecrab sessions

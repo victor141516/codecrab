@@ -3137,6 +3137,14 @@ impl App {
                 picker.projects[project_index].sessions(section)[session_index].id,
             )
         };
+        if self.active_session {
+            let current_id = self.conversation.snapshot().session.id;
+            if current_id != id {
+                self.conversations
+                    .prepare_for_navigation(current_id)
+                    .await?;
+            }
+        }
         self.park_current_turn();
         let mut catalog_error = None;
         if self.active_session {
@@ -3339,7 +3347,7 @@ impl App {
         }
         self.background_turns.remove(&id);
         self.model_catalogs.remove(&id);
-        store.delete(&id.to_string())?;
+        store.discard(id)?;
 
         if deleting_active {
             if let Some(summary) = store.list()?.first() {
@@ -4315,7 +4323,11 @@ impl App {
     }
 
     async fn create_no_project_session(&mut self) -> Result<()> {
-        self.save_active_session().await?;
+        if self.active_session {
+            self.conversations
+                .prepare_for_navigation(self.conversation.snapshot().session.id)
+                .await?;
+        }
         self.park_current_turn();
         let session = self.coordinator.create_no_project_session()?;
         let id = session.id;
@@ -4794,7 +4806,7 @@ pub(crate) async fn interactive(
     )?;
     terminal.show_cursor()?;
 
-    if let Ok(session_id) = &result {
+    if let Ok(Some(session_id)) = &result {
         println!("\x1b[2mSession saved as {session_id}\x1b[0m");
     }
     let report = diagnostics.report();
@@ -4814,7 +4826,7 @@ Use `--error-log <path>` to choose a different location.",
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: App,
-) -> Result<String> {
+) -> Result<Option<String>> {
     if app.active_goal_id().is_some() {
         app.start_goal_continuation()?;
     }
@@ -4857,7 +4869,11 @@ async fn run_tui(
         }
     }
 
-    let session_id = app.conversation.snapshot().session.id;
+    let saved_session_id = app
+        .active_session
+        .then(|| app.conversation.snapshot().session)
+        .filter(|session| !session.is_empty())
+        .map(|session| session.id.to_string());
     app.conversations.cancel_all();
     while app
         .conversations
@@ -4868,7 +4884,7 @@ async fn run_tui(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     app.conversations.shutdown_all().await?;
-    Ok(session_id.to_string())
+    Ok(saved_session_id)
 }
 
 fn advance_spinner_if_due(spinner: &mut usize, last_tick: &mut Instant, now: Instant) {
@@ -10750,6 +10766,7 @@ mod tests {
         let registry = test_registry(temp.path());
         let other_store = SessionStore::new(&other_root).unwrap();
         let mut app = test_app(&current_root);
+        let initial_session_id = app.conversation.snapshot().session.id;
         app.registry = registry.clone();
         let mut saved = other_store.create("restored-model".into()).unwrap();
         saved.reasoning_effort = Some("high".into());
@@ -10913,6 +10930,12 @@ mod tests {
         ));
 
         app.accept_session_selection().await.unwrap();
+        assert!(
+            SessionStore::new(&current_root)
+                .unwrap()
+                .load(Some(&initial_session_id.to_string()))
+                .is_err()
+        );
         assert!(paths_equal(&app.project_root, &other_root));
         assert!(paths_equal(
             &app.conversation.snapshot().project_root,
