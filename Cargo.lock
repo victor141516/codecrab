@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "codecrab"
-version = "1.14.1"
+version = "1.15.0"
 dependencies = [
  "anyhow",
  "arboard",
