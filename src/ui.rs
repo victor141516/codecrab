@@ -77,6 +77,7 @@ const MARKDOWN_FENCE: Color = Color::Rgb(105, 115, 130);
 const USER_MESSAGE_BG: Color = Color::Rgb(13, 31, 49);
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const WAVEFORM: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const TUI_TICK_RATE: Duration = Duration::from_millis(70);
 const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 256;
 struct SkillView {
     name: String,
@@ -4818,6 +4819,7 @@ async fn run_tui(
         app.start_goal_continuation()?;
     }
     let mut terminal_events = Vec::new();
+    let mut last_spinner_tick = Instant::now();
     loop {
         app.drain_agent_events();
         app.drain_completion_updates();
@@ -4831,7 +4833,7 @@ async fn run_tui(
         app.finish_transcription_if_ready().await?;
         app.refresh_process_dialog();
         app.update_drag_autoscroll();
-        app.spinner = app.spinner.wrapping_add(1);
+        advance_spinner_if_due(&mut app.spinner, &mut last_spinner_tick, Instant::now());
         terminal.draw(|frame| render(frame, &mut app))?;
 
         if app.should_quit && !app.is_busy() {
@@ -4839,7 +4841,7 @@ async fn run_tui(
         }
         collect_terminal_events(
             &mut terminal_events,
-            Duration::from_millis(70),
+            TUI_TICK_RATE,
             event::poll,
             event::read,
         )?;
@@ -4867,6 +4869,13 @@ async fn run_tui(
     }
     app.conversations.shutdown_all().await?;
     Ok(session_id.to_string())
+}
+
+fn advance_spinner_if_due(spinner: &mut usize, last_tick: &mut Instant, now: Instant) {
+    if now.saturating_duration_since(*last_tick) >= TUI_TICK_RATE {
+        *spinner = spinner.wrapping_add(1);
+        *last_tick = now;
+    }
 }
 
 fn collect_terminal_events(
@@ -7841,6 +7850,37 @@ mod tests {
 
         assert_eq!(events.len(), MAX_TERMINAL_EVENTS_PER_FRAME);
         assert_eq!(pending.borrow().len(), 5);
+    }
+
+    #[test]
+    fn spinner_speed_depends_on_elapsed_time_not_event_loop_iterations() {
+        let start = Instant::now();
+        let mut last_tick = start;
+        let mut spinner = 0;
+
+        for _ in 0..1_000 {
+            advance_spinner_if_due(
+                &mut spinner,
+                &mut last_tick,
+                start + TUI_TICK_RATE - Duration::from_millis(1),
+            );
+        }
+        assert_eq!(spinner, 0);
+
+        advance_spinner_if_due(&mut spinner, &mut last_tick, start + TUI_TICK_RATE);
+        assert_eq!(spinner, 1);
+
+        for _ in 0..1_000 {
+            advance_spinner_if_due(&mut spinner, &mut last_tick, start + TUI_TICK_RATE);
+        }
+        assert_eq!(spinner, 1);
+
+        advance_spinner_if_due(
+            &mut spinner,
+            &mut last_tick,
+            start + TUI_TICK_RATE + TUI_TICK_RATE,
+        );
+        assert_eq!(spinner, 2);
     }
 
     fn test_registry(root: &Path) -> SessionRegistry {
