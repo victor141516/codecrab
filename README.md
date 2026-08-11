@@ -23,7 +23,7 @@ CodeCrab keeps final responses concise by default while adapting when the user r
 - ⚡ **Live, transparent progress** — stream assistant text and structured reads, searches, edits, commands, retries, and other tool activity as they happen.
 - 🧵 **Managed background processes** — see per-session process counts, inspect styled live output, jump to the originating shell activity, and stop a process tree from either client.
 - 🧭 **Web code explorer and diffs** — optionally embed a managed `code-server`, follow edits live, and inspect per-operation or complete turn changes.
-- 💾 **Persistent sessions** — resume conversations with their messages, tool history, model settings, terminals, goals, and project context intact.
+- 💾 **Persistent sessions** — resume, rename, pin, and archive conversations with their messages, tool history, model settings, terminals, goals, and project context intact.
 - 🌿 **Conversation branches** — edit an earlier prompt, preview alternate paths, and switch branches without losing history.
 - 🎯 **Long-running goals** — give CodeCrab an objective and let it continue across turns until it verifies completion or reports a blocker.
 - 🗓️ **Scheduled agent tasks** — run recurring or delayed prompts through a persistent, hot-reloaded cron daemon, with execution history in both clients.
@@ -47,7 +47,7 @@ The table below compares the user-facing capabilities documented in this README 
 | Streaming and tool activity | Persists and streams assistant deltas, retries, progress, and typed tool lifecycle events in exact order to TUI and web. | Streams typed thread, turn, item, plan, diff, approval, and tool events through app-server and clients. | Both are live and structured; Codex exposes a broader event taxonomy for integrations. |
 | File editing and diffs | Reads, writes, and performs exact replacements; the web client can follow edits and open Git-backed operation diffs or accumulated turn changes through a managed `code-server`. | Adds `apply_patch`, aggregated turn diffs, `/diff`, and `codex apply`. | Both expose first-class diffs; CodeCrab uses its optional embedded web IDE while Codex integrates the workflow directly into its clients. |
 | Shell and persistent PTYs | Supports non-interactive commands and conversation-scoped PTYs with text, paste, key, mouse, resize, observation, styled live output, origin navigation, per-session counts, and termination through `/processes`. | Supports PTYs, background processes, stdin, resize, termination, `/ps`, and `/stop`. | Both expose persistent process management through their terminal and graphical clients. |
-| Persistent sessions | Saves cross-project sessions, live workers, activities, model state, terminals, branches, goals, and URL-addressable web navigation. | Adds rename, archive, search, filters, sections, manual ordering, pagination, and session forks. | CodeCrab covers persistence and concurrent work; Codex provides richer session organization. |
+| Persistent sessions | Saves cross-project sessions, live workers, activities, model state, terminals, branches, goals, editable titles, pins, archives, and URL-addressable web navigation. | Adds search, filters, sections, manual ordering, pagination, and session forks. | CodeCrab covers persistent metadata and concurrent work; Codex provides richer large-catalog organization. |
 | Conversation branches | Keeps a non-destructive tree inside one session, with message editing and reversible preview in TUI and web. | Provides `/side`, `/btw`, `/fork`, in-memory forks, and forks at a selected turn. | CodeCrab emphasizes visible in-session history; Codex offers more ways to promote or isolate forks. |
 | Long-running goals and planning | Persistent goals continue automatically until the model verifies completion or reports a blocker. | Provides structured Plan mode, plan events, and multiple-choice `request_user_input`. | CodeCrab has first-class autonomous goals; Codex has richer interactive planning and decision checkpoints. |
 | Agent delegation | Creates persistent child sessions with isolated context, live observation, follow-ups, waiting, and exact-turn cancellation. | Stable subagent collaboration plus richer collaboration controls and thread navigation. | The core capability exists in both; Codex currently exposes a broader collaboration surface. |
@@ -114,7 +114,7 @@ codecrab -C path/to/project
 
 ## Choose your interface
 
-All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists include a global **No project** group followed by project groups, and each group is arranged as a tree: roots and siblings are ordered by creation time, newest first, while children stay beneath their parent. Activity updates do not move an existing session. The terminal picker shows creation (`C`) and last-update (`U`) times, while the denser web sidebar keeps each session to one title row. `codecrab sessions` prints `PARENT`, `CREATED`, and `UPDATED` columns. `codecrab resume` without an ID still resumes the most recently updated session.
+All three modes use the same agent, providers, tools, skills, instructions, sessions, and model-selection behavior. Session lists include a global **No project** group followed by project groups, and each group is arranged as a tree: roots and siblings are ordered by creation time, newest first, while children stay beneath their parent. Activity and metadata updates do not move an existing session. Pinned shortcuts appear first in each project, ordered by pin time, while archived trees live in a collapsed section ordered by archive time. The terminal picker shows creation (`C`) and last-update (`U`) times, while the denser web sidebar keeps each session to one title row. `codecrab sessions` prints `PARENT`, `PINNED`, `ARCHIVED`, `CREATED`, and `UPDATED` columns. `codecrab resume` without an ID still considers archived sessions and resumes the most recently updated session.
 
 ### Interactive terminal
 
@@ -227,7 +227,9 @@ codecrab resume
 codecrab resume <session-id-or-prefix>
 ```
 
-The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy, including the top-level **No project** group. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches. On desktop, the web sidebar can be hidden completely from its header and reopened from the workspace header; that browser-local preference survives reloads, while the compact mobile drawer remains transient. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact `child of` hint. Deleting a parent does not delete or rewrite its descendants.
+The terminal `/sessions` view and web sidebar both expose the complete project/session hierarchy, including the top-level **No project** group. Child sessions are indented recursively; parents use disclosure chevrons and show the number of hidden descendants when collapsed. In the terminal, left/right collapse and expand projects or session branches, `R` renames, `P` toggles a pin, and `A` archives or restores the selected session. The web edits a title directly and keeps pin and archive buttons visible on every session row. A manual title is permanent, trimmed, non-empty, limited to 120 characters, and unaffected by later edits to the first message.
+
+Pinned child sessions remain in their canonical tree and also appear as contextual shortcuts at the start of the project. Archiving is organizational only: it does not pause workers, goals, cron runs, or processes, change conversation recency, close the active session, or exclude it from an implicit resume. Archiving a parent hides its descendants through an inherited state without overwriting their own archive metadata. On desktop, the web sidebar can be hidden completely from its header and reopened from the workspace header; that browser-local preference survives reloads, while the compact mobile drawer remains transient. Collapsing a branch is visual only and never pauses its workers. Children whose parent is missing or belongs to another project remain roots in their own project with a compact parent-path hint. Deleting a parent does not delete or rewrite its descendants.
 
 Deleting a session with active managed processes requires one confirmation covering all of them. Accepting stops every managed process tree before deleting; declining leaves both the processes and session untouched. The terminal asks the same question before exiting while managed processes are active.
 
@@ -255,7 +257,7 @@ Because browser uploads write files on the CodeCrab host, the existing server wa
 | `/models` | Choose a provider-returned model, reasoning level, and speed |
 | `/processes` | Inspect and stop managed shell processes in the current session |
 | `/skills` | Browse installed Agent Skills |
-| `/sessions` | Browse, resume, or delete sessions across projects |
+| `/sessions` | Browse, resume, rename, pin, archive, restore, or delete sessions across projects |
 | `/no-project` | Start a new session without a project |
 | `/cron` | Browse, run, pause, edit, or delete scheduled agent tasks |
 | `/branches` | Preview and select conversation branches |
@@ -517,6 +519,7 @@ With ChatGPT OAuth, dictation uses ChatGPT's private subscription transcription 
 | `POST` | `/api/branches/select` | Select and persist a conversation path |
 | `POST` | `/api/sessions` | Create and select a session in a project |
 | `GET` | `/api/sessions/stream` | Stream the live session catalog, worker lifecycle, transcripts, and activities |
+| `PUT` | `/api/sessions/metadata` | Rename, pin/unpin, or archive/restore one session |
 | `POST` | `/api/sessions/delete` | Delete a session |
 | `POST` | `/api/sessions/resume` | Resolve and resume a session across registered projects |
 | `GET` | `/api/directories` | Browse directories on the backend host |

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ use crate::{
     },
     session::{
         CompactionCheckpoint, CompactionTrigger, ConversationTree, GoalStatus, RequestUsage,
-        Session, SessionScope, SessionStore, TurnOutcome,
+        Session, SessionMetadataUpdate, SessionScope, SessionStore, TurnOutcome,
     },
     skills::{Skill, SkillRegistry},
     terminal::TerminalManager,
@@ -408,6 +408,14 @@ impl Agent {
         self.session.select_branch(node_id)
     }
 
+    pub(crate) fn update_session_metadata(
+        &mut self,
+        update: SessionMetadataUpdate,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.session.update_metadata(update, now)
+    }
+
     async fn turn_inner(
         &mut self,
         prompt: &str,
@@ -429,7 +437,11 @@ impl Agent {
         } else {
             self.user_message(prompt, bindings)?
         };
-        if self.session.messages.is_empty() && !hidden_prompt && edit_node_id.is_none() {
+        if self.session.messages.is_empty()
+            && !self.session.manual_title
+            && !hidden_prompt
+            && edit_node_id.is_none()
+        {
             self.session.title = prompt.chars().take(72).collect();
         }
         let turn_message_id = if let Some(node_id) = edit_node_id {

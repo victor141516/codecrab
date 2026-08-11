@@ -10,6 +10,7 @@ import {
 } from "vue";
 import {
   ArrowUp,
+  Archive,
   CalendarClock,
   Check,
   CircleStop,
@@ -35,6 +36,7 @@ import {
   PanelLeftClose,
   PanelRight,
   Pencil,
+  Pin,
   Play,
   ScanLine,
   Plus,
@@ -148,6 +150,9 @@ const autocomplete = ref(null);
 const autocompleteSelection = ref(0);
 const expandedProjects = ref(new Set());
 const collapsedSessions = ref(new Set());
+const expandedArchivedProjects = ref(new Set());
+const editingSessionRowKey = ref(null);
+const editingSessionTitle = ref("");
 const projectPickerOpen = ref(false);
 const directoryListing = ref(null);
 const directoryPathDraft = ref("");
@@ -1085,6 +1090,55 @@ async function deleteSession(project, id, activeTerminalCount = 0) {
   }
 }
 
+async function updateSessionMetadata(project, id, patch) {
+  error.value = "";
+  try {
+    const nextState = await api("/api/sessions/metadata", {
+      method: "PUT",
+      body: JSON.stringify({ project, id, ...patch })
+    });
+    applyServerState(nextState);
+    return true;
+  } catch (cause) {
+    error.value = cause.message;
+    return false;
+  }
+}
+
+async function togglePinned(project, item) {
+  await updateSessionMetadata(project, item.id, { pinned: !item.pinned_at });
+}
+
+async function toggleArchived(project, item) {
+  const archived = !item.archived_at;
+  if (archived) {
+    const next = new Set(expandedArchivedProjects.value);
+    next.add(project);
+    expandedArchivedProjects.value = next;
+  }
+  await updateSessionMetadata(project, item.id, { archived });
+}
+
+function beginSessionRename(item) {
+  editingSessionRowKey.value = item.row_key;
+  editingSessionTitle.value = item.title ?? "";
+  requestAnimationFrame(() => {
+    document.querySelector(`[data-session-title-input="${item.row_key}"]`)?.select();
+  });
+}
+
+function cancelSessionRename() {
+  editingSessionRowKey.value = null;
+  editingSessionTitle.value = "";
+}
+
+async function saveSessionRename(project, item) {
+  if (editingSessionRowKey.value !== item.row_key) return;
+  const title = editingSessionTitle.value;
+  cancelSessionRename();
+  await updateSessionMetadata(project, item.id, { title });
+}
+
 function processQuery(sessionId = session.value?.id) {
   return sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
 }
@@ -1288,6 +1342,18 @@ function applyServerState(nextState, { selectActiveProject = false } = {}) {
     effective.projects ?? [],
     selectActiveProject ? effective.project : undefined
   );
+  expandArchivedForSession(effective.projects ?? [], effective.session?.id);
+}
+
+function expandArchivedForSession(projects, sessionId) {
+  if (!sessionId) return;
+  const project = projects.find((candidate) =>
+    candidate.archived_sessions?.some((item) => item.id === sessionId)
+  );
+  if (!project || expandedArchivedProjects.value.has(project.root)) return;
+  const next = new Set(expandedArchivedProjects.value);
+  next.add(project.root);
+  expandedArchivedProjects.value = next;
 }
 
 function targetState(sessionId) {
@@ -1358,6 +1424,7 @@ function applyLiveCatalog(message) {
     message.projects ?? [],
     undefined
   );
+  expandArchivedForSession(message.projects ?? [], session.value?.id);
 }
 
 function liveStateFor(view) {
@@ -1470,7 +1537,69 @@ function toggleSession(id) {
 }
 
 function visibleProjectSessions(project) {
-  return visibleSessionRows(project.sessions, collapsedSessions.value);
+  return visibleSessionRows(
+    project.active_sessions ?? project.sessions,
+    collapsedSessions.value
+  );
+}
+
+function archivedProjectExpanded(root) {
+  return expandedArchivedProjects.value.has(root);
+}
+
+function toggleArchivedProject(root) {
+  const next = new Set(expandedArchivedProjects.value);
+  if (!next.delete(root)) next.add(root);
+  expandedArchivedProjects.value = next;
+}
+
+function projectSessionRows(project) {
+  const rows = [];
+  const pinned = project.pinned_sessions ?? [];
+  const active = visibleProjectSessions(project);
+  const archived = project.archived_sessions ?? [];
+  if (pinned.length) {
+    rows.push({
+      section_header: true,
+      row_key: "pinned-header",
+      title: "Pinned",
+      count: pinned.length,
+      section: "pinned"
+    });
+    rows.push(
+      ...pinned.map((item) => ({
+        ...item,
+        row_key: `pinned:${item.id}`,
+        section: "pinned"
+      }))
+    );
+  }
+  rows.push(
+    ...active.map((item) => ({
+      ...item,
+      row_key: `active:${item.id}`,
+      section: "active"
+    }))
+  );
+  if (archived.length) {
+    rows.push({
+      section_header: true,
+      row_key: "archived-header",
+      title: "Archived",
+      count: archived.filter((item) => item.depth === 0).length,
+      section: "archived"
+    });
+    if (archivedProjectExpanded(project.root)) {
+      rows.push(
+        ...visibleSessionRows(archived, collapsedSessions.value).map((item) => ({
+          ...item,
+          row_key: `archived:${item.id}`,
+          section: "archived"
+        }))
+      );
+    }
+  }
+  return rows;
 }
 
 async function browseDirectory(path = directoryPathDraft.value) {
@@ -4739,9 +4868,29 @@ onBeforeUnmount(() => {
             >
               No sessions yet. Use + on this project to create one.
             </p>
-            <div
-              v-for="item in visibleProjectSessions(project)"
-              :key="item.id"
+            <template
+              v-for="item in projectSessionRows(project)"
+              :key="item.row_key"
+            >
+              <button
+                v-if="item.section_header"
+                class="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500"
+                :class="{ 'hover:text-zinc-300': item.section === 'archived' }"
+                :aria-expanded="item.section === 'archived' ? archivedProjectExpanded(project.root) : undefined"
+                @click="item.section === 'archived' && toggleArchivedProject(project.root)"
+              >
+                <Pin v-if="item.section === 'pinned'" class="size-3" aria-hidden="true" />
+                <ChevronDown
+                  v-else-if="archivedProjectExpanded(project.root)"
+                  class="size-3"
+                  aria-hidden="true"
+                />
+                <ChevronRight v-else class="size-3" aria-hidden="true" />
+                <span>{{ item.title }}</span>
+                <span class="font-mono text-[9px]">{{ item.count }}</span>
+              </button>
+              <div
+                v-else
               class="sidebar-session-row group/session flex w-full items-center transition"
               :class="{ 'is-current': isCurrentSession(project, item) }"
               :style="{ paddingLeft: `${item.depth * 0.75}rem` }"
@@ -4777,7 +4926,24 @@ onBeforeUnmount(() => {
                   :title="`Scheduled run ${item.scheduled_run.job_id} #${item.scheduled_run.occurrence}`"
                   aria-label="Scheduled run"
                 />
-                <span class="min-w-0 flex-1 truncate text-[13px] text-zinc-300 group-hover/session:text-white">
+                <input
+                  v-if="editingSessionRowKey === item.row_key"
+                  v-model="editingSessionTitle"
+                  :data-session-title-input="item.row_key"
+                  class="min-w-0 flex-1 rounded border border-cyan-400/40 bg-black/30 px-1.5 py-0.5 text-[13px] text-zinc-100 outline-none focus:border-cyan-300"
+                  maxlength="120"
+                  aria-label="Session title"
+                  @click.stop
+                  @keydown.enter.stop.prevent="saveSessionRename(project.root, item)"
+                  @keydown.esc.stop.prevent="cancelSessionRename"
+                  @blur="saveSessionRename(project.root, item)"
+                />
+                <span
+                  v-else
+                  class="min-w-0 flex-1 truncate text-[13px] text-zinc-300 group-hover/session:text-white"
+                  title="Click to rename"
+                  @click.stop="beginSessionRename(item)"
+                >
                   {{ item.title || "New session" }}
                 </span>
                 <span
@@ -4788,11 +4954,11 @@ onBeforeUnmount(() => {
                   +{{ item.descendant_count }}
                 </span>
                 <span
-                  v-else-if="item.depth === 0 && item.parent_session_id"
+                  v-else-if="item.depth === 0 && item.ancestor_titles?.length"
                   class="shrink-0 font-mono text-[9px] text-zinc-500"
-                  :title="`Parent session ${item.parent_session_id}`"
+                  :title="item.ancestor_titles.join(' › ')"
                 >
-                  child of {{ shortId(item.parent_session_id) }}
+                  {{ item.ancestor_titles.slice(-2).join(" › ") }}
                 </span>
                 <span
                   v-if="workerLifecycle(item.id) && workerLifecycle(item.id) !== 'idle'"
@@ -4802,6 +4968,34 @@ onBeforeUnmount(() => {
                     'bg-red-400': workerLifecycle(item.id) === 'failed'
                   }"
                   :title="workerLifecycle(item.id)"
+                />
+              </button>
+              <button
+                class="grid size-7 shrink-0 place-items-center rounded-md transition hover:bg-cyan-400/10 hover:text-cyan-200"
+                :class="item.pinned_at ? 'text-cyan-300' : 'text-zinc-600'"
+                :aria-pressed="Boolean(item.pinned_at)"
+                :aria-label="`${item.pinned_at ? 'Unpin' : 'Pin'} session ${item.title || shortId(item.id)}`"
+                :title="item.pinned_at ? 'Unpin session' : 'Pin session'"
+                @click.stop="togglePinned(project.root, item)"
+              >
+                <Pin
+                  class="size-3.5"
+                  :class="{ 'fill-current': item.pinned_at }"
+                  aria-hidden="true"
+                />
+              </button>
+              <button
+                class="grid size-7 shrink-0 place-items-center rounded-md transition hover:bg-amber-400/10 hover:text-amber-200"
+                :class="item.archived_at ? 'text-amber-300' : item.archived_by_ancestor ? 'text-amber-500/60' : 'text-zinc-600'"
+                :aria-pressed="Boolean(item.archived_at)"
+                :aria-label="`${item.archived_at ? 'Restore' : 'Archive'} session ${item.title || shortId(item.id)}`"
+                :title="item.archived_at ? 'Restore session' : item.archived_by_ancestor ? 'Archived by ancestor; archive directly' : 'Archive session'"
+                @click.stop="toggleArchived(project.root, item)"
+              >
+                <Archive
+                  class="size-3.5"
+                  :class="{ 'fill-current/20': item.archived_at }"
+                  aria-hidden="true"
                 />
               </button>
               <button
@@ -4823,7 +5017,8 @@ onBeforeUnmount(() => {
               >
                 <Trash2 class="size-3.5" aria-hidden="true" />
               </button>
-            </div>
+              </div>
+            </template>
           </div>
         </section>
       </div>

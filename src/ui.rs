@@ -54,8 +54,8 @@ use crate::{
     events::{ActivityKind, ActivityStatus, AgentActivity, AgentEvent},
     provider::{AttachmentBinding, Message, MessagePart, ModelCatalogEntry, ModelSelection, Role},
     session::{
-        AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionProject, SessionScope,
-        SessionStore, list_session_projects,
+        AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionMetadataUpdate,
+        SessionProject, SessionScope, SessionStore, SessionSummary, list_session_projects,
     },
     terminal::{TerminalOutputSnapshot, TerminalProcessState, TerminalRecord, TerminalStyle},
     transcription::Transcriber,
@@ -177,12 +177,30 @@ struct GoalButtons {
 struct SessionProjectView {
     project: SessionProject,
     expanded: bool,
+    pinned_sessions: Vec<SessionSummary>,
+    active_sessions: Vec<SessionSummary>,
+    archived_sessions: Vec<SessionSummary>,
+    archived_expanded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionPickerRow {
     Project(usize),
-    Session(usize, usize),
+    Section(usize, SessionSection),
+    Session(usize, SessionSection, usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionSection {
+    Pinned,
+    Active,
+    Archived,
+}
+
+struct SessionRename {
+    project_index: usize,
+    session_id: Uuid,
+    title: String,
 }
 
 #[derive(Clone)]
@@ -704,23 +722,62 @@ impl SessionPicker {
         for (project_index, project) in self.projects.iter().enumerate() {
             rows.push(SessionPickerRow::Project(project_index));
             if project.expanded {
-                let mut hidden_below_depth = None;
-                for (session_index, session) in project.project.sessions.iter().enumerate() {
-                    if let Some(depth) = hidden_below_depth {
-                        if session.depth > depth {
-                            continue;
-                        }
-                        hidden_below_depth = None;
-                    }
-                    rows.push(SessionPickerRow::Session(project_index, session_index));
-                    if session.descendant_count > 0 && self.collapsed_sessions.contains(&session.id)
-                    {
-                        hidden_below_depth = Some(session.depth);
+                if !project.pinned_sessions.is_empty() {
+                    rows.push(SessionPickerRow::Section(
+                        project_index,
+                        SessionSection::Pinned,
+                    ));
+                    self.append_session_rows(&mut rows, project_index, SessionSection::Pinned);
+                }
+                self.append_session_rows(&mut rows, project_index, SessionSection::Active);
+                if !project.archived_sessions.is_empty() {
+                    rows.push(SessionPickerRow::Section(
+                        project_index,
+                        SessionSection::Archived,
+                    ));
+                    if project.archived_expanded {
+                        self.append_session_rows(
+                            &mut rows,
+                            project_index,
+                            SessionSection::Archived,
+                        );
                     }
                 }
             }
         }
         rows
+    }
+
+    fn append_session_rows(
+        &self,
+        rows: &mut Vec<SessionPickerRow>,
+        project_index: usize,
+        section: SessionSection,
+    ) {
+        let mut hidden_below_depth = None;
+        for (session_index, session) in self.projects[project_index]
+            .sessions(section)
+            .iter()
+            .enumerate()
+        {
+            if let Some(depth) = hidden_below_depth {
+                if session.depth > depth {
+                    continue;
+                }
+                hidden_below_depth = None;
+            }
+            rows.push(SessionPickerRow::Session(
+                project_index,
+                section,
+                session_index,
+            ));
+            if section != SessionSection::Pinned
+                && session.descendant_count > 0
+                && self.collapsed_sessions.contains(&session.id)
+            {
+                hidden_below_depth = Some(session.depth);
+            }
+        }
     }
 
     fn selected_row(&self) -> Option<SessionPickerRow> {
@@ -737,14 +794,50 @@ impl SessionPicker {
 
     fn select_session(&mut self, project_index: usize, session_id: Uuid) {
         if let Some(index) = self.rows().iter().position(|row| {
-            matches!(
-                row,
-                SessionPickerRow::Session(project, session)
-                    if *project == project_index
-                        && self.projects[*project].project.sessions[*session].id == session_id
-            )
+            let SessionPickerRow::Session(project, section, session) = *row else {
+                return false;
+            };
+            project == project_index
+                && section != SessionSection::Pinned
+                && self.projects[project].sessions(section)[session].id == session_id
         }) {
             self.selected = index;
+        }
+    }
+
+    fn selected_session(&self) -> Option<(usize, SessionSection, usize, &SessionSummary)> {
+        let SessionPickerRow::Session(project, section, session) = self.selected_row()? else {
+            return None;
+        };
+        Some((
+            project,
+            section,
+            session,
+            &self.projects[project].sessions(section)[session],
+        ))
+    }
+}
+
+impl SessionProjectView {
+    fn new(project: SessionProject, expanded: bool, archived_expanded: bool) -> Self {
+        let pinned_sessions = project.pinned_sessions();
+        let active_sessions = project.active_sessions();
+        let archived_sessions = project.archived_sessions();
+        Self {
+            project,
+            expanded,
+            pinned_sessions,
+            active_sessions,
+            archived_sessions,
+            archived_expanded,
+        }
+    }
+
+    fn sessions(&self, section: SessionSection) -> &[SessionSummary] {
+        match section {
+            SessionSection::Pinned => &self.pinned_sessions,
+            SessionSection::Active => &self.active_sessions,
+            SessionSection::Archived => &self.archived_sessions,
         }
     }
 }
@@ -905,6 +998,7 @@ struct App {
     model_picker: Option<ModelPicker>,
     provider_picker: Option<ProviderPicker>,
     session_picker: Option<SessionPicker>,
+    session_rename: Option<SessionRename>,
     process_dialog: Option<ProcessDialog>,
     session_delete_confirm: bool,
     exit_confirm: bool,
@@ -1085,6 +1179,7 @@ impl App {
             model_picker: None,
             provider_picker: None,
             session_picker: None,
+            session_rename: None,
             process_dialog: None,
             session_delete_confirm: false,
             exit_confirm: false,
@@ -2792,13 +2887,19 @@ impl App {
             .then(|| self.conversation.snapshot().session.id);
         let projects = list_session_projects(&self.project_root, &self.registry)?
             .into_iter()
-            .map(|project| SessionProjectView {
-                expanded: match (&project.root, self.session_scope) {
+            .map(|project| {
+                let expanded = match (&project.root, self.session_scope) {
                     (None, SessionScope::NoProject) => true,
                     (Some(root), SessionScope::Project) => paths_equal(root, &self.project_root),
                     _ => false,
-                },
-                project,
+                };
+                let archived_expanded = current_id.is_some_and(|id| {
+                    project
+                        .archived_sessions()
+                        .iter()
+                        .any(|session| session.id == id)
+                });
+                SessionProjectView::new(project, expanded, archived_expanded)
             })
             .collect::<Vec<_>>();
         let mut picker = SessionPicker {
@@ -2807,11 +2908,11 @@ impl App {
             collapsed_sessions: HashSet::new(),
         };
         if let Some(selected) = picker.rows().iter().position(|row| {
-            matches!(
-                row,
-                SessionPickerRow::Session(project, session)
-                    if Some(picker.projects[*project].project.sessions[*session].id) == current_id
-            )
+            let SessionPickerRow::Session(project, section, session) = *row else {
+                return false;
+            };
+            section != SessionSection::Pinned
+                && Some(picker.projects[project].sessions(section)[session].id) == current_id
         }) {
             picker.selected = selected;
         }
@@ -2822,6 +2923,130 @@ impl App {
         self.provider_picker = None;
         self.close_completion();
         Ok(())
+    }
+
+    fn rebuild_session_picker(&mut self, selected_id: Uuid, expand_archive: bool) -> Result<()> {
+        let Some(existing) = self.session_picker.as_ref() else {
+            return Ok(());
+        };
+        let expanded = existing
+            .projects
+            .iter()
+            .filter(|project| project.expanded)
+            .map(|project| project.project.root.clone())
+            .collect::<Vec<_>>();
+        let archived_expanded = existing
+            .projects
+            .iter()
+            .filter(|project| project.archived_expanded)
+            .map(|project| project.project.root.clone())
+            .collect::<Vec<_>>();
+        let collapsed_sessions = existing.collapsed_sessions.clone();
+        let projects = list_session_projects(&self.project_root, &self.registry)?;
+        let mut picker = SessionPicker {
+            projects: projects
+                .into_iter()
+                .map(|project| {
+                    let is_expanded = expanded.iter().any(|root| match (root, &project.root) {
+                        (Some(left), Some(right)) => paths_equal(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    });
+                    let target_archived = project
+                        .archived_sessions()
+                        .iter()
+                        .any(|session| session.id == selected_id);
+                    let archive_is_expanded = (expand_archive && target_archived)
+                        || archived_expanded
+                            .iter()
+                            .any(|root| match (root, &project.root) {
+                                (Some(left), Some(right)) => paths_equal(left, right),
+                                (None, None) => true,
+                                _ => false,
+                            });
+                    SessionProjectView::new(project, is_expanded, archive_is_expanded)
+                })
+                .collect(),
+            selected: 0,
+            collapsed_sessions,
+        };
+        for project in 0..picker.projects.len() {
+            picker.select_session(project, selected_id);
+            if picker
+                .selected_session()
+                .is_some_and(|(_, _, _, session)| session.id == selected_id)
+            {
+                break;
+            }
+        }
+        self.session_picker = Some(picker);
+        Ok(())
+    }
+
+    async fn update_selected_session_metadata(
+        &mut self,
+        update: SessionMetadataUpdate,
+        expand_archive: bool,
+    ) -> Result<()> {
+        let Some((project_index, _, _, session)) = self
+            .session_picker
+            .as_ref()
+            .and_then(SessionPicker::selected_session)
+        else {
+            return Ok(());
+        };
+        let id = session.id;
+        let root = self.session_picker.as_ref().unwrap().projects[project_index]
+            .project
+            .root
+            .clone();
+        if let Some(conversation) = self.conversations.get(id) {
+            conversation.update_metadata(update).await?;
+        } else {
+            let store =
+                SessionStore::for_project_root_in(root.as_deref(), &self.registry.data_dir()?)?;
+            let mut session = store.load(Some(&id.to_string()))?;
+            session.update_metadata(update, chrono::Utc::now())?;
+            store.save(&session)?;
+        }
+        self.rebuild_session_picker(id, expand_archive)?;
+        Ok(())
+    }
+
+    fn begin_session_rename(&mut self) {
+        let Some((project_index, _, _, session)) = self
+            .session_picker
+            .as_ref()
+            .and_then(SessionPicker::selected_session)
+        else {
+            return;
+        };
+        self.session_rename = Some(SessionRename {
+            project_index,
+            session_id: session.id,
+            title: session.title.clone(),
+        });
+    }
+
+    async fn finish_session_rename(&mut self) -> Result<()> {
+        let Some(rename) = self.session_rename.take() else {
+            return Ok(());
+        };
+        let title = rename.title.trim().to_owned();
+        if title.is_empty() {
+            self.error = Some("Session title cannot be empty.".into());
+            return Ok(());
+        }
+        if title.chars().count() > 120 {
+            self.error = Some("Session title cannot exceed 120 characters.".into());
+            return Ok(());
+        }
+        let Some(picker) = self.session_picker.as_mut() else {
+            return Ok(());
+        };
+        picker.select_session(rename.project_index, rename.session_id);
+        self.update_selected_session_metadata(SessionMetadataUpdate::Rename(title), false)
+            .await
     }
 
     fn move_session_selection(&mut self, delta: isize) {
@@ -2840,8 +3065,8 @@ impl App {
             return;
         };
         match picker.selected_row() {
-            Some(SessionPickerRow::Session(project, session_index)) => {
-                let session = &picker.projects[project].project.sessions[session_index];
+            Some(SessionPickerRow::Session(project, section, session_index)) => {
+                let session = &picker.projects[project].sessions(section)[session_index];
                 let id = session.id;
                 let parent = session.parent_session_id;
                 let depth = session.depth;
@@ -2856,6 +3081,10 @@ impl App {
                     picker.select_project(project);
                 }
             }
+            Some(SessionPickerRow::Section(project, SessionSection::Archived)) => {
+                picker.projects[project].archived_expanded = false;
+            }
+            Some(SessionPickerRow::Section(project, _)) => picker.select_project(project),
             Some(SessionPickerRow::Project(project)) if picker.projects[project].expanded => {
                 picker.projects[project].expanded = false;
                 picker.select_project(project);
@@ -2873,8 +3102,11 @@ impl App {
                 picker.projects[project].expanded = true;
                 picker.select_project(project);
             }
-            Some(SessionPickerRow::Session(project, session_index)) => {
-                let id = picker.projects[project].project.sessions[session_index].id;
+            Some(SessionPickerRow::Section(project, SessionSection::Archived)) => {
+                picker.projects[project].archived_expanded = true;
+            }
+            Some(SessionPickerRow::Session(project, section, session_index)) => {
+                let id = picker.projects[project].sessions(section)[session_index].id;
                 if picker.collapsed_sessions.remove(&id) {
                     picker.select_session(project, id);
                 }
@@ -2891,14 +3123,17 @@ impl App {
         else {
             return Ok(());
         };
-        let SessionPickerRow::Session(project_index, session_index) = row else {
+        let SessionPickerRow::Session(project_index, section, session_index) = row else {
             self.move_session_right();
             return Ok(());
         };
         let (root, id) = {
             let picker = self.session_picker.as_ref().unwrap();
             let project = &picker.projects[project_index].project;
-            (project.root.clone(), project.sessions[session_index].id)
+            (
+                project.root.clone(),
+                picker.projects[project_index].sessions(section)[session_index].id,
+            )
         };
         self.park_current_turn();
         let mut catalog_error = None;
@@ -3058,10 +3293,10 @@ impl App {
     }
 
     async fn delete_session_selection(&mut self) -> Result<()> {
-        let Some(SessionPickerRow::Session(project_index, session_index)) = self
+        let Some((project_index, _, _, selected_session)) = self
             .session_picker
             .as_ref()
-            .and_then(SessionPicker::selected_row)
+            .and_then(SessionPicker::selected_session)
         else {
             return Ok(());
         };
@@ -3069,7 +3304,7 @@ impl App {
         let (root, id) = {
             let picker = self.session_picker.as_ref().unwrap();
             let project = &picker.projects[project_index].project;
-            (project.root.clone(), project.sessions[session_index].id)
+            (project.root.clone(), selected_session.id)
         };
         let active_terminals = self
             .conversations
@@ -3150,16 +3385,36 @@ impl App {
             .as_ref()
             .map(|picker| picker.collapsed_sessions.clone())
             .unwrap_or_default();
+        let archived_expanded = self
+            .session_picker
+            .as_ref()
+            .map(|picker| {
+                picker
+                    .projects
+                    .iter()
+                    .filter(|project| project.archived_expanded)
+                    .map(|project| project.project.root.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut picker = SessionPicker {
             projects: projects
                 .into_iter()
-                .map(|project| SessionProjectView {
-                    expanded: expanded.iter().any(|root| match (root, &project.root) {
+                .map(|project| {
+                    let is_expanded = expanded.iter().any(|root| match (root, &project.root) {
                         (Some(left), Some(right)) => paths_equal(left, right),
                         (None, None) => true,
                         _ => false,
-                    }),
-                    project,
+                    });
+                    let archive_is_expanded =
+                        archived_expanded
+                            .iter()
+                            .any(|root| match (root, &project.root) {
+                                (Some(left), Some(right)) => paths_equal(left, right),
+                                (None, None) => true,
+                                _ => false,
+                            });
+                    SessionProjectView::new(project, is_expanded, archive_is_expanded)
                 })
                 .collect(),
             selected: 0,
@@ -4098,6 +4353,37 @@ impl App {
             }
             return Ok(());
         }
+        if self.session_rename.is_some() {
+            match key.code {
+                KeyCode::Enter => self.finish_session_rename().await?,
+                KeyCode::Esc => self.session_rename = None,
+                KeyCode::Backspace => {
+                    if let Some(rename) = self.session_rename.as_mut() {
+                        rename.title.pop();
+                    }
+                }
+                KeyCode::Char('u' | 'U')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(rename) = self.session_rename.as_mut() {
+                        rename.title.clear();
+                    }
+                }
+                KeyCode::Char(value)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(rename) = self.session_rename.as_mut()
+                        && rename.title.chars().count() < 120
+                    {
+                        rename.title.push(value);
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.session_delete_confirm {
             match key.code {
                 KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
@@ -4245,6 +4531,33 @@ impl App {
                 KeyCode::Left => self.move_session_left(),
                 KeyCode::Right => self.move_session_right(),
                 KeyCode::Enter => self.accept_session_selection().await?,
+                KeyCode::Char('r' | 'R') => self.begin_session_rename(),
+                KeyCode::Char('p' | 'P') => {
+                    if let Some((_, _, _, session)) = self
+                        .session_picker
+                        .as_ref()
+                        .and_then(SessionPicker::selected_session)
+                    {
+                        self.update_selected_session_metadata(
+                            SessionMetadataUpdate::SetPinned(session.pinned_at.is_none()),
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+                KeyCode::Char('a' | 'A') => {
+                    if let Some((_, _, _, session)) = self
+                        .session_picker
+                        .as_ref()
+                        .and_then(SessionPicker::selected_session)
+                    {
+                        self.update_selected_session_metadata(
+                            SessionMetadataUpdate::SetArchived(session.archived_at.is_none()),
+                            true,
+                        )
+                        .await?;
+                    }
+                }
                 KeyCode::Delete | KeyCode::Backspace => self.delete_session_selection().await?,
                 KeyCode::Esc => self.session_picker = None,
                 _ => {}
@@ -4602,6 +4915,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.session_picker.is_some() {
         render_session_picker(frame, app, area);
+    }
+    if app.session_rename.is_some() {
+        render_session_rename(frame, app, area);
     }
     if app.goal_picker.is_some() {
         render_goal_picker(frame, app, area);
@@ -6456,7 +6772,7 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .then(|| app.conversation.snapshot().session.id);
     let mut lines = vec![
         Line::from(Span::styled(
-            "↑↓ select  •  ← parent/collapse  •  → expand  •  Enter resume  •  Del delete",
+            "↑↓ select  •  Enter resume  •  R rename  •  P pin  •  A archive  •  Del delete",
             Style::default().fg(MUTED),
         )),
         Line::default(),
@@ -6502,9 +6818,42 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ),
                 ])
             }
-            SessionPickerRow::Session(project_index, session_index) => {
-                let session = &picker.projects[project_index].project.sessions[session_index];
-                let collapsed = picker.collapsed_sessions.contains(&session.id);
+            SessionPickerRow::Section(project_index, section) => {
+                let project = &picker.projects[project_index];
+                let (icon, title, count) = match section {
+                    SessionSection::Pinned => ("󰐃", "Pinned", project.pinned_sessions.len()),
+                    SessionSection::Active => ("", "Sessions", project.active_sessions.len()),
+                    SessionSection::Archived => (
+                        if project.archived_expanded {
+                            "▾"
+                        } else {
+                            "▸"
+                        },
+                        "Archived",
+                        project
+                            .archived_sessions
+                            .iter()
+                            .filter(|session| session.depth == 0)
+                            .count(),
+                    ),
+                };
+                Line::from(vec![
+                    Span::styled(
+                        if selected { " › " } else { "   " },
+                        Style::default().fg(CRAB),
+                    ),
+                    Span::styled(
+                        format!("  {icon} {title}  {count}"),
+                        Style::default()
+                            .fg(if selected { Color::White } else { MUTED })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            }
+            SessionPickerRow::Session(project_index, section, session_index) => {
+                let session = &picker.projects[project_index].sessions(section)[session_index];
+                let collapsed = section != SessionSection::Pinned
+                    && picker.collapsed_sessions.contains(&session.id);
                 let active_group = match (
                     &picker.projects[project_index].project.root,
                     app.session_scope,
@@ -6555,6 +6904,26 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ),
                     Span::styled(if active { "● " } else { "  " }, Style::default().fg(AQUA)),
                     Span::styled(
+                        if session.pinned_at.is_some() {
+                            "󰐃 "
+                        } else {
+                            "  "
+                        },
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        if session.archived_at.is_some() || session.archived_by_ancestor {
+                            "󰀼 "
+                        } else {
+                            "  "
+                        },
+                        Style::default().fg(if session.archived_at.is_some() {
+                            Color::Yellow
+                        } else {
+                            MUTED
+                        }),
+                    ),
+                    Span::styled(
                         format!("{:<20}", compact_text(&session_title, 19)),
                         Style::default()
                             .fg(if selected { Color::White } else { AQUA })
@@ -6573,12 +6942,22 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled(
                         if collapsed {
                             format!(" +{} ", session.descendant_count)
-                        } else if session.depth == 0 {
-                            session
-                                .parent_session_id
-                                .map_or_else(String::new, |parent| {
-                                    format!(" child of {} ", &parent.to_string()[..8])
-                                })
+                        } else if session.depth == 0 && !session.ancestor_titles.is_empty() {
+                            format!(
+                                " via {} ",
+                                compact_text(
+                                    &session
+                                        .ancestor_titles
+                                        .iter()
+                                        .rev()
+                                        .take(2)
+                                        .rev()
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(" › "),
+                                    18,
+                                )
+                            )
                         } else {
                             String::new()
                         },
@@ -6618,6 +6997,36 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         picker.projects.len(),
                         session_count
                     ),
+                    Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        popup,
+    );
+}
+
+fn render_session_rename(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(rename) = &app.session_rename else {
+        return;
+    };
+    let popup = centered_rect(area, 66, 7);
+    frame.render_widget(Clear, popup);
+    let text = format!("{}█", rename.title);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(text),
+            Line::default(),
+            Line::from(Span::styled(
+                "Enter save  •  Esc cancel  •  Ctrl+U clear",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(CRAB))
+                .title(Span::styled(
+                    " Rename session ",
                     Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
                 )),
         ),
@@ -7248,8 +7657,8 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
                 .unwrap_or_else(|| "No project".into())
         );
         println!(
-            "  {:<10}  {:<10}  {:<20}  {:<20}  {:<18}  TITLE",
-            "ID", "PARENT", "CREATED", "UPDATED", "MODEL"
+            "  {:<10}  {:<10}  {:<6}  {:<8}  {:<20}  {:<20}  {:<18}  TITLE",
+            "ID", "PARENT", "PINNED", "ARCHIVED", "CREATED", "UPDATED", "MODEL"
         );
         for session in &project.sessions {
             let parent = session
@@ -7257,9 +7666,21 @@ pub(crate) fn print_sessions(projects: &[SessionProject]) {
                 .map(|id| id.to_string()[..8].to_owned())
                 .unwrap_or_else(|| "-".into());
             println!(
-                "  {:<10}  {:<10}  {:<20}  {:<20}  {:<18}  {}{}",
+                "  {:<10}  {:<10}  {:<6}  {:<8}  {:<20}  {:<20}  {:<18}  {}{}",
                 &session.id.to_string()[..8],
                 parent,
+                if session.pinned_at.is_some() {
+                    "yes"
+                } else {
+                    "-"
+                },
+                if session.archived_at.is_some() {
+                    "direct"
+                } else if session.archived_by_ancestor {
+                    "inherited"
+                } else {
+                    "-"
+                },
                 session.created_at.format("%Y-%m-%d %H:%M"),
                 session.updated_at.format("%Y-%m-%d %H:%M"),
                 session.model,
@@ -10138,8 +10559,8 @@ mod tests {
             .position(|row| {
                 matches!(
                     row,
-                    SessionPickerRow::Session(project, session)
-                        if app.session_picker.as_ref().unwrap().projects[*project].project.sessions[*session].id
+                    SessionPickerRow::Session(project, section, session)
+                        if app.session_picker.as_ref().unwrap().projects[*project].sessions(*section)[*session].id
                             == snapshot.session.id
                 )
             })
@@ -10216,7 +10637,7 @@ mod tests {
         assert!(picker.projects[current_project].expanded);
         assert!(matches!(
             picker.selected_row(),
-            Some(SessionPickerRow::Session(project, _)) if project == current_project
+            Some(SessionPickerRow::Session(project, _, _)) if project == current_project
         ));
 
         app.move_session_left();
@@ -10236,19 +10657,19 @@ mod tests {
         app.move_session_selection(1);
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Session(project, _)) if project == other_project
+            Some(SessionPickerRow::Session(project, _, _)) if project == other_project
         ));
         let picker = app.session_picker.as_ref().unwrap();
         let selected = picker.selected_row().unwrap();
-        let SessionPickerRow::Session(_, selected_index) = selected else {
+        let SessionPickerRow::Session(_, section, selected_index) = selected else {
             unreachable!();
         };
         assert_eq!(
-            picker.projects[other_project].project.sessions[selected_index].id,
+            picker.projects[other_project].sessions(section)[selected_index].id,
             saved.id
         );
         assert_eq!(
-            picker.projects[other_project].project.sessions[selected_index].descendant_count,
+            picker.projects[other_project].sessions(section)[selected_index].descendant_count,
             2
         );
 
@@ -10266,7 +10687,7 @@ mod tests {
                 .unwrap()
                 .rows()
                 .iter()
-                .filter(|row| matches!(row, SessionPickerRow::Session(project, _) if *project == other_project))
+                .filter(|row| matches!(row, SessionPickerRow::Session(project, _, _) if *project == other_project))
                 .count(),
             1
         );
@@ -10307,8 +10728,8 @@ mod tests {
         app.move_session_selection(1);
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Session(project, session))
-                if project == other_project && app.session_picker.as_ref().unwrap().projects[other_project].project.sessions[session].id == child.id
+            Some(SessionPickerRow::Session(project, section, session))
+                if project == other_project && app.session_picker.as_ref().unwrap().projects[other_project].sessions(section)[session].id == child.id
         ));
         app.move_session_left();
         assert!(
@@ -10321,8 +10742,8 @@ mod tests {
         app.move_session_left();
         assert!(matches!(
             app.session_picker.as_ref().unwrap().selected_row(),
-            Some(SessionPickerRow::Session(project, session))
-                if project == other_project && app.session_picker.as_ref().unwrap().projects[other_project].project.sessions[session].id == saved.id
+            Some(SessionPickerRow::Session(project, section, session))
+                if project == other_project && app.session_picker.as_ref().unwrap().projects[other_project].sessions(section)[session].id == saved.id
         ));
 
         app.accept_session_selection().await.unwrap();
@@ -10357,8 +10778,8 @@ mod tests {
                 .position(|row| {
                     matches!(
                         row,
-                        SessionPickerRow::Session(project, session)
-                            if picker.projects[*project].project.sessions[*session].id == saved.id
+                        SessionPickerRow::Session(project, section, session)
+                            if picker.projects[*project].sessions(*section)[*session].id == saved.id
                     )
                 })
                 .unwrap()
@@ -10374,5 +10795,69 @@ mod tests {
         assert!(replacement.messages.is_empty());
         assert!(other_store.load(Some(&saved.id.to_string())).is_err());
         assert!(app.session_picker.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_picker_shortcuts_edit_persistent_metadata_without_changing_recency() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = test_app(&root);
+        let id = app.conversation.snapshot().session.id;
+        let updated_at = app.conversation.snapshot().session.updated_at;
+        app.open_session_picker().await.unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        for character in "Renamed session".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let persisted = SessionStore::new(&root)
+            .unwrap()
+            .load(Some(&id.to_string()))
+            .unwrap();
+        assert_eq!(persisted.title, "Renamed session");
+        assert!(persisted.manual_title);
+        assert!(persisted.pinned_at.is_some());
+        assert!(persisted.archived_at.is_some());
+        assert_eq!(persisted.updated_at, updated_at);
+        let picker = app.session_picker.as_ref().unwrap();
+        assert!(picker.projects.iter().any(|project| {
+            project.archived_expanded
+                && project
+                    .archived_sessions
+                    .iter()
+                    .any(|session| session.id == id)
+        }));
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Archived"));
+        assert!(text.contains("Renamed session"));
+        assert!(text.contains("󰐃"));
+        assert!(text.contains("󰀼"));
     }
 }

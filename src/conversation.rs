@@ -24,7 +24,7 @@ use crate::{
     provider::{
         AttachmentBinding, Message, ModelCatalogEntry, ModelSelection, OpenAiCompatible, Role,
     },
-    session::{GoalStatus, Session, SessionStore, TurnOutcome},
+    session::{GoalStatus, Session, SessionMetadataUpdate, SessionStore, TurnOutcome},
     skills::{Skill, SkillRegistry},
     terminal::{TerminalManager, TerminalOutputSnapshot, TerminalRecord},
 };
@@ -181,6 +181,7 @@ pub(crate) struct ObservedGoal {
 pub(crate) struct ConversationObservation {
     pub revision: u64,
     pub title: String,
+    pub manual_title: bool,
     pub lifecycle: ConversationLifecycle,
     pub active_turn_started_at: Option<DateTime<Utc>>,
     pub latest_event_at: DateTime<Utc>,
@@ -298,6 +299,10 @@ enum ConversationCommand {
     DeleteGoal {
         id: Uuid,
         reply: oneshot::Sender<Result<Option<ConversationSnapshot>>>,
+    },
+    UpdateMetadata {
+        update: SessionMetadataUpdate,
+        reply: oneshot::Sender<Result<ConversationSnapshot>>,
     },
     Persist {
         reply: oneshot::Sender<Result<ConversationSnapshot>>,
@@ -751,6 +756,17 @@ impl ConversationHandle {
         receive(response, "deleting a goal").await?
     }
 
+    pub(crate) async fn update_metadata(
+        &self,
+        update: SessionMetadataUpdate,
+    ) -> Result<ConversationSnapshot> {
+        self.request_snapshot_command(
+            |reply| ConversationCommand::UpdateMetadata { update, reply },
+            "updating session metadata",
+        )
+        .await
+    }
+
     pub(crate) async fn persist(&self) -> Result<ConversationSnapshot> {
         self.request_snapshot_command(
             |reply| ConversationCommand::Persist { reply },
@@ -1084,6 +1100,28 @@ async fn run_worker(
                 reply_optional_snapshot(changed, &agent, &registry, &snapshots, reply);
                 false
             }
+            ConversationCommand::UpdateMetadata { update, reply } => {
+                let result = agent
+                    .update_session_metadata(update, Utc::now())
+                    .and_then(|()| persist(&agent, &registry).map(|()| snapshot(&agent)));
+                if let Ok(current) = &result {
+                    let _ = snapshots.send(current.clone());
+                    let observation_revision = reconcile_metadata_observation(
+                        &observation,
+                        &observation_hub,
+                        current,
+                        ConversationLifecycle::from_u8(lifecycle.load(Ordering::Acquire)),
+                    );
+                    live_hub.publish(
+                        session_id,
+                        project_root.clone(),
+                        observation_revision,
+                        ConversationLiveEvent::Snapshot,
+                    );
+                }
+                let _ = reply.send(result);
+                false
+            }
             ConversationCommand::Persist { reply } => {
                 reply_snapshot(&agent, &registry, &snapshots, reply);
                 false
@@ -1153,7 +1191,8 @@ fn apply_agent_event(
 ) -> u64 {
     update_observation(observation, hub, |observation| match event {
         AgentEvent::UserMessage(message) => {
-            if observation.messages.is_empty()
+            if !observation.manual_title
+                && observation.messages.is_empty()
                 && let Some(content) = message.content.as_deref()
             {
                 observation.title = content.chars().take(72).collect();
@@ -1264,6 +1303,28 @@ fn reconcile_observation(
     })
 }
 
+fn reconcile_metadata_observation(
+    observation: &Arc<Mutex<ConversationObservation>>,
+    hub: &ObservationHub,
+    snapshot: &ConversationSnapshot,
+    lifecycle: ConversationLifecycle,
+) -> u64 {
+    let revision = {
+        let mut observation = observation
+            .lock()
+            .expect("conversation observation mutex poisoned");
+        let next_revision = observation.revision.saturating_add(1);
+        let latest_event_at = observation.latest_event_at;
+        let catalog_error = observation.catalog_error.clone();
+        *observation = observation_from_snapshot(snapshot, lifecycle, next_revision);
+        observation.latest_event_at = latest_event_at;
+        observation.catalog_error = catalog_error;
+        next_revision
+    };
+    hub.publish();
+    revision
+}
+
 fn observation_from_snapshot(
     snapshot: &ConversationSnapshot,
     lifecycle: ConversationLifecycle,
@@ -1303,6 +1364,7 @@ fn observation_from_snapshot(
     ConversationObservation {
         revision,
         title: session.title.clone(),
+        manual_title: session.manual_title,
         lifecycle,
         active_turn_started_at: (lifecycle == ConversationLifecycle::Running)
             .then(|| session.turns.last().map(|turn| turn.started_at))
@@ -1468,6 +1530,11 @@ impl ConversationManager {
             .expect("conversation manager lock poisoned")
             .get(&id)
             .cloned()
+    }
+
+    pub(crate) fn publish_catalog_change(&self, id: Uuid, project_root: PathBuf) {
+        self.live_hub
+            .publish(id, project_root, 0, ConversationLiveEvent::Snapshot);
     }
 
     pub(crate) fn statuses(&self) -> Vec<ConversationStatus> {

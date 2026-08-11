@@ -484,6 +484,12 @@ pub(crate) struct Session {
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
     pub title: String,
+    #[serde(default)]
+    pub manual_title: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
     #[serde(rename = "conversation")]
     pub messages: ConversationTree,
     pub activities: Vec<AgentActivity>,
@@ -517,6 +523,13 @@ pub(crate) enum SessionScope {
     NoProject,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum SessionMetadataUpdate {
+    Rename(String),
+    SetPinned(bool),
+    SetArchived(bool),
+}
+
 fn default_provider() -> String {
     crate::config::DEFAULT_PROVIDER.into()
 }
@@ -526,6 +539,41 @@ fn default_next_terminal_id() -> u64 {
 }
 
 impl Session {
+    pub(crate) fn update_metadata(
+        &mut self,
+        update: SessionMetadataUpdate,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        match update {
+            SessionMetadataUpdate::Rename(title) => self.rename(&title),
+            SessionMetadataUpdate::SetPinned(pinned) => {
+                if self.pinned_at.is_some() != pinned {
+                    self.pinned_at = pinned.then_some(now);
+                }
+                Ok(())
+            }
+            SessionMetadataUpdate::SetArchived(archived) => {
+                if self.archived_at.is_some() != archived {
+                    self.archived_at = archived.then_some(now);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn rename(&mut self, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            anyhow::bail!("session title is empty");
+        }
+        if title.chars().count() > 120 {
+            anyhow::bail!("session title exceeds 120 characters");
+        }
+        self.title = title.to_owned();
+        self.manual_title = true;
+        Ok(())
+    }
+
     pub(crate) fn reserve_event_sequence(&mut self) -> u64 {
         let sequence = self.next_event_sequence;
         self.next_event_sequence = self.next_event_sequence.saturating_add(1);
@@ -723,7 +771,7 @@ impl Session {
             .messages
             .branch_from_edited_user_message(node_id, message)?;
         self.refresh_active_indexes();
-        if editing_root {
+        if editing_root && !self.manual_title {
             self.title = content.chars().take(72).collect();
         }
         self.updated_at = Utc::now();
@@ -784,13 +832,21 @@ pub(crate) struct SessionSummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub title: String,
+    pub manual_title: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+    pub archived_by_ancestor: bool,
+    pub shortcut: bool,
+    pub ancestor_titles: Vec<String>,
     pub model: String,
     pub depth: usize,
     pub descendant_count: usize,
     pub active_terminal_count: usize,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub(crate) struct SessionProject {
     pub root: Option<PathBuf>,
     pub sessions: Vec<SessionSummary>,
@@ -799,6 +855,89 @@ pub(crate) struct SessionProject {
 impl SessionProject {
     pub(crate) fn store(&self, no_project_data_root: &Path) -> Result<SessionStore> {
         SessionStore::for_project_root_in(self.root.as_deref(), no_project_data_root)
+    }
+
+    pub(crate) fn pinned_sessions(&self) -> Vec<SessionSummary> {
+        let mut pinned = self
+            .sessions
+            .iter()
+            .filter(|session| session.pinned_at.is_some() && !session.effectively_archived())
+            .cloned()
+            .collect::<Vec<_>>();
+        pinned.sort_by_key(|session| std::cmp::Reverse((session.pinned_at, session.id)));
+        for session in &mut pinned {
+            session.depth = 0;
+            session.descendant_count = 0;
+            session.shortcut = true;
+        }
+        pinned
+    }
+
+    pub(crate) fn active_sessions(&self) -> Vec<SessionSummary> {
+        let mut active = self
+            .sessions
+            .iter()
+            .filter(|session| !session.effectively_archived())
+            .cloned()
+            .collect::<Vec<_>>();
+        normalize_flat_rows(&mut active);
+        active
+    }
+
+    pub(crate) fn archived_sessions(&self) -> Vec<SessionSummary> {
+        let mut blocks = Vec::new();
+        for (index, session) in self.sessions.iter().enumerate() {
+            if !session.effectively_archived() || session.archived_by_ancestor {
+                continue;
+            }
+            let end = self.sessions[index + 1..]
+                .iter()
+                .position(|candidate| candidate.depth <= session.depth)
+                .map_or(self.sessions.len(), |offset| index + 1 + offset);
+            let mut block = self.sessions[index..end].to_vec();
+            let root_depth = session.depth;
+            for item in &mut block {
+                item.depth = item.depth.saturating_sub(root_depth);
+                item.shortcut = false;
+            }
+            normalize_flat_rows(&mut block);
+            blocks.push((session.archived_at, session.id, block));
+        }
+        blocks.sort_by_key(|(archived_at, id, _)| std::cmp::Reverse((*archived_at, *id)));
+        blocks.into_iter().flat_map(|(_, _, block)| block).collect()
+    }
+}
+
+impl SessionSummary {
+    pub(crate) fn effectively_archived(&self) -> bool {
+        self.archived_at.is_some() || self.archived_by_ancestor
+    }
+}
+
+impl Serialize for SessionProject {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("SessionProject", 5)?;
+        state.serialize_field("root", &self.root)?;
+        state.serialize_field("sessions", &self.sessions)?;
+        state.serialize_field("pinned_sessions", &self.pinned_sessions())?;
+        state.serialize_field("active_sessions", &self.active_sessions())?;
+        state.serialize_field("archived_sessions", &self.archived_sessions())?;
+        state.end()
+    }
+}
+
+fn normalize_flat_rows(rows: &mut [SessionSummary]) {
+    for index in 0..rows.len() {
+        let depth = rows[index].depth;
+        rows[index].descendant_count = rows[index + 1..]
+            .iter()
+            .take_while(|candidate| candidate.depth > depth)
+            .count();
     }
 }
 
@@ -870,6 +1009,9 @@ impl SessionStore {
             reasoning_effort: None,
             service_tier: None,
             title: "New session".into(),
+            manual_title: false,
+            pinned_at: None,
+            archived_at: None,
             messages: ConversationTree::default(),
             activities: Vec::new(),
             next_event_sequence: 0,
@@ -917,6 +1059,12 @@ impl SessionStore {
                 created_at: session.created_at,
                 updated_at: session.updated_at,
                 title: session.title,
+                manual_title: session.manual_title,
+                pinned_at: session.pinned_at,
+                archived_at: session.archived_at,
+                archived_by_ancestor: false,
+                shortcut: false,
+                ancestor_titles: Vec::new(),
                 model: session.model,
                 depth: 0,
                 descendant_count: 0,
@@ -1117,6 +1265,8 @@ fn arrange_session_tree(sessions: &mut Vec<SessionSummary>) {
     fn append_tree(
         index: usize,
         depth: usize,
+        ancestor_titles: &[String],
+        ancestor_archived: bool,
         source: &[SessionSummary],
         children: &[Vec<usize>],
         output: &mut Vec<SessionSummary>,
@@ -1124,15 +1274,29 @@ fn arrange_session_tree(sessions: &mut Vec<SessionSummary>) {
         let mut session = source[index].clone();
         session.depth = depth;
         session.descendant_count = descendant_count(index, children);
+        session.ancestor_titles = ancestor_titles.to_vec();
+        session.archived_by_ancestor = ancestor_archived;
+        session.shortcut = false;
+        let mut child_ancestors = ancestor_titles.to_vec();
+        child_ancestors.push(session.title.clone());
+        let child_archived = ancestor_archived || session.archived_at.is_some();
         output.push(session);
         for child in &children[index] {
-            append_tree(*child, depth + 1, source, children, output);
+            append_tree(
+                *child,
+                depth + 1,
+                &child_ancestors,
+                child_archived,
+                source,
+                children,
+                output,
+            );
         }
     }
 
     sessions.reserve(source.len());
     for root in roots {
-        append_tree(root, 0, &source, &children, sessions);
+        append_tree(root, 0, &[], false, &source, &children, sessions);
     }
 }
 
@@ -1361,6 +1525,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.title, "A clearer edited request");
+    }
+
+    #[test]
+    fn manual_metadata_is_validated_and_does_not_touch_conversation_recency() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut session = store.create("test-model".into()).unwrap();
+        let root = session
+            .messages
+            .push(Message::text(crate::provider::Role::User, "old title"));
+        let updated_at = session.updated_at;
+        let now = updated_at + chrono::Duration::seconds(10);
+
+        session
+            .update_metadata(
+                SessionMetadataUpdate::Rename("  Manual title  ".into()),
+                now,
+            )
+            .unwrap();
+        session
+            .update_metadata(SessionMetadataUpdate::SetPinned(true), now)
+            .unwrap();
+        session
+            .update_metadata(SessionMetadataUpdate::SetArchived(true), now)
+            .unwrap();
+
+        assert_eq!(session.title, "Manual title");
+        assert!(session.manual_title);
+        assert_eq!(session.pinned_at, Some(now));
+        assert_eq!(session.archived_at, Some(now));
+        assert_eq!(session.updated_at, updated_at);
+        assert!(session.rename("   ").is_err());
+        assert!(session.rename(&"x".repeat(121)).is_err());
+
+        session
+            .edit_user_message(root, "A later edited request".into())
+            .unwrap();
+        assert_eq!(session.title, "Manual title");
     }
 
     #[test]
@@ -1921,6 +2123,12 @@ mod tests {
                 created_at: DateTime::from_timestamp(created_at, 0).unwrap(),
                 updated_at: DateTime::from_timestamp(created_at, 0).unwrap(),
                 title: format!("session-{id}"),
+                manual_title: false,
+                pinned_at: None,
+                archived_at: None,
+                archived_by_ancestor: false,
+                shortcut: false,
+                ancestor_titles: Vec::new(),
                 model: "model".into(),
                 depth: 99,
                 descendant_count: 99,
@@ -1990,5 +2198,56 @@ mod tests {
         );
         assert_eq!(projection[0]["sessions"][5]["depth"], 1);
         assert_eq!(projection[0]["sessions"][4]["descendant_count"], 2);
+    }
+
+    #[test]
+    fn projects_derive_pinned_active_and_archived_views_from_one_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut root = store.create("model".into()).unwrap();
+        root.title = "root".into();
+        let mut child = store.create("model".into()).unwrap();
+        child.title = "child".into();
+        child.parent_session_id = Some(root.id);
+        child.pinned_at = Some(DateTime::from_timestamp(30, 0).unwrap());
+        let mut archived = store.create("model".into()).unwrap();
+        archived.title = "archived".into();
+        archived.parent_session_id = Some(root.id);
+        archived.archived_at = Some(DateTime::from_timestamp(20, 0).unwrap());
+        let mut inherited = store.create("model".into()).unwrap();
+        inherited.title = "inherited".into();
+        inherited.parent_session_id = Some(archived.id);
+        inherited.pinned_at = Some(DateTime::from_timestamp(40, 0).unwrap());
+        for session in [&root, &child, &archived, &inherited] {
+            store.save(session).unwrap();
+        }
+
+        let mut projects = vec![SessionProject {
+            root: Some(temp.path().to_path_buf()),
+            sessions: store.list().unwrap(),
+        }];
+        arrange_session_projects(&mut projects);
+        let project = &projects[0];
+
+        assert_eq!(
+            project
+                .active_sessions()
+                .iter()
+                .map(|session| session.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "child"]
+        );
+        let pinned = project.pinned_sessions();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, child.id);
+        assert!(pinned[0].shortcut);
+        assert_eq!(pinned[0].ancestor_titles, vec!["root"]);
+        let archived_rows = project.archived_sessions();
+        assert_eq!(archived_rows.len(), 2);
+        assert_eq!(archived_rows[0].id, archived.id);
+        assert_eq!(archived_rows[1].id, inherited.id);
+        assert!(!archived_rows[0].archived_by_ancestor);
+        assert!(archived_rows[1].archived_by_ancestor);
+        assert_eq!(archived_rows[0].ancestor_titles, vec!["root"]);
     }
 }
