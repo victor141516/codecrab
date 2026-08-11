@@ -7,7 +7,7 @@ const appSource = await readFile(new URL("./App.vue", import.meta.url), "utf8");
 test("sidebar renders every project with nested sessions and exact project actions", () => {
   assert.match(appSource, /v-for="project in projects"/);
   assert.match(appSource, /v-if="projectExpanded\(project\.root\)"/);
-  assert.match(appSource, /v-for="item in visibleProjectSessions\(project\)"/);
+  assert.match(appSource, /v-for="item in projectSessionRows\(project\)"/);
   assert.match(appSource, /newSession\(project\.root\)/);
   assert.match(appSource, /resumeSession\(project\.root, item\.id\)/);
   assert.doesNotMatch(appSource, /formatTime\(item\.(created_at|updated_at)\)/);
@@ -17,7 +17,12 @@ test("sidebar renders every project with nested sessions and exact project actio
   assert.match(appSource, /item\.depth \* 0\.75/);
   assert.match(appSource, /item\.descendant_count > 0/);
   assert.match(appSource, /@click\.stop="toggleSession\(item\.id\)"/);
-  assert.match(appSource, /child of \{\{ shortId\(item\.parent_session_id\) \}\}/);
+  assert.match(appSource, /item\.ancestor_titles\.slice\(-2\)/);
+  assert.match(appSource, /togglePinned\(project\.root, item\)/);
+  assert.match(appSource, /toggleArchived\(project\.root, item\)/);
+  assert.match(appSource, /beginSessionRename\(item\)/);
+  assert.match(appSource, /project\.pinned_sessions/);
+  assert.match(appSource, /project\.archived_sessions/);
 });
 
 test("model controls live inside the composer instead of the header", () => {

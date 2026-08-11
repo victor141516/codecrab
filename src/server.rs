@@ -59,8 +59,8 @@ use crate::{
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
     provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection},
     session::{
-        Session, SessionProject, SessionStore, SessionSummary, arrange_session_projects,
-        list_session_projects, resolve_global_session,
+        Session, SessionMetadataUpdate, SessionProject, SessionStore, SessionSummary,
+        arrange_session_projects, list_session_projects, resolve_global_session,
     },
     skills::SkillRegistry,
     terminal::{TerminalOutputSnapshot, TerminalProcessState},
@@ -304,6 +304,15 @@ struct SessionRequest {
     id: String,
     #[serde(default)]
     stop_processes: bool,
+}
+
+#[derive(Deserialize)]
+struct SessionMetadataRequest {
+    project: Option<PathBuf>,
+    id: String,
+    title: Option<String>,
+    pinned: Option<bool>,
+    archived: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -667,6 +676,7 @@ fn server_app(state: ServerState) -> Router {
                 .route("/branches/select", post(select_branch))
                 .route("/sessions", post(new_session))
                 .route("/sessions/stream", get(session_stream))
+                .route("/sessions/metadata", put(update_session_metadata))
                 .route("/sessions/delete", post(delete_session))
                 .route("/directories", get(list_directories))
                 .route("/directories", post(make_directory))
@@ -910,6 +920,12 @@ fn live_session_projects(
             created_at: session.created_at,
             updated_at: live.observation.latest_event_at,
             title: live.observation.title,
+            manual_title: session.manual_title,
+            pinned_at: session.pinned_at,
+            archived_at: session.archived_at,
+            archived_by_ancestor: false,
+            shortcut: false,
+            ancestor_titles: Vec::new(),
             model: session.model.clone(),
             depth: 0,
             descendant_count: 0,
@@ -2085,6 +2101,53 @@ async fn resume_session(
     Ok(Json(snapshot(&state).await?))
 }
 
+async fn update_session_metadata(
+    State(state): State<ServerState>,
+    Json(request): Json<SessionMetadataRequest>,
+) -> ApiResult<StateResponse> {
+    let updates = usize::from(request.title.is_some())
+        + usize::from(request.pinned.is_some())
+        + usize::from(request.archived.is_some());
+    if updates != 1 {
+        return Err(ApiError::message(
+            StatusCode::BAD_REQUEST,
+            "provide exactly one of title, pinned, or archived",
+        ));
+    }
+    let update = if let Some(title) = request.title.clone() {
+        SessionMetadataUpdate::Rename(title)
+    } else if let Some(pinned) = request.pinned {
+        SessionMetadataUpdate::SetPinned(pinned)
+    } else {
+        SessionMetadataUpdate::SetArchived(request.archived.expect("one update was provided"))
+    };
+    let current_root = state.inner.workspace.lock().await.root.clone();
+    let session_request = SessionRequest {
+        project: request.project,
+        id: request.id,
+        stop_processes: false,
+    };
+    let session_root =
+        resolve_session_root(&current_root, &state.inner.registry, &session_request)?;
+    let store = SessionStore::for_project_root_in(
+        session_root.as_deref(),
+        &state.inner.registry.data_dir()?,
+    )?;
+    let target = store.load(Some(&session_request.id))?;
+    if let Some(conversation) = state.inner.conversations.get(target.id) {
+        conversation.update_metadata(update).await?;
+    } else {
+        let mut target = target;
+        target.update_metadata(update, chrono::Utc::now())?;
+        store.save(&target)?;
+        state.inner.conversations.publish_catalog_change(
+            target.id,
+            session_root.unwrap_or_else(|| state.inner.runtime_root.clone()),
+        );
+    }
+    Ok(Json(snapshot(&state).await?))
+}
+
 async fn delete_session(
     State(state): State<ServerState>,
     Json(request): Json<SessionRequest>,
@@ -2880,6 +2943,7 @@ mod tests {
         let mut observation = crate::conversation::ConversationObservation {
             revision: 3,
             title: "Live delegated title".into(),
+            manual_title: false,
             lifecycle: ConversationLifecycle::Running,
             active_turn_started_at: Some(chrono::Utc::now()),
             latest_event_at: chrono::Utc::now(),
@@ -4923,5 +4987,65 @@ mod tests {
         assert!(response.session.is_none());
         assert!(response.projects[0].sessions.is_empty());
         assert!(state.inner.workspace.lock().await.conversation.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_metadata_endpoint_updates_the_worker_and_persisted_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::default();
+        let store = SessionStore::new(&root).unwrap();
+        let session = store.create("test-model".into()).unwrap();
+        let id = session.id;
+        let updated_at = session.updated_at;
+        store.save(&session).unwrap();
+        let agent = build_agent(&root, &config, false, session).unwrap();
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+
+        for request in [
+            SessionMetadataRequest {
+                project: Some(root.clone()),
+                id: id.to_string(),
+                title: Some("  Manual title  ".into()),
+                pinned: None,
+                archived: None,
+            },
+            SessionMetadataRequest {
+                project: Some(root.clone()),
+                id: id.to_string(),
+                title: None,
+                pinned: Some(true),
+                archived: None,
+            },
+            SessionMetadataRequest {
+                project: Some(root.clone()),
+                id: id.to_string(),
+                title: None,
+                pinned: None,
+                archived: Some(true),
+            },
+        ] {
+            api_ok(update_session_metadata(State(state.clone()), Json(request)).await);
+        }
+
+        let persisted = store.load(Some(&id.to_string())).unwrap();
+        assert_eq!(persisted.title, "Manual title");
+        assert!(persisted.manual_title);
+        assert!(persisted.pinned_at.is_some());
+        assert!(persisted.archived_at.is_some());
+        assert_eq!(persisted.updated_at, updated_at);
+        let projects = live_session_projects(&root, &state.inner).unwrap();
+        let project = projects
+            .iter()
+            .find(|project| {
+                project
+                    .root
+                    .as_deref()
+                    .is_some_and(|project_root| paths_equal(project_root, &root))
+            })
+            .unwrap();
+        assert!(project.active_sessions().is_empty());
+        assert!(project.pinned_sessions().is_empty());
+        assert_eq!(project.archived_sessions()[0].id, id);
     }
 }

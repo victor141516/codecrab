@@ -320,6 +320,10 @@ impl SessionCoordinator {
                     "project_root": project.root,
                     "scope": session.scope,
                     "parent_session_id": session.parent_session_id,
+                    "manual_title": session.manual_title,
+                    "pinned_at": session.pinned_at,
+                    "archived_at": session.archived_at,
+                    "archived_by_ancestor": summary.archived_by_ancestor,
                     "depth": summary.depth,
                     "descendant_count": summary.descendant_count,
                     "live": live.is_some(),
@@ -1011,6 +1015,7 @@ fn persisted_observation(session: &Session) -> ConversationObservation {
     ConversationObservation {
         revision: 0,
         title: session.title.clone(),
+        manual_title: session.manual_title,
         lifecycle: ConversationLifecycle::Idle,
         active_turn_started_at: None,
         latest_event_at: session.updated_at,
