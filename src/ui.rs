@@ -801,7 +801,6 @@ impl SessionPicker {
                 return false;
             };
             project == project_index
-                && section != SessionSection::Pinned
                 && self.projects[project].sessions(section)[session].id == session_id
         }) {
             self.selected = index;
@@ -2936,8 +2935,7 @@ impl App {
             let SessionPickerRow::Session(project, section, session) = *row else {
                 return false;
             };
-            section != SessionSection::Pinned
-                && Some(picker.projects[project].sessions(section)[session].id) == current_id
+            Some(picker.projects[project].sessions(section)[session].id) == current_id
         }) {
             picker.selected = selected;
         }
