@@ -77,7 +77,7 @@ needed.
 ## Repository layout
 
 - `src/main.rs`: CLI parsing and mode dispatch.
-- `src/agent.rs`: model/tool loop, system prompt, and root `AGENTS.md` loading.
+- `src/agent.rs`: model/tool loop, system prompt, and hierarchical `AGENTS.md` loading.
 - `src/compaction/`: context projection, summary construction, safe boundaries,
   and centralized compaction tuning.
 - `src/conversation.rs`: persistent Tokio conversation worker, typed command
@@ -147,9 +147,10 @@ current draft and all later turns until changed.
   first non-empty section. If there is no separator, send the entire file.
 - Load the complete `SKILL.md` only after the skill is selected. Load referenced
   resources progressively.
-- CodeCrab loads the complete root `AGENTS.md` once when constructing a new
-  agent. Changes to this file require a new CodeCrab conversation/process to
-  affect the model context.
+- CodeCrab composes the complete global, Git repository-root, and selected
+  working-directory `AGENTS.md` files in that order when constructing a new
+  agent, deduplicating coincident paths. Changes to these files require a new
+  CodeCrab conversation/process to affect the model context.
 
 ## UI behavior to preserve
 

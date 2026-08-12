@@ -88,14 +88,14 @@ pub(crate) fn turn_was_cancelled(error: &anyhow::Error) -> bool {
 
 #[derive(Clone, Debug)]
 struct InstructionSource {
-    path: PathBuf,
     content: String,
 }
 
 #[derive(Clone, Debug, Default)]
 struct AgentInstructions {
     global: Option<InstructionSource>,
-    project: Option<InstructionSource>,
+    repository: Option<InstructionSource>,
+    working_directory: Option<InstructionSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -1855,34 +1855,54 @@ impl AgentInstructions {
         diagnostics: &DiagnosticLog,
     ) -> Result<Self> {
         let global = load_global_instructions(&global_path, diagnostics);
-        let project = match root {
-            None => None,
-            Some(root) => {
-                let project_path = root.join("AGENTS.md");
-                let same_candidate = paths_equal(&global_path, &project_path);
-                let same_loaded_source = global
-                    .as_ref()
-                    .is_some_and(|source| paths_equal(&source.path, &project_path));
-                if same_candidate || same_loaded_source {
-                    None
-                } else {
-                    load_project_instructions(root)?
-                }
-            }
+        let Some(root) = root else {
+            return Ok(Self {
+                global,
+                ..Self::default()
+            });
         };
-        Ok(Self { global, project })
+
+        let repository_path = repository_root(root).map(|root| root.join("AGENTS.md"));
+        let repository = match repository_path.as_deref() {
+            Some(path) if !paths_equal(&global_path, path) => load_project_instructions(path)?,
+            _ => None,
+        };
+        let working_directory_path = root.join("AGENTS.md");
+        let duplicates_repository = repository_path
+            .as_deref()
+            .is_some_and(|path| paths_equal(path, &working_directory_path));
+        let working_directory =
+            if paths_equal(&global_path, &working_directory_path) || duplicates_repository {
+                None
+            } else {
+                load_project_instructions(&working_directory_path)?
+            };
+        Ok(Self {
+            global,
+            repository,
+            working_directory,
+        })
     }
 
     fn combined_content(&self) -> Option<String> {
-        match (&self.global, &self.project) {
-            (Some(global), Some(project)) => Some(format!(
-                "{}\n\n--- project-doc ---\n\n{}",
-                global.content, project.content
-            )),
-            (Some(global), None) => Some(global.content.clone()),
-            (None, Some(project)) => Some(project.content.clone()),
-            (None, None) => None,
+        let mut combined: Option<String> = None;
+        for (label, source) in [
+            ("global-doc", self.global.as_ref()),
+            ("repository-root-doc", self.repository.as_ref()),
+            ("working-directory-doc", self.working_directory.as_ref()),
+        ] {
+            let Some(source) = source else {
+                continue;
+            };
+            match &mut combined {
+                Some(combined) => {
+                    combined.push_str(&format!("\n\n--- {label} ---\n\n"));
+                    combined.push_str(&source.content);
+                }
+                None => combined = Some(source.content.clone()),
+            }
         }
+        combined
     }
 
     fn context_message(&self, root: Option<&Path>) -> Option<Message> {
@@ -1943,16 +1963,16 @@ where
         }
     };
     let content = String::from_utf8_lossy(&bytes).trim().to_owned();
-    (!content.is_empty()).then(|| InstructionSource {
-        path: path.to_path_buf(),
-        content,
-    })
+    (!content.is_empty()).then_some(InstructionSource { content })
 }
 
-fn load_project_instructions(root: &Path) -> Result<Option<InstructionSource>> {
-    let path = root.join("AGENTS.md");
-    match fs::read_to_string(&path) {
-        Ok(content) => Ok(Some(InstructionSource { path, content })),
+fn repository_root(root: &Path) -> Option<&Path> {
+    root.ancestors().find(|path| path.join(".git").exists())
+}
+
+fn load_project_instructions(path: &Path) -> Result<Option<InstructionSource>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(InstructionSource { content })),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
     }
@@ -2134,7 +2154,6 @@ mod tests {
         let valid = temp.path().join("valid.md");
         fs::write(&valid, "\n  Global rule.  \n").unwrap();
         let loaded = load_global_instructions(&valid, &diagnostics).unwrap();
-        assert_eq!(loaded.path, valid);
         assert_eq!(loaded.content, "Global rule.");
 
         let invalid = temp.path().join("invalid.md");
@@ -2188,16 +2207,19 @@ mod tests {
     }
 
     #[test]
-    fn instruction_bundle_composes_global_then_complete_project_content() {
+    fn instruction_bundle_composes_global_repository_and_working_directory_in_order() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("project");
+        let repository = temp.path().join("repository");
+        let root = repository.join("nested").join("project");
         let global_path = temp.path().join("config").join("AGENTS.md");
         fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        fs::create_dir_all(&root).unwrap();
         fs::write(&global_path, "\n Global rule. \n").unwrap();
+        fs::write(repository.join("AGENTS.md"), "Repository rule.\n").unwrap();
         fs::write(
             root.join("AGENTS.md"),
-            "First project rule.\n\n---\n\nLast project rule.\n",
+            "First working directory rule.\n\n---\n\nLast working directory rule.\n",
         )
         .unwrap();
 
@@ -2205,7 +2227,15 @@ mod tests {
             AgentInstructions::load(Some(&root), global_path, &DiagnosticLog::default()).unwrap();
         assert_eq!(
             instructions.combined_content().unwrap(),
-            "Global rule.\n\n--- project-doc ---\n\nFirst project rule.\n\n---\n\nLast project rule.\n"
+            "Global rule.\n\n--- repository-root-doc ---\n\nRepository rule.\n\n\n--- working-directory-doc ---\n\nFirst working directory rule.\n\n---\n\nLast working directory rule.\n"
+        );
+        assert_eq!(
+            instructions.repository.unwrap().content,
+            "Repository rule.\n"
+        );
+        assert_eq!(
+            instructions.working_directory.unwrap().content,
+            "First working directory rule.\n\n---\n\nLast working directory rule.\n"
         );
     }
 
@@ -2227,7 +2257,8 @@ mod tests {
             Some("global rule")
         );
         assert!(instructions.global.is_some());
-        assert!(instructions.project.is_none());
+        assert!(instructions.repository.is_none());
+        assert!(instructions.working_directory.is_none());
     }
 
     #[test]
@@ -2264,7 +2295,25 @@ mod tests {
                 .unwrap();
         assert_eq!(deduplicated.combined_content().unwrap(), "shared once");
         assert!(deduplicated.global.is_some());
-        assert!(deduplicated.project.is_none());
+        assert!(deduplicated.repository.is_none());
+        assert!(deduplicated.working_directory.is_none());
+
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(repository.join(".git")).unwrap();
+        fs::write(repository.join("AGENTS.md"), "repository once\n").unwrap();
+        let repository_root = AgentInstructions::load(
+            Some(&repository),
+            temp.path().join("missing-global").join("AGENTS.md"),
+            &DiagnosticLog::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            repository_root.combined_content().unwrap(),
+            "repository once\n"
+        );
+        assert!(repository_root.repository.is_some());
+        assert!(repository_root.working_directory.is_none());
     }
 
     #[test]
@@ -2272,12 +2321,13 @@ mod tests {
         let root = Path::new("project");
         let instructions = AgentInstructions {
             global: Some(InstructionSource {
-                path: PathBuf::from("global/AGENTS.md"),
                 content: "global".into(),
             }),
-            project: Some(InstructionSource {
-                path: PathBuf::from("project/AGENTS.md"),
-                content: "project".into(),
+            repository: Some(InstructionSource {
+                content: "repository".into(),
+            }),
+            working_directory: Some(InstructionSource {
+                content: "working directory".into(),
             }),
         };
 
@@ -2286,7 +2336,7 @@ mod tests {
         assert!(message.hidden);
         assert_eq!(
             message.content.unwrap(),
-            "# AGENTS.md instructions for project\n\n<INSTRUCTIONS>\nglobal\n\n--- project-doc ---\n\nproject\n</INSTRUCTIONS>"
+            "# AGENTS.md instructions for project\n\n<INSTRUCTIONS>\nglobal\n\n--- repository-root-doc ---\n\nrepository\n\n--- working-directory-doc ---\n\nworking directory\n</INSTRUCTIONS>"
         );
     }
 
@@ -2333,7 +2383,7 @@ mod tests {
         assert!(projection[1].hidden);
         assert_eq!(projection[2].content.as_deref(), Some("visible request"));
         let context = projection[1].content.as_deref().unwrap();
-        assert!(context.contains("global rule\n\n--- project-doc ---\n\nproject rule"));
+        assert!(context.contains("global rule\n\n--- working-directory-doc ---\n\nproject rule"));
         assert_eq!(agent.session.messages.len(), 1);
         assert!(!agent.session.messages[0].hidden);
 
