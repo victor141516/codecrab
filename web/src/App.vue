@@ -686,6 +686,14 @@ const speedOptions = computed(() =>
   (selectedModel.value?.service_tiers ?? []).filter((tier) => tier.id !== "default")
 );
 
+function builtinCommandFromInput(input) {
+  if (!input.startsWith("/") || input.includes(" ") || input.includes("\n")) {
+    return null;
+  }
+  const name = input.slice(1);
+  return state.value?.commands?.includes(name) ? input : null;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -2697,6 +2705,10 @@ async function sendPrompt() {
     return;
   }
   if (runtime.queuedPromptEdit) {
+    if (builtinCommandFromInput(prompt)) {
+      error.value = "Built-in commands cannot be saved as queued messages; cancel the edit to run the command.";
+      return;
+    }
     await finishQueuedPromptEdit(prompt, attachments);
     return;
   }
@@ -2727,43 +2739,6 @@ async function sendPrompt() {
     }
     return;
   }
-  if (prompt === "/models" || prompt === "/providers") {
-    await clearComposer();
-    closeAutocomplete();
-    await activateSelectionControl(
-      prompt === "/models" ? modelControl.value : providerControl.value
-    );
-    return;
-  }
-  if (prompt === "/usage" && usage.value.available) {
-    await clearComposer();
-    closeAutocomplete();
-    openUsage();
-    return;
-  }
-  if (prompt === "/goals") {
-    await clearComposer();
-    closeAutocomplete();
-    goalsOpen.value = true;
-    return;
-  }
-  if (prompt === "/cron") {
-    await clearComposer();
-    closeAutocomplete();
-    await openCron();
-    return;
-  }
-  if (prompt === "/branches") {
-    await clearComposer();
-    openBranchNavigator();
-    return;
-  }
-  if (prompt === "/processes") {
-    await clearComposer();
-    closeAutocomplete();
-    await openProcesses();
-    return;
-  }
   if (prompt === "/goal") {
     error.value = "Write the objective after /goal.";
     return;
@@ -2773,6 +2748,12 @@ async function sendPrompt() {
     await clearComposer();
     closeAutocomplete();
     await createGoal(goalMatch[1].trim());
+    return;
+  }
+  if (builtinCommandFromInput(prompt)) {
+    await clearComposer();
+    closeAutocomplete();
+    await runBuiltinCommand(prompt);
     return;
   }
   if (sending.value) {
@@ -2795,6 +2776,61 @@ async function sendPrompt() {
   if (!completed && !draftAttachments.value.length) {
     draftAttachments.value = sentAttachments;
   }
+}
+
+async function runBuiltinCommand(command) {
+  if (command === "/models" || command === "/providers") {
+    if (sending.value) {
+      error.value = "Wait for the active turn before changing the model or provider.";
+      return;
+    }
+    await activateSelectionControl(
+      command === "/models" ? modelControl.value : providerControl.value
+    );
+    return;
+  }
+  if (command === "/usage" && usage.value.available) {
+    openUsage();
+    return;
+  }
+  if (command === "/goals") {
+    goalsOpen.value = true;
+    return;
+  }
+  if (command === "/cron") {
+    await openCron();
+    return;
+  }
+  if (command === "/branches") {
+    openBranchNavigator();
+    return;
+  }
+  if (command === "/processes") {
+    await openProcesses();
+    return;
+  }
+  if (command === "/sessions") {
+    sidebarOpen.value = true;
+    setDesktopSidebarCollapsed(false);
+    return;
+  }
+  if (command === "/no-project") {
+    await newSession(null);
+    return;
+  }
+  if (command === "/help") {
+    error.value = "Keyboard help is available in the terminal client; web controls show their actions in place.";
+    return;
+  }
+  if (command === "/skills") {
+    error.value = "Type / in the composer to browse the current skill catalog.";
+    return;
+  }
+  if (command === "/quit") {
+    error.value = "The web client cannot stop the CodeCrab server; close this page or stop the server process.";
+    return;
+  }
+  error.value = `Command ${command} is unavailable in this context.`;
 }
 
 function activeGoalFor(sessionId) {

@@ -35,6 +35,10 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("quit", "Save the session and exit"),
 ];
 
+pub(crate) fn builtin_command_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|(name, _)| *name)
+}
+
 pub(crate) const NERD_FOLDER: &str = "";
 const NERD_FILE: &str = "";
 const RECURSIVE_EXCLUDED_DIRECTORIES: &[&str] = &[".git", "target", "node_modules", "dist"];
@@ -238,7 +242,7 @@ pub(crate) fn complete_with_policy<'a>(
 pub(crate) fn builtin_command_from_input(input: &str) -> Option<&str> {
     let trimmed = input.trim();
     let name = trimmed.strip_prefix('/')?;
-    (input == trimmed && COMMANDS.iter().any(|(command, _)| *command == name)).then_some(trimmed)
+    (input == trimmed && builtin_command_names().any(|command| command == name)).then_some(trimmed)
 }
 
 pub(crate) fn goal_objective_from_input(input: &str) -> Option<&str> {

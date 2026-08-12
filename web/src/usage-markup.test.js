@@ -11,7 +11,7 @@ test("OpenAI usage has a persistent indicator and detailed modal", () => {
   assert.match(appSource, /v-for="window in usage\.snapshot\.windows"/);
   assert.match(appSource, /\{\{ window\.remaining_percent \}\}% remaining/);
   assert.match(appSource, /Resets \{\{ formatUsageReset/);
-  assert.match(appSource, /if \(prompt === "\/usage" && usage\.value\.available\)/);
+  assert.match(appSource, /if \(command === "\/usage" && usage\.value\.available\)/);
 });
 
 test("manual reset requires confirmation and is blocked for stale usage", () => {
