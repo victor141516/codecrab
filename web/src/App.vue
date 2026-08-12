@@ -39,6 +39,7 @@ import {
   Pin,
   Play,
   ScanLine,
+  Search,
   Plus,
   RefreshCw,
   Square,
@@ -139,6 +140,11 @@ const recording = ref(false);
 const transcribing = ref(false);
 const error = ref("");
 const sidebarOpen = ref(false);
+const sessionTitleQuery = ref("");
+const sessionTitleResults = ref([]);
+const sessionTitleSearching = ref(false);
+const sessionTitleSearchError = ref("");
+let sessionTitleSearchRequest = 0;
 const desktopSidebarCollapsed = ref(loadDesktopSidebarCollapsed());
 const projectSidebar = ref(null);
 const composer = ref(null);
@@ -436,6 +442,19 @@ watch(
     usageResetKey = null;
   }
 );
+
+watch(sessionTitleQuery, () => {
+  void refreshSessionTitleSearch();
+});
+
+watch(
+  () => projects.value
+    .flatMap((project) => project.sessions.map((item) => `${project.root ?? ""}:${item.id}:${item.title}:${item.updated_at}`))
+    .join("\u0000"),
+  () => {
+    if (sessionTitleQuery.value.trim()) void refreshSessionTitleSearch();
+  }
+);
 const cron = computed(() => state.value?.cron ?? null);
 const cronJobs = computed(() => cron.value?.jobs ?? []);
 const goals = computed(() => session.value?.goals ?? []);
@@ -707,6 +726,48 @@ async function api(path, options = {}) {
     throw new Error(body.error || `Request failed with ${response.status}`);
   }
   return body;
+}
+
+async function refreshSessionTitleSearch() {
+  const query = sessionTitleQuery.value.trim();
+  const request = ++sessionTitleSearchRequest;
+  sessionTitleSearchError.value = "";
+  if (!query) {
+    sessionTitleResults.value = [];
+    sessionTitleSearching.value = false;
+    return;
+  }
+  sessionTitleSearching.value = true;
+  try {
+    const results = await api(
+      `/api/sessions/search?query=${encodeURIComponent(query)}`
+    );
+    if (request === sessionTitleSearchRequest) {
+      sessionTitleResults.value = results;
+    }
+  } catch (cause) {
+    if (request === sessionTitleSearchRequest) {
+      sessionTitleResults.value = [];
+      sessionTitleSearchError.value = cause.message;
+    }
+  } finally {
+    if (request === sessionTitleSearchRequest) {
+      sessionTitleSearching.value = false;
+    }
+  }
+}
+
+function resetTitleSearch() {
+  sessionTitleSearchRequest += 1;
+  sessionTitleQuery.value = "";
+  sessionTitleResults.value = [];
+  sessionTitleSearching.value = false;
+  sessionTitleSearchError.value = "";
+}
+
+async function resumeSessionTitleResult(result) {
+  resetTitleSearch();
+  await resumeSession(result.project, result.session.id);
 }
 
 function applySharedUsage(nextUsage) {
@@ -4879,9 +4940,75 @@ onBeforeUnmount(() => {
           <FolderPlus class="size-4" aria-hidden="true" />
           Add or create project
         </button>
+        <div class="relative mt-2">
+          <Search class="pointer-events-none absolute left-2.5 top-2.5 size-3.5 text-zinc-600" aria-hidden="true" />
+          <input
+            v-model="sessionTitleQuery"
+            class="w-full rounded-lg border border-white/8 bg-black/20 py-2 pl-8 pr-8 text-xs text-zinc-300 outline-none placeholder:text-zinc-650 focus:border-cyan-400/30"
+            type="search"
+            placeholder="Search session titles"
+            aria-label="Search session titles"
+          />
+          <button
+            v-if="sessionTitleQuery"
+            class="absolute right-1.5 top-1.5 grid size-5 place-items-center rounded text-zinc-600 hover:bg-white/5 hover:text-zinc-300"
+            aria-label="Clear session title search"
+            @click="resetTitleSearch"
+          >
+            <X class="size-3" aria-hidden="true" />
+          </button>
+        </div>
       </div>
 
       <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4" aria-label="Projects and sessions">
+        <template v-if="sessionTitleQuery.trim()">
+          <p
+            v-if="sessionTitleSearching && !sessionTitleResults.length"
+            class="flex items-center gap-2 px-2 py-4 text-xs text-zinc-600"
+          >
+            <LoaderCircle class="size-3.5 animate-spin" aria-hidden="true" />
+            Searching titles
+          </p>
+          <p v-else-if="sessionTitleSearchError" class="px-2 py-4 text-xs leading-5 text-red-300">
+            {{ sessionTitleSearchError }}
+          </p>
+          <p v-else-if="!sessionTitleResults.length" class="px-2 py-4 text-xs leading-5 text-zinc-600">
+            No session titles match “{{ sessionTitleQuery.trim() }}”.
+          </p>
+          <div v-else class="space-y-1" aria-label="Session title search results">
+            <p class="px-2 pb-1 pt-2 text-[9px] font-semibold uppercase tracking-[0.14em] text-zinc-600">
+              Title matches · {{ sessionTitleResults.length }}
+            </p>
+            <button
+              v-for="result in sessionTitleResults"
+              :key="`${result.project ?? 'no-project'}:${result.session.id}`"
+              class="group flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition hover:bg-white/5"
+              @click="resumeSessionTitleResult(result)"
+            >
+              <Search class="size-3.5 shrink-0 text-cyan-400" aria-hidden="true" />
+              <span class="min-w-0 flex-1">
+                <span class="block truncate text-[13px] font-semibold text-zinc-300 group-hover:text-white">
+                  {{ result.session.title || "New session" }}
+                </span>
+                <span class="mt-0.5 block truncate font-mono text-[9px] text-zinc-600" :title="result.project">
+                  {{ projectName(result.project) }} · {{ result.project || "No project" }}
+                </span>
+              </span>
+              <span
+                v-if="result.session.archived_at || result.session.archived_by_ancestor"
+                class="rounded bg-amber-400/8 px-1.5 py-0.5 text-[8px] uppercase text-amber-300"
+              >
+                archived
+              </span>
+              <Pin
+                v-else-if="result.session.pinned_at"
+                class="size-3 shrink-0 fill-current text-cyan-300"
+                aria-label="Pinned"
+              />
+            </button>
+          </div>
+        </template>
+        <template v-else>
         <p
           v-if="!projects.length"
           class="px-2 py-3 text-xs leading-5 text-zinc-600"
@@ -5103,6 +5230,7 @@ onBeforeUnmount(() => {
             </template>
           </div>
         </section>
+        </template>
       </div>
     </aside>
 

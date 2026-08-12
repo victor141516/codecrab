@@ -869,6 +869,12 @@ pub(crate) struct SessionProject {
     pub sessions: Vec<SessionSummary>,
 }
 
+#[derive(Clone, Serialize)]
+pub(crate) struct SessionTitleMatch {
+    pub project: Option<PathBuf>,
+    pub session: SessionSummary,
+}
+
 impl SessionProject {
     pub(crate) fn store(&self, no_project_data_root: &Path) -> Result<SessionStore> {
         SessionStore::for_project_root_in(self.root.as_deref(), no_project_data_root)
@@ -1220,6 +1226,52 @@ pub(crate) fn arrange_session_projects(projects: &mut [SessionProject]) {
     for project in projects {
         arrange_session_tree(&mut project.sessions);
     }
+}
+
+pub(crate) fn search_session_titles(
+    projects: &[SessionProject],
+    query: &str,
+) -> Vec<SessionTitleMatch> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = projects
+        .iter()
+        .flat_map(|project| {
+            let query = &query;
+            project.sessions.iter().filter_map(move |session| {
+                let title = session.title.to_lowercase();
+                let rank = if title == *query {
+                    0
+                } else if title.starts_with(query) {
+                    1
+                } else if title.split_whitespace().any(|word| word.starts_with(query)) {
+                    2
+                } else if title.contains(query) {
+                    3
+                } else {
+                    return None;
+                };
+                Some((
+                    rank,
+                    SessionTitleMatch {
+                        project: project.root.clone(),
+                        session: session.clone(),
+                    },
+                ))
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_rank, left), (right_rank, right)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| right.session.updated_at.cmp(&left.session.updated_at))
+            .then_with(|| left.session.title.cmp(&right.session.title))
+            .then_with(|| left.project.cmp(&right.project))
+            .then_with(|| left.session.id.cmp(&right.session.id))
+    });
+    matches.into_iter().map(|(_, result)| result).collect()
 }
 
 fn arrange_session_tree(sessions: &mut Vec<SessionSummary>) {
@@ -2147,6 +2199,59 @@ mod tests {
                 .is_some_and(|root| paths_equal(root, &other))
         );
         assert_eq!(id, other_session.id);
+    }
+
+    #[test]
+    fn title_search_ranks_matches_across_projects_and_includes_archived_sessions() {
+        fn save_session(
+            store: &SessionStore,
+            title: &str,
+            updated_at: i64,
+            archived: bool,
+        ) -> Session {
+            let mut session = store.create("model".into()).unwrap();
+            session.title = title.into();
+            session.updated_at = DateTime::from_timestamp(updated_at, 0).unwrap();
+            session.archived_at = archived.then_some(session.updated_at);
+            store.save(&session).unwrap();
+            session
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let first_store = SessionStore::new(&first_root).unwrap();
+        let second_store = SessionStore::new(&second_root).unwrap();
+        let exact = save_session(&first_store, "Alpha", 1, false);
+        let prefix = save_session(&second_store, "Alphabet soup", 4, false);
+        let word = save_session(&first_store, "Project ALPHA", 3, false);
+        let contains = save_session(&second_store, "Metalpha notes", 2, true);
+        let projects = vec![
+            SessionProject {
+                root: Some(first_root.clone()),
+                sessions: first_store.list().unwrap(),
+            },
+            SessionProject {
+                root: Some(second_root.clone()),
+                sessions: second_store.list().unwrap(),
+            },
+        ];
+
+        let matches = search_session_titles(&projects, "  aLpHa  ");
+
+        assert_eq!(
+            matches
+                .iter()
+                .map(|result| result.session.id)
+                .collect::<Vec<_>>(),
+            vec![exact.id, prefix.id, word.id, contains.id]
+        );
+        assert_eq!(matches[1].project.as_deref(), Some(second_root.as_path()));
+        assert!(matches[3].session.effectively_archived());
+        assert!(search_session_titles(&projects, "   ").is_empty());
+        assert!(search_session_titles(&projects, "missing").is_empty());
     }
 
     #[test]

@@ -57,6 +57,7 @@ use crate::{
     session::{
         AgentTurn, ConversationGraphNode, Goal, GoalStatus, Session, SessionMetadataUpdate,
         SessionProject, SessionScope, SessionStore, SessionSummary, list_session_projects,
+        search_session_titles,
     },
     terminal::{TerminalOutputSnapshot, TerminalProcessState, TerminalRecord, TerminalStyle},
     transcription::Transcriber,
@@ -129,6 +130,9 @@ struct SessionPicker {
     projects: Vec<SessionProjectView>,
     selected: usize,
     collapsed_sessions: HashSet<Uuid>,
+    searching: bool,
+    search_query: String,
+    search_results: Vec<SessionSearchView>,
 }
 
 enum ProcessDialogView {
@@ -191,6 +195,14 @@ enum SessionPickerRow {
     Project(usize),
     Section(usize, SessionSection),
     Session(usize, SessionSection, usize),
+    SearchResult(usize),
+}
+
+#[derive(Clone, Copy)]
+struct SessionSearchView {
+    project: usize,
+    section: SessionSection,
+    session: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -721,6 +733,11 @@ fn ratatui_style_from_syntect(style: SyntectStyle) -> Style {
 
 impl SessionPicker {
     fn rows(&self) -> Vec<SessionPickerRow> {
+        if !self.search_query.is_empty() {
+            return (0..self.search_results.len())
+                .map(SessionPickerRow::SearchResult)
+                .collect();
+        }
         let mut rows = Vec::new();
         for (project_index, project) in self.projects.iter().enumerate() {
             rows.push(SessionPickerRow::Project(project_index));
@@ -797,8 +814,13 @@ impl SessionPicker {
 
     fn select_session(&mut self, project_index: usize, session_id: Uuid) {
         if let Some(index) = self.rows().iter().position(|row| {
-            let SessionPickerRow::Session(project, section, session) = *row else {
-                return false;
+            let (project, section, session) = match *row {
+                SessionPickerRow::Session(project, section, session) => (project, section, session),
+                SessionPickerRow::SearchResult(index) => {
+                    let result = self.search_results[index];
+                    (result.project, result.section, result.session)
+                }
+                _ => return false,
             };
             project == project_index
                 && self.projects[project].sessions(section)[session].id == session_id
@@ -808,8 +830,13 @@ impl SessionPicker {
     }
 
     fn selected_session(&self) -> Option<(usize, SessionSection, usize, &SessionSummary)> {
-        let SessionPickerRow::Session(project, section, session) = self.selected_row()? else {
-            return None;
+        let (project, section, session) = match self.selected_row()? {
+            SessionPickerRow::Session(project, section, session) => (project, section, session),
+            SessionPickerRow::SearchResult(index) => {
+                let result = self.search_results[index];
+                (result.project, result.section, result.session)
+            }
+            _ => return None,
         };
         Some((
             project,
@@ -817,6 +844,45 @@ impl SessionPicker {
             session,
             &self.projects[project].sessions(section)[session],
         ))
+    }
+
+    fn refresh_title_search(&mut self) {
+        let projects = self
+            .projects
+            .iter()
+            .map(|project| project.project.clone())
+            .collect::<Vec<_>>();
+        self.search_results = search_session_titles(&projects, &self.search_query)
+            .into_iter()
+            .filter_map(|result| {
+                let project = self.projects.iter().position(|candidate| {
+                    match (&candidate.project.root, &result.project) {
+                        (Some(left), Some(right)) => paths_equal(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                })?;
+                let section = if result.session.effectively_archived() {
+                    SessionSection::Archived
+                } else if result.session.pinned_at.is_some() {
+                    SessionSection::Pinned
+                } else {
+                    SessionSection::Active
+                };
+                let session = self.projects[project]
+                    .sessions(section)
+                    .iter()
+                    .position(|session| session.id == result.session.id)?;
+                Some(SessionSearchView {
+                    project,
+                    section,
+                    session,
+                })
+            })
+            .collect();
+        self.selected = self
+            .selected
+            .min(self.search_results.len().saturating_sub(1));
     }
 }
 
@@ -1452,6 +1518,20 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
+        if let Some(picker) = self
+            .session_picker
+            .as_mut()
+            .filter(|picker| picker.searching)
+        {
+            let normalized = normalize_paste(text).replace('\n', " ");
+            if normalized.is_empty() {
+                return false;
+            }
+            picker.search_query.push_str(&normalized);
+            picker.selected = 0;
+            picker.refresh_title_search();
+            return true;
+        }
         if self.recording.is_some()
             || self.transcription.is_some()
             || self.goal_picker.is_some()
@@ -2930,6 +3010,9 @@ impl App {
             projects,
             selected: 0,
             collapsed_sessions: HashSet::new(),
+            searching: false,
+            search_query: String::new(),
+            search_results: Vec::new(),
         };
         if let Some(selected) = picker.rows().iter().position(|row| {
             let SessionPickerRow::Session(project, section, session) = *row else {
@@ -2965,6 +3048,8 @@ impl App {
             .map(|project| project.project.root.clone())
             .collect::<Vec<_>>();
         let collapsed_sessions = existing.collapsed_sessions.clone();
+        let searching = existing.searching;
+        let search_query = existing.search_query.clone();
         let projects = list_session_projects(&self.project_root, &self.registry)?;
         let mut picker = SessionPicker {
             projects: projects
@@ -2992,7 +3077,11 @@ impl App {
                 .collect(),
             selected: 0,
             collapsed_sessions,
+            searching,
+            search_query,
+            search_results: Vec::new(),
         };
+        picker.refresh_title_search();
         for project in 0..picker.projects.len() {
             picker.select_session(project, selected_id);
             if picker
@@ -3083,6 +3172,38 @@ impl App {
         picker.selected = (picker.selected as isize + delta).rem_euclid(len as isize) as usize;
     }
 
+    fn start_session_search(&mut self) {
+        if let Some(picker) = self.session_picker.as_mut() {
+            picker.searching = true;
+            picker.selected = 0;
+        }
+    }
+
+    fn push_session_search_character(&mut self, character: char) {
+        if let Some(picker) = self.session_picker.as_mut() {
+            picker.search_query.push(character);
+            picker.selected = 0;
+            picker.refresh_title_search();
+        }
+    }
+
+    fn pop_session_search_character(&mut self) {
+        if let Some(picker) = self.session_picker.as_mut() {
+            picker.search_query.pop();
+            picker.selected = 0;
+            picker.refresh_title_search();
+        }
+    }
+
+    fn stop_session_search(&mut self) {
+        if let Some(picker) = self.session_picker.as_mut() {
+            picker.searching = false;
+            picker.search_query.clear();
+            picker.search_results.clear();
+            picker.selected = 0;
+        }
+    }
+
     fn move_session_left(&mut self) {
         let Some(picker) = &mut self.session_picker else {
             return;
@@ -3139,24 +3260,18 @@ impl App {
     }
 
     async fn accept_session_selection(&mut self) -> Result<()> {
-        let Some(row) = self
+        let Some((project_index, _, _, selected_session)) = self
             .session_picker
             .as_ref()
-            .and_then(SessionPicker::selected_row)
+            .and_then(SessionPicker::selected_session)
         else {
-            return Ok(());
-        };
-        let SessionPickerRow::Session(project_index, section, session_index) = row else {
             self.move_session_right();
             return Ok(());
         };
         let (root, id) = {
             let picker = self.session_picker.as_ref().unwrap();
             let project = &picker.projects[project_index].project;
-            (
-                project.root.clone(),
-                picker.projects[project_index].sessions(section)[session_index].id,
-            )
+            (project.root.clone(), selected_session.id)
         };
         if self.active_session {
             let current_id = self.conversation.snapshot().session.id;
@@ -3428,6 +3543,11 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let (searching, search_query) = self
+            .session_picker
+            .as_ref()
+            .map(|picker| (picker.searching, picker.search_query.clone()))
+            .unwrap_or_default();
         let mut picker = SessionPicker {
             projects: projects
                 .into_iter()
@@ -3450,7 +3570,11 @@ impl App {
                 .collect(),
             selected: 0,
             collapsed_sessions,
+            searching,
+            search_query,
+            search_results: Vec::new(),
         };
+        picker.refresh_title_search();
         picker.selected = selected.min(picker.rows().len().saturating_sub(1));
         self.session_picker = Some(picker);
         self.error =
@@ -4569,6 +4693,30 @@ impl App {
             return Ok(());
         }
         if self.session_picker.is_some() {
+            let searching = self
+                .session_picker
+                .as_ref()
+                .is_some_and(|picker| picker.searching);
+            if searching {
+                match key.code {
+                    KeyCode::Up => self.move_session_selection(-1),
+                    KeyCode::Down => self.move_session_selection(1),
+                    KeyCode::PageUp => self.move_session_selection(-5),
+                    KeyCode::PageDown => self.move_session_selection(5),
+                    KeyCode::Enter => self.accept_session_selection().await?,
+                    KeyCode::Backspace => self.pop_session_search_character(),
+                    KeyCode::Esc => self.stop_session_search(),
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                    {
+                        self.push_session_search_character(character);
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Up => self.move_session_selection(-1),
                 KeyCode::Down => self.move_session_selection(1),
@@ -4604,6 +4752,7 @@ impl App {
                         .await?;
                     }
                 }
+                KeyCode::Char('/') => self.start_session_search(),
                 KeyCode::Delete | KeyCode::Backspace => self.delete_session_selection().await?,
                 KeyCode::Esc => self.session_picker = None,
                 _ => {}
@@ -6887,10 +7036,10 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .iter()
         .map(|project| project.project.sessions.len())
         .sum::<usize>();
-    let height = (rows.len().min(16) as u16 + 5).clamp(8, area.height.saturating_sub(2).max(8));
+    let height = (rows.len().min(16) as u16 + 6).clamp(9, area.height.saturating_sub(2).max(9));
     let popup = centered_rect(area, 86, height);
     frame.render_widget(Clear, popup);
-    let available = popup.height.saturating_sub(4) as usize;
+    let available = popup.height.saturating_sub(5) as usize;
     let start = picker
         .selected
         .saturating_sub(available.saturating_sub(1))
@@ -6900,9 +7049,24 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .then(|| app.conversation.snapshot().session.id);
     let mut lines = vec![
         Line::from(Span::styled(
-            "↑↓ select  •  Enter resume  •  R rename  •  P pin  •  A archive  •  Del delete",
+            if picker.searching {
+                "Type to search  •  ↑↓ select  •  Enter resume  •  Esc clear search"
+            } else {
+                "↑↓ select  •  Enter resume  •  / search  •  R rename  •  P pin  •  A archive  •  Del delete"
+            },
             Style::default().fg(MUTED),
         )),
+        Line::from(vec![
+            Span::styled("Search titles: ", Style::default().fg(CRAB)),
+            Span::styled(
+                if picker.searching {
+                    format!("{}█", picker.search_query)
+                } else {
+                    picker.search_query.clone()
+                },
+                Style::default().fg(Color::White),
+            ),
+        ]),
         Line::default(),
     ];
     for (index, row) in rows.iter().enumerate().skip(start).take(available) {
@@ -7104,6 +7268,54 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ),
                 ])
             }
+            SessionPickerRow::SearchResult(result_index) => {
+                let result = picker.search_results[result_index];
+                let project = &picker.projects[result.project];
+                let session = &project.sessions(result.section)[result.session];
+                let project_label = project
+                    .project
+                    .root
+                    .as_ref()
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| "No project".into());
+                let active = Some(session.id) == current_id
+                    && match (&project.project.root, app.session_scope) {
+                        (None, SessionScope::NoProject) => true,
+                        (Some(root), SessionScope::Project) => paths_equal(root, &app.project_root),
+                        _ => false,
+                    };
+                Line::from(vec![
+                    Span::styled(
+                        if selected { " › " } else { "   " },
+                        Style::default().fg(AQUA),
+                    ),
+                    Span::styled(if active { "● " } else { "  " }, Style::default().fg(AQUA)),
+                    Span::styled(
+                        compact_text(&session.title, 30),
+                        Style::default()
+                            .fg(if selected { Color::White } else { AQUA })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if session.effectively_archived() {
+                            "  archived"
+                        } else if session.pinned_at.is_some() {
+                            "  pinned"
+                        } else {
+                            ""
+                        },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!(
+                            "  {}  U {}",
+                            compact_path(&project_label, 30),
+                            session.updated_at.format("%m-%d %H:%M")
+                        ),
+                        Style::default().fg(MUTED),
+                    ),
+                ])
+            }
         };
         lines.push(line.style(if selected {
             Style::default().bg(Color::Rgb(42, 48, 58))
@@ -7112,7 +7324,11 @@ fn render_session_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }));
     }
     if rows.is_empty() {
-        lines.push(Line::from("No saved sessions."));
+        lines.push(Line::from(if picker.search_query.is_empty() {
+            "No saved sessions."
+        } else {
+            "No session titles match this search."
+        }));
     }
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -11132,6 +11348,72 @@ mod tests {
         assert!(replacement.messages.is_empty());
         assert!(other_store.load(Some(&saved.id.to_string())).is_err());
         assert!(app.session_picker.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_picker_searches_ranked_titles_across_projects_and_resumes_archived_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let current_root = temp.path().join("current-project");
+        let other_root = temp.path().join("other-project");
+        fs::create_dir_all(&current_root).unwrap();
+        fs::create_dir_all(&other_root).unwrap();
+        let mut app = test_app(&current_root);
+        let registry = test_registry(temp.path());
+        registry.register(&other_root).unwrap();
+        app.registry = registry;
+        app.conversation
+            .update_metadata(SessionMetadataUpdate::Rename("Project Alpha".into()))
+            .await
+            .unwrap();
+        let other_store = SessionStore::new(&other_root).unwrap();
+        let mut exact = other_store.create("model".into()).unwrap();
+        exact.title = "Alpha".into();
+        exact.archived_at = Some(chrono::Utc::now());
+        other_store.save(&exact).unwrap();
+
+        app.open_session_picker().await.unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.handle_paste("pha"));
+
+        let picker = app.session_picker.as_ref().unwrap();
+        assert!(picker.searching);
+        assert_eq!(picker.search_query, "Alpha");
+        assert_eq!(picker.rows().len(), 2);
+        assert!(matches!(
+            picker.selected_row(),
+            Some(SessionPickerRow::SearchResult(0))
+        ));
+        assert_eq!(picker.selected_session().unwrap().3.id, exact.id);
+        assert!(picker.selected_session().unwrap().3.effectively_archived());
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Search titles: Alpha"));
+        assert!(text.contains("other-project"));
+        assert!(text.contains("archived"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.session_picker.is_none());
+        assert_eq!(app.conversation.snapshot().session.id, exact.id);
+        assert!(paths_equal(&app.project_root, &other_root));
     }
 
     #[tokio::test]
