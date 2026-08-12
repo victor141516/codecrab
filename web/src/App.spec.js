@@ -305,6 +305,10 @@ describe("OpenAI usage", () => {
       },
       projects: [{ root: "/workspace", sessions: [] }],
       skills: [],
+      commands: [
+        "help", "models", "skills", "sessions", "processes", "no-project",
+        "branches", "providers", "goal", "goals", "usage", "cron", "quit"
+      ],
       models: [],
       providers: [],
       workers: [],
@@ -408,6 +412,10 @@ describe("session provider selection", () => {
       },
       projects: [{ root: "/workspace", sessions: [] }],
       skills: [],
+      commands: [
+        "help", "models", "skills", "sessions", "processes", "no-project",
+        "branches", "providers", "goal", "goals", "usage", "cron", "quit"
+      ],
       models: [{
         slug: model,
         display_name: model,
@@ -488,6 +496,63 @@ describe("session provider selection", () => {
       expect(root.querySelector('span[title="Provider"]')?.textContent.trim()).toBe("openai")
     );
     expect(root.querySelector('select[aria-label="Provider"]')).toBeNull();
+  });
+
+  test("keeps built-in commands out of the active-turn queue but queues skills", async () => {
+    let chatRequests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input) => {
+      const url = String(input);
+      if (url === "/api/state") return response(workspaceState());
+      if (url === "/api/completions") return response(null);
+      if (url === "/api/chat") {
+        chatRequests += 1;
+        return new Promise(() => {});
+      }
+      throw new Error(`offline test: ${url}`);
+    }));
+
+    mountApp();
+    await vi.waitFor(() => expect(root.textContent).toContain("Provider test"));
+    const composer = get('[role="textbox"][aria-label="Message CodeCrab"]');
+
+    composer.textContent = "Keep working";
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+    );
+    await vi.waitFor(() => expect(chatRequests).toBe(1));
+
+    composer.textContent = "/help";
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+    );
+    await vi.waitFor(() =>
+      expect(root.textContent).toContain("Keyboard help is available in the terminal client")
+    );
+    expect(root.textContent).not.toContain("Queued 1");
+
+    composer.textContent = "/review-rust";
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+    );
+    await vi.waitFor(() => expect(root.textContent).toContain("Queued 1"));
+    expect(root.textContent).toContain("/review-rust");
+    expect(chatRequests).toBe(1);
+
+    get('button[aria-label="Edit queued message"]').click();
+    await vi.waitFor(() => expect(root.textContent).toContain("Editing"));
+    composer.textContent = "/help";
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+    );
+    await vi.waitFor(() =>
+      expect(root.textContent).toContain("cannot be saved as queued messages")
+    );
+    expect(root.textContent).toContain("/review-rust");
+    expect(root.textContent).toContain("Editing");
   });
 
   test("renders server-classified composer pills without changing the draft", async () => {
@@ -630,6 +695,10 @@ describe("managed terminal processes", () => {
         }]
       }],
       skills: [],
+      commands: [
+        "help", "models", "skills", "sessions", "processes", "no-project",
+        "branches", "providers", "goal", "goals", "usage", "cron", "quit"
+      ],
       models: [],
       providers: [],
       workers: [],

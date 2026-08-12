@@ -43,10 +43,10 @@ use crate::{
     changes::ChangeStore,
     code_server::{CodeServerManager, EditorStatus, ExtensionAction, ExtensionDiffFile},
     completion::{
-        CompletionItem, ComposerSegment, complete_with_policy as complete_input,
-        composer_decorations, composer_segments, file_completion_context_with_policy,
-        filesystem_root, recursive_file_completion_available, slash_completion_range,
-        start_file_completion_search,
+        CompletionItem, ComposerSegment, builtin_command_names,
+        complete_with_policy as complete_input, composer_decorations, composer_segments,
+        file_completion_context_with_policy, filesystem_root, recursive_file_completion_available,
+        slash_completion_range, start_file_completion_search,
     },
     config::{Config, ProviderSummary, SessionRegistry, paths_equal},
     conversation::{
@@ -143,6 +143,7 @@ struct StateResponse {
     session: Option<WebSession>,
     projects: Vec<SessionProject>,
     skills: Vec<SkillResponse>,
+    commands: Vec<&'static str>,
     models: Vec<ModelCatalogEntry>,
     catalog_error: Option<String>,
     dictation_available: bool,
@@ -1054,6 +1055,7 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
         session,
         projects,
         skills,
+        commands: builtin_command_names().collect(),
         models: selected_id
             .and_then(|id| state.inner.catalogs.read().unwrap().get(&id).cloned())
             .map(|catalog| catalog.models)
@@ -3306,6 +3308,10 @@ mod tests {
 
         assert!(response.cron.is_none());
         assert!(response.cron_error.unwrap().contains("not valid cron JSON"));
+        assert_eq!(
+            response.commands,
+            builtin_command_names().collect::<Vec<_>>()
+        );
         assert!(paths_equal(
             Path::new(response.project.as_ref().unwrap()),
             &root

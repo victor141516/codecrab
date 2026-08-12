@@ -4028,6 +4028,13 @@ impl App {
             return Ok(());
         }
         if self.queued_prompt_edit.is_some() {
+            if builtin_command_from_input(&self.input).is_some() {
+                self.error = Some(
+                    "Built-in commands cannot be saved as queued messages; cancel the edit to run the command."
+                        .into(),
+                );
+                return Ok(());
+            }
             self.finish_queued_prompt_edit(prompt);
             return Ok(());
         }
@@ -4108,18 +4115,18 @@ impl App {
             self.close_completion();
             return self.cron_command(&prompt).await;
         }
+        if builtin_command_from_input(&self.input).is_some() {
+            self.clear_composer_text();
+            self.preferred_column = None;
+            self.close_completion();
+            return self.command(&prompt).await;
+        }
         if self.is_running() {
             self.clear_composer_text();
             self.preferred_column = None;
             self.close_completion();
             self.prompt_queue.push(prompt, attachments);
             return Ok(());
-        }
-        if builtin_command_from_input(&self.input).is_some() {
-            self.clear_composer_text();
-            self.preferred_column = None;
-            self.close_completion();
-            return self.command(&prompt).await;
         }
 
         self.start_turn(prompt, attachments, true)?;
@@ -8698,6 +8705,44 @@ mod tests {
         assert!(app.is_running());
         assert_eq!(app.scroll, 7);
         assert!(!app.auto_scroll);
+        app.running.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn built_in_commands_bypass_the_queue_while_skills_remain_follow_ups() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        app.running = Some(tokio::spawn(std::future::pending()));
+        app.input = "/help".into();
+        app.cursor = app.input.len();
+
+        app.submit().await.unwrap();
+
+        assert!(app.show_help);
+        assert!(app.prompt_queue.items.is_empty());
+
+        app.show_help = false;
+        app.input = "/review-rust".into();
+        app.cursor = app.input.len();
+        app.submit().await.unwrap();
+
+        assert_eq!(app.prompt_queue.items.len(), 1);
+        assert_eq!(app.prompt_queue.items[0].content, "/review-rust");
+
+        let queued_id = app.prompt_queue.items[0].id;
+        app.begin_queued_prompt_edit(queued_id);
+        app.input = "/help".into();
+        app.cursor = app.input.len();
+        app.submit().await.unwrap();
+
+        assert_eq!(app.prompt_queue.items[0].content, "/review-rust");
+        assert!(app.queued_prompt_edit.is_some());
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("cannot be saved as queued messages")
+        );
         app.running.take().unwrap().abort();
     }
 

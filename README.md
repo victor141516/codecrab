@@ -150,7 +150,7 @@ Long shell commands are limited to one terminal activity row and end with an ell
 
 When a managed shell command remains active, its session row shows a live count. `/processes` opens the current session's process list in both clients; the web count opens the same view after selecting that session. Each entry shows its command and duration and can open a read-only, ANSI-styled live viewer, jump to the exact shell activity that created it, or stop its complete managed process tree after confirmation. The viewer retains the existing 1 MiB terminal scrollback, interprets overwritten lines, and stays open with a final state when the command finishes. Stopping a process does not stop the agent turn, so the agent may run it again if needed.
 
-Sending a new turn while the agent is idle jumps the terminal conversation to the bottom and resumes automatic following. You can keep typing while an agent turn runs; sending then adds an editable follow-up to a queue without changing a manually scrolled position. **Steer** cancels the current turn and sends one selected follow-up next without reordering the rest.
+Sending a new turn while the agent is idle jumps the terminal conversation to the bottom and resumes automatic following. You can keep typing while an agent turn runs; sending then adds an editable follow-up to a queue without changing a manually scrolled position. Built-in slash commands remain local client actions: they run immediately when compatible with the active turn, or report why they cannot run, and never enter the follow-up queue. Skill invocations are agent prompts and may be queued normally. **Steer** cancels the current turn and sends one selected follow-up next without reordering the rest.
 
 ### One-shot CLI
 
