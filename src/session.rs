@@ -894,7 +894,7 @@ impl SessionProject {
         let mut active = self
             .sessions
             .iter()
-            .filter(|session| !session.effectively_archived())
+            .filter(|session| session.pinned_at.is_none() && !session.effectively_archived())
             .cloned()
             .collect::<Vec<_>>();
         normalize_flat_rows(&mut active);
@@ -2271,7 +2271,7 @@ mod tests {
                 .iter()
                 .map(|session| session.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["root", "child"]
+            vec!["root"]
         );
         let pinned = project.pinned_sessions();
         assert_eq!(pinned.len(), 1);

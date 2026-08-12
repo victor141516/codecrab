@@ -99,6 +99,10 @@ textarea:focus-visible,
   border-bottom: 1px solid rgb(255 255 255 / 0.07);
 }
 
+.sidebar-session-row.is-pinned-section:not(.is-current) {
+  background: rgb(34 211 238 / 0.025);
+}
+
 .sidebar-session-row.is-current {
   background: rgb(244 99 86 / 0.09);
   box-shadow: none;

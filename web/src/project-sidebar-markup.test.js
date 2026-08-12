@@ -14,13 +14,15 @@ test("sidebar renders every project with nested sessions and exact project actio
   assert.match(appSource, /current-session-dot/);
   assert.match(appSource, /sidebar-session-list/);
   assert.match(appSource, /:data-session-depth="item\.depth"/);
-  assert.match(appSource, /item\.depth \* 0\.75/);
+  assert.match(appSource, /1\.75 \+ item\.depth \* 0\.75/);
   assert.match(appSource, /item\.descendant_count > 0/);
   assert.match(appSource, /@click\.stop="toggleSession\(item\.id\)"/);
   assert.match(appSource, /item\.ancestor_titles\.slice\(-2\)/);
   assert.match(appSource, /togglePinned\(project\.root, item\)/);
   assert.match(appSource, /toggleArchived\(project\.root, item\)/);
-  assert.match(appSource, /beginSessionRename\(item\)/);
+  assert.match(appSource, /@click\.stop="openSessionFromTitle\(project\.root, item\)"/);
+  assert.match(appSource, /@dblclick\.stop\.prevent="renameSessionFromTitle\(item\)"/);
+  assert.doesNotMatch(appSource, /@click\.stop="beginSessionRename\(item\)"/);
   assert.match(appSource, /project\.pinned_sessions/);
   assert.match(appSource, /project\.archived_sessions/);
 });

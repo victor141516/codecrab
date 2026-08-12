@@ -155,6 +155,7 @@ const collapsedSessions = ref(new Set());
 const expandedArchivedProjects = ref(new Set());
 const editingSessionRowKey = ref(null);
 const editingSessionTitle = ref("");
+let sessionTitleOpenTimer = null;
 const projectPickerOpen = ref(false);
 const directoryListing = ref(null);
 const directoryPathDraft = ref("");
@@ -1123,6 +1124,20 @@ async function toggleArchived(project, item) {
   await updateSessionMetadata(project, item.id, { archived });
 }
 
+function openSessionFromTitle(project, item) {
+  window.clearTimeout(sessionTitleOpenTimer);
+  sessionTitleOpenTimer = window.setTimeout(() => {
+    sessionTitleOpenTimer = null;
+    void resumeSession(project, item.id);
+  }, 220);
+}
+
+function renameSessionFromTitle(item) {
+  window.clearTimeout(sessionTitleOpenTimer);
+  sessionTitleOpenTimer = null;
+  beginSessionRename(item);
+}
+
 function beginSessionRename(item) {
   editingSessionRowKey.value = item.row_key;
   editingSessionTitle.value = item.title ?? "";
@@ -1560,7 +1575,10 @@ function toggleArchivedProject(root) {
 function projectSessionRows(project) {
   const rows = [];
   const pinned = project.pinned_sessions ?? [];
-  const active = visibleProjectSessions(project);
+  const pinnedIds = new Set(pinned.map((item) => item.id));
+  const active = visibleProjectSessions(project).filter(
+    (item) => !pinnedIds.has(item.id)
+  );
   const archived = project.archived_sessions ?? [];
   if (pinned.length) {
     rows.push({
@@ -1577,6 +1595,15 @@ function projectSessionRows(project) {
         section: "pinned"
       }))
     );
+  }
+  if (pinned.length && active.length) {
+    rows.push({
+      section_header: true,
+      row_key: "active-header",
+      title: "Sessions",
+      count: active.filter((item) => item.depth === 0).length,
+      section: "active"
+    });
   }
   rows.push(
     ...active.map((item) => ({
@@ -4186,6 +4213,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.removeEventListener("resize", clampEditorToViewport);
   window.clearTimeout(copiedMessageTimer);
+  window.clearTimeout(sessionTitleOpenTimer);
   window.clearTimeout(editorStatusTimer);
   window.clearTimeout(editorFollowTimer);
   editorResizeCleanup?.();
@@ -4874,7 +4902,7 @@ onBeforeUnmount(() => {
 
           <div
             v-if="projectExpanded(project.root)"
-            class="sidebar-session-list ml-3 pl-2"
+            class="sidebar-session-list -mx-2"
           >
             <p
               v-if="!project.sessions.length"
@@ -4888,7 +4916,7 @@ onBeforeUnmount(() => {
             >
               <button
                 v-if="item.section_header"
-                class="flex w-full items-center gap-2 px-2 py-1.5 text-left text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500"
+                class="flex w-full items-center gap-2 py-1.5 pl-7 pr-2 text-left text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500"
                 :class="{ 'hover:text-zinc-300': item.section === 'archived' }"
                 :aria-expanded="item.section === 'archived' ? archivedProjectExpanded(project.root) : undefined"
                 @click="item.section === 'archived' && toggleArchivedProject(project.root)"
@@ -4906,8 +4934,11 @@ onBeforeUnmount(() => {
               <div
                 v-else
               class="sidebar-session-row group/session flex w-full items-center transition"
-              :class="{ 'is-current': isCurrentSession(project, item) }"
-              :style="{ paddingLeft: `${item.depth * 0.75}rem` }"
+              :class="{
+                'is-current': isCurrentSession(project, item),
+                'is-pinned-section': item.section === 'pinned'
+              }"
+              :style="{ paddingLeft: `${1.75 + item.depth * 0.75}rem` }"
               :data-session-depth="item.depth"
             >
               <button
@@ -4931,7 +4962,7 @@ onBeforeUnmount(() => {
               >
                 <span
                   v-if="isCurrentSession(project, item)"
-                  class="current-session-dot absolute left-0 size-1.5 rounded-full bg-coral"
+                  class="current-session-dot absolute left-7 size-1.5 rounded-full bg-coral"
                   aria-hidden="true"
                 />
                 <CalendarClock
@@ -4955,8 +4986,9 @@ onBeforeUnmount(() => {
                 <span
                   v-else
                   class="min-w-0 flex-1 truncate text-[13px] text-zinc-300 group-hover/session:text-white"
-                  title="Click to rename"
-                  @click.stop="beginSessionRename(item)"
+                  title="Double-click to rename"
+                  @click.stop="openSessionFromTitle(project.root, item)"
+                  @dblclick.stop.prevent="renameSessionFromTitle(item)"
                 >
                   {{ item.title || "New session" }}
                 </span>

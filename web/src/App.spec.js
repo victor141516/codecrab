@@ -96,6 +96,110 @@ describe("desktop project sidebar", () => {
   });
 });
 
+describe("session sidebar actions", () => {
+  function response(body) {
+    return { ok: true, status: 200, json: async () => body };
+  }
+
+  function sidebarState(activeSessionId = "regular") {
+    const pinned = {
+      id: "pinned",
+      title: "Pinned session",
+      depth: 0,
+      descendant_count: 0,
+      ancestor_titles: [],
+      pinned_at: "2026-08-12T12:00:00Z",
+      active_terminal_count: 0
+    };
+    const regular = {
+      id: "regular",
+      title: "Regular session",
+      depth: 0,
+      descendant_count: 0,
+      ancestor_titles: [],
+      pinned_at: null,
+      active_terminal_count: 0
+    };
+    const active = activeSessionId === "pinned" ? pinned : regular;
+    return {
+      live_revision: 1,
+      project: "/workspace",
+      filesystem_root: "/",
+      session: {
+        ...active,
+        provider: "openai",
+        model: "gpt-test",
+        messages: [],
+        activities: [],
+        turns: [],
+        goals: [],
+        branch_nodes: [],
+        active_message_ids: []
+      },
+      projects: [{
+        root: "/workspace",
+        sessions: [pinned, regular],
+        pinned_sessions: [pinned],
+        active_sessions: [pinned, regular],
+        archived_sessions: []
+      }],
+      skills: [],
+      models: [],
+      providers: [],
+      workers: [],
+      usage: { available: false },
+      cron: null
+    };
+  }
+
+  test("separates pinned rows and reserves rename for a double click", async () => {
+    const resumeBodies = [];
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url === "/api/state") return response(sidebarState());
+      if (url === "/api/sessions/resume") {
+        const body = JSON.parse(options.body);
+        resumeBodies.push(body);
+        return response(sidebarState(body.id));
+      }
+      throw new Error("offline test");
+    }));
+
+    mountApp();
+    await vi.waitFor(() =>
+      expect(root.textContent).toContain("Regular session")
+    );
+
+    const titles = [...root.querySelectorAll('[title="Double-click to rename"]')];
+    expect(titles.map((item) => item.textContent.trim())).toEqual([
+      "Pinned session",
+      "Regular session"
+    ]);
+    expect(root.textContent).toContain("Pinned");
+    expect(root.textContent).toContain("Sessions");
+
+    titles[1].click();
+    await nextTick();
+    expect(root.querySelector('[aria-label="Session title"]')).toBeNull();
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+    await vi.waitFor(() =>
+      expect(resumeBodies).toEqual([{ project: "/workspace", id: "regular" }])
+    );
+
+    const pinnedTitle = [...root.querySelectorAll('[title="Double-click to rename"]')]
+      .find((item) => item.textContent.trim() === "Pinned session");
+    pinnedTitle.click();
+    pinnedTitle.click();
+    pinnedTitle.dispatchEvent(
+      new MouseEvent("dblclick", { bubbles: true, cancelable: true })
+    );
+    await nextTick();
+    expect(get('[aria-label="Session title"]').value).toBe("Pinned session");
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+    expect(resumeBodies).toHaveLength(1);
+  });
+});
+
 describe("No project sessions", () => {
   test("renders the global group and creates a session without a project path", async () => {
     const neutralState = {
