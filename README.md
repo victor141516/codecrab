@@ -144,6 +144,8 @@ Useful composer controls:
 
 Run `/help` or press `F1` for the complete keyboard reference. The terminal handles Unicode-aware soft wrapping, international keyboard layouts including AltGr, Markdown and code highlighting, mouse selection, native clipboard copy, and explicit image/file clipboard paste.
 
+Both composers identify references while you write. Built-in commands are green, skills are blue, existing files are cyan, directories are yellow, and unrecognized slash or `@path` references are red. The web presents these references as inline pills in its plain-text rich composer; the underlying prompt, selection, autocomplete, dictation, attachments, drafts, and queued-message behavior remain text-compatible.
+
 Long shell commands are limited to one terminal activity row and end with an ellipsis only when they exceed the available width; copying the activity still returns the complete command. The web client keeps its expand/collapse control, while `codecrab run` prints complete command activity.
 
 When a managed shell command remains active, its session row shows a live count. `/processes` opens the current session's process list in both clients; the web count opens the same view after selecting that session. Each entry shows its command and duration and can open a read-only, ANSI-styled live viewer, jump to the exact shell activity that created it, or stop its complete managed process tree after confirmation. The viewer retains the existing 1 MiB terminal scrollback, interprets overwritten lines, and stays open with a final state when the command finishes. Stopping a process does not stop the agent turn, so the agent may run it again if needed.

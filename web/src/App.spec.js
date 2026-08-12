@@ -349,18 +349,22 @@ describe("session provider selection", () => {
       expect(get('select[aria-label="Model"]').value).toBe("local-model")
     );
 
-    const composer = get("textarea");
-    composer.value = "/providers";
+    const composer = get('[role="textbox"][aria-label="Message CodeCrab"]');
+    composer.textContent = "/providers";
     composer.dispatchEvent(new InputEvent("input", { bubbles: true, data: "s" }));
     await nextTick();
-    composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+    );
     await vi.waitFor(() => expect(document.activeElement).toBe(provider));
     expect(chatRequested).toBe(false);
 
-    composer.value = "/models";
+    composer.textContent = "/models";
     composer.dispatchEvent(new InputEvent("input", { bubbles: true, data: "s" }));
     await nextTick();
-    composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+    );
     await vi.waitFor(() =>
       expect(document.activeElement).toBe(get('select[aria-label="Model"]'))
     );
@@ -380,6 +384,111 @@ describe("session provider selection", () => {
       expect(root.querySelector('span[title="Provider"]')?.textContent.trim()).toBe("openai")
     );
     expect(root.querySelector('select[aria-label="Provider"]')).toBeNull();
+  });
+
+  test("renders server-classified composer pills without changing the draft", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url === "/api/state") return response(workspaceState());
+      if (url === "/api/completions") {
+        const request = JSON.parse(options.body);
+        return response({
+          request_id: request.request_id,
+          items: [],
+          replace_before: "",
+          replace_after: "",
+          recursive: false,
+          slash_context: false,
+          segments: [
+            { text: "Use ", kind: null },
+            { text: "/review-rust", kind: "skill" },
+            { text: " on ", kind: null },
+            { text: "@src/main.rs", kind: "file" },
+            { text: " then ", kind: null },
+            { text: "/missing", kind: "invalid" }
+          ]
+        });
+      }
+      throw new Error("offline test");
+    }));
+
+    mountApp();
+    await vi.waitFor(() => expect(root.textContent).toContain("Provider test"));
+    const composer = get('[role="textbox"][aria-label="Message CodeCrab"]');
+    const draft = "Use /review-rust on @src/main.rs then /missing";
+    composer.textContent = draft;
+    composer.dispatchEvent(
+      new InputEvent("input", { bubbles: true, data: "/missing" })
+    );
+
+    await vi.waitFor(() =>
+      expect(composer.querySelectorAll("[data-composer-token]").length).toBe(3)
+    );
+    expect(
+      [...composer.querySelectorAll("[data-composer-token]")].map((token) => [
+        token.textContent,
+        token.dataset.composerToken
+      ])
+    ).toEqual([
+      ["/review-rust", "skill"],
+      ["@src/main.rs", "file"],
+      ["/missing", "invalid"]
+    ]);
+    expect(composer.textContent).toBe(draft);
+  });
+
+  test("accepts autocomplete at a contenteditable caret and restores that caret", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url === "/api/state") return response(workspaceState());
+      if (url === "/api/completions") {
+        const request = JSON.parse(options.body);
+        const completing = request.before_cursor === "/rev";
+        return response({
+          request_id: request.request_id,
+          items: completing
+            ? [{
+                id: "skill:review-rust",
+                name: "review-rust",
+                display: "review-rust",
+                description: "Review Rust changes.",
+                icon: null,
+                kind: "skill",
+                replacement: "/review-rust "
+              }]
+            : [],
+          replace_before: completing ? "/rev" : "",
+          replace_after: "",
+          recursive: false,
+          slash_context: completing,
+          segments: completing
+            ? [{ text: "/rev", kind: "invalid" }]
+            : [{ text: request.before_cursor, kind: "skill" }]
+        });
+      }
+      throw new Error("offline test");
+    }));
+
+    mountApp();
+    await vi.waitFor(() => expect(root.textContent).toContain("Provider test"));
+    const composer = get('[role="textbox"][aria-label="Message CodeCrab"]');
+    composer.textContent = "/rev";
+    composer.focus();
+    const range = document.createRange();
+    range.selectNodeContents(composer);
+    range.collapse(false);
+    document.getSelection().removeAllRanges();
+    document.getSelection().addRange(range);
+    composer.dispatchEvent(new InputEvent("input", { bubbles: true, data: "v" }));
+    await vi.waitFor(() => expect(root.querySelector("#completion-0")).not.toBeNull());
+
+    composer.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })
+    );
+
+    await vi.waitFor(() => expect(composer.textContent).toBe("/review-rust "));
+    expect(document.activeElement).toBe(composer);
+    expect(document.getSelection().anchorOffset).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -491,8 +600,8 @@ describe("managed terminal processes", () => {
     await vi.waitFor(() =>
       expect(root.querySelector('button[aria-label^="Open 1 active process"]')).not.toBeNull()
     );
-    const composer = get('textarea[aria-label="Message CodeCrab"]');
-    composer.value = "/processes";
+    const composer = get('[role="textbox"][aria-label="Message CodeCrab"]');
+    composer.textContent = "/processes";
     composer.dispatchEvent(new Event("input", { bubbles: true }));
     await nextTick();
     get('button[aria-label="Send message"]').click();

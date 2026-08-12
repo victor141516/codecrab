@@ -79,6 +79,35 @@ pub(crate) enum CompletionKind {
     Directory,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ComposerDecorationKind {
+    Command,
+    Skill,
+    File,
+    Directory,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ComposerDecoration {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) kind: ComposerDecorationKind,
+}
+
+impl ComposerDecoration {
+    fn new(start: usize, end: usize, kind: ComposerDecorationKind) -> Self {
+        Self { start, end, kind }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ComposerSegment {
+    pub(crate) text: String,
+    pub(crate) kind: Option<ComposerDecorationKind>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CompletionItem {
     pub(crate) id: String,
@@ -224,6 +253,114 @@ pub(crate) fn goal_objective_from_input(input: &str) -> Option<&str> {
         .is_some_and(char::is_whitespace)
         .then(|| objective.trim())
         .filter(|objective| !objective.is_empty())
+}
+
+pub(crate) fn composer_decorations<'a>(
+    input: &str,
+    working_directory: &Path,
+    skills: impl IntoIterator<Item = (&'a str, &'a str)>,
+    usage_available: bool,
+    absolute_only: bool,
+) -> Vec<ComposerDecoration> {
+    let skills = skills
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<HashSet<_>>();
+    let mut decorations = Vec::new();
+    let mut index = 0;
+    while index < input.len() {
+        let character = input[index..]
+            .chars()
+            .next()
+            .expect("index remains on a character boundary");
+        let token_boundary = index == 0
+            || input[..index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        if token_boundary && character == '/' {
+            let mut end = index + 1;
+            while end < input.len() && is_completion_name_byte(input.as_bytes()[end]) {
+                end += 1;
+            }
+            let name = &input[index + 1..end];
+            let command = index == 0
+                && COMMANDS.iter().any(|(candidate, _)| {
+                    *candidate == name && (*candidate != "usage" || usage_available)
+                });
+            let kind = if command {
+                ComposerDecorationKind::Command
+            } else if skills.contains(name) {
+                ComposerDecorationKind::Skill
+            } else {
+                ComposerDecorationKind::Invalid
+            };
+            decorations.push(ComposerDecoration::new(index, end, kind));
+            index = end;
+            continue;
+        }
+        if token_boundary && character == '@' {
+            let mut end = index + 1;
+            while end < input.len() {
+                let next = input[end..]
+                    .chars()
+                    .next()
+                    .expect("end remains on a character boundary");
+                if next.is_whitespace() {
+                    break;
+                }
+                end += next.len_utf8();
+            }
+            let value = &input[index + 1..end];
+            let path = Path::new(value);
+            let valid_scope = !value.is_empty() && (!absolute_only || path.is_absolute());
+            let resolved = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                working_directory.join(path)
+            };
+            let kind = if valid_scope && resolved.is_dir() {
+                ComposerDecorationKind::Directory
+            } else if valid_scope && resolved.is_file() {
+                ComposerDecorationKind::File
+            } else {
+                ComposerDecorationKind::Invalid
+            };
+            decorations.push(ComposerDecoration::new(index, end, kind));
+            index = end;
+            continue;
+        }
+        index += character.len_utf8();
+    }
+    decorations
+}
+
+pub(crate) fn composer_segments(
+    input: &str,
+    decorations: &[ComposerDecoration],
+) -> Vec<ComposerSegment> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for decoration in decorations {
+        if cursor < decoration.start {
+            segments.push(ComposerSegment {
+                text: input[cursor..decoration.start].to_owned(),
+                kind: None,
+            });
+        }
+        segments.push(ComposerSegment {
+            text: input[decoration.start..decoration.end].to_owned(),
+            kind: Some(decoration.kind),
+        });
+        cursor = decoration.end;
+    }
+    if cursor < input.len() {
+        segments.push(ComposerSegment {
+            text: input[cursor..].to_owned(),
+            kind: None,
+        });
+    }
+    segments
 }
 
 struct SlashCompletionContext<'a> {
@@ -1130,6 +1267,131 @@ mod tests {
         assert_eq!(goal_objective_from_input("Explain /goal syntax"), None);
         assert_eq!(goal_objective_from_input("/goals"), None);
         assert_eq!(goal_objective_from_input("/goal"), None);
+    }
+
+    #[test]
+    fn composer_decorations_classify_commands_skills_and_unknown_slashes() {
+        let root = tempfile::tempdir().unwrap();
+        let input = "/help then /review-rust and /missing";
+
+        let decorations = composer_decorations(
+            input,
+            root.path(),
+            [("review-rust", "Review Rust changes.")],
+            true,
+            false,
+        );
+
+        assert_eq!(
+            decorations,
+            vec![
+                ComposerDecoration::new(0, 5, ComposerDecorationKind::Command),
+                ComposerDecoration::new(11, 23, ComposerDecorationKind::Skill),
+                ComposerDecoration::new(28, 36, ComposerDecorationKind::Invalid),
+            ]
+        );
+    }
+
+    #[test]
+    fn composer_decorations_only_treat_commands_as_commands_at_the_start() {
+        let root = tempfile::tempdir().unwrap();
+
+        let decorations = composer_decorations(
+            "Explain /help and visit https://example.com/a/b",
+            root.path(),
+            [],
+            true,
+            false,
+        );
+
+        assert_eq!(
+            decorations,
+            vec![ComposerDecoration::new(
+                8,
+                13,
+                ComposerDecorationKind::Invalid,
+            )]
+        );
+    }
+
+    #[test]
+    fn composer_decorations_classify_existing_and_missing_file_references() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        let input = "Read @main.rs and @src then @missing.rs";
+
+        let decorations = composer_decorations(input, root.path(), [], true, false);
+
+        assert_eq!(
+            decorations,
+            vec![
+                ComposerDecoration::new(5, 13, ComposerDecorationKind::File),
+                ComposerDecoration::new(18, 22, ComposerDecorationKind::Directory),
+                ComposerDecoration::new(28, 39, ComposerDecorationKind::Invalid),
+            ]
+        );
+    }
+
+    #[test]
+    fn composer_decorations_keep_no_project_and_usage_availability_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let unavailable = composer_decorations("/usage @main.rs", root.path(), [], false, true);
+        assert_eq!(
+            unavailable
+                .iter()
+                .map(|decoration| decoration.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ComposerDecorationKind::Invalid,
+                ComposerDecorationKind::Invalid,
+            ]
+        );
+
+        let available = composer_decorations("/usage", root.path(), [], true, false);
+        assert_eq!(
+            available,
+            vec![ComposerDecoration::new(
+                0,
+                6,
+                ComposerDecorationKind::Command,
+            )]
+        );
+    }
+
+    #[test]
+    fn composer_segments_reconstruct_unicode_input_without_exposing_byte_offsets() {
+        let root = tempfile::tempdir().unwrap();
+        let input = "🦀 usa /review-rust, luego /nope";
+        let decorations = composer_decorations(
+            input,
+            root.path(),
+            [("review-rust", "Review Rust changes.")],
+            true,
+            false,
+        );
+
+        let segments = composer_segments(input, &decorations);
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+            input
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .filter_map(|segment| segment.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ComposerDecorationKind::Skill,
+                ComposerDecorationKind::Invalid
+            ]
+        );
     }
 
     #[test]

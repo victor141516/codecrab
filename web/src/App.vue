@@ -46,6 +46,7 @@ import {
   Trash2,
   X
 } from "@lucide/vue";
+import ComposerEditor from "./ComposerEditor.vue";
 import { renderMarkdown } from "./markdown.js";
 import {
   createComposerDraftController,
@@ -148,6 +149,7 @@ const autoScroll = ref(true);
 const waveformCanvas = ref(null);
 const autocomplete = ref(null);
 const autocompleteSelection = ref(0);
+const composerSegments = ref([]);
 const expandedProjects = ref(new Set());
 const collapsedSessions = ref(new Set());
 const expandedArchivedProjects = ref(new Set());
@@ -309,6 +311,7 @@ function loadAttachmentDraft(project, sessionId) {
 async function activateComposerDraft(project, sessionId, options) {
   await composerDrafts.activate(project, sessionId, options);
   loadAttachmentDraft(project, sessionId);
+  if (sessionId && draft.value) await refreshAutocomplete();
 }
 
 async function beginComposerNavigation() {
@@ -330,6 +333,7 @@ async function rollbackComposerNavigation(source) {
   attachmentDraftIdentity = source.attachmentSource.identity;
   draftAttachments.value = source.attachmentSource.bindings;
   replacingAttachmentDraft = false;
+  if (attachmentDraftIdentity && draft.value) await refreshAutocomplete();
 }
 
 function forgetComposerDraft(project, sessionId) {
@@ -1935,6 +1939,7 @@ async function recallLatestUserMessage() {
   resizeComposer();
   composer.value?.focus();
   composer.value?.setSelectionRange(draft.value.length, draft.value.length);
+  await refreshAutocomplete();
   return true;
 }
 
@@ -2203,11 +2208,14 @@ async function startWaveform(stream) {
 
 async function insertTranscript(text) {
   const element = composer.value;
-  const focused = document.activeElement === element;
+  const focused = element?.isFocused() ?? false;
+  const selection = focused
+    ? element.getSelectionRange()
+    : { start: draft.value.length, end: draft.value.length };
   const result = insertTranscriptAtSelection(draft.value, text, {
     focused,
-    start: focused ? element.selectionStart : draft.value.length,
-    end: focused ? element.selectionEnd : draft.value.length
+    start: selection.start,
+    end: selection.end
   });
   if (!result.inserted) return false;
   draft.value = result.value;
@@ -2215,7 +2223,7 @@ async function insertTranscript(text) {
   element?.focus();
   element?.setSelectionRange(result.cursor, result.cursor);
   resizeComposer();
-  await refreshAutocomplete(element);
+  await refreshAutocomplete();
   return true;
 }
 
@@ -2902,6 +2910,7 @@ async function beginQueuedPromptEdit(item) {
   resizeComposer();
   composer.value?.focus();
   composer.value?.setSelectionRange(draft.value.length, draft.value.length);
+  await refreshAutocomplete();
 }
 
 async function restoreDraftAfterQueuedPromptEdit(runtime, edit) {
@@ -2913,6 +2922,7 @@ async function restoreDraftAfterQueuedPromptEdit(runtime, edit) {
   await nextTick();
   resizeComposer();
   composer.value?.focus();
+  if (draft.value) await refreshAutocomplete();
 }
 
 function dispatchQueuedPromptIfIdle(sessionId) {
@@ -3098,15 +3108,14 @@ function closeAutocomplete() {
   slashCompletionOpening.close();
 }
 
-async function refreshAutocomplete(
-  element = composer.value,
-  forceNewSkillOpening = false
-) {
-  if (!element || sending.value) {
+async function refreshAutocomplete(forceNewSkillOpening = false) {
+  const element = composer.value;
+  if (!element) {
     closeAutocomplete();
     return;
   }
-  const cursor = element.selectionStart ?? draft.value.length;
+  const autocompleteAllowed = !sending.value;
+  const cursor = element.getSelectionRange().start;
   const request = ++autocompleteRequest;
   const beforeCursor = draft.value.slice(0, cursor);
   const afterCursor = draft.value.slice(cursor);
@@ -3135,6 +3144,13 @@ async function refreshAutocomplete(
       slashCompletionOpening.update(result);
       if (request !== autocompleteRequest) return;
       if (!result) {
+        autocomplete.value = null;
+        return;
+      }
+      composerSegments.value = result.segments ?? [
+        { text: draft.value, kind: null }
+      ];
+      if (!autocompleteAllowed || !(result.items?.length || result.recursive)) {
         autocomplete.value = null;
         return;
       }
@@ -3201,10 +3217,7 @@ async function streamRecursiveCompletions(payload, request, controller) {
 
 function handleComposerInput(event) {
   resizeComposer();
-  refreshAutocomplete(
-    event.target,
-    typeof event.data === "string" && event.data.includes("/")
-  );
+  refreshAutocomplete(typeof event.data === "string" && event.data.includes("/"));
 }
 
 function moveAutocomplete(delta) {
@@ -3220,7 +3233,7 @@ async function acceptAutocomplete(index = autocompleteSelection.value) {
   const element = composer.value;
   if (!menu || !item || !element) return;
 
-  const cursor = element.selectionStart ?? draft.value.length;
+  const cursor = element.getSelectionRange().start;
   const start = cursor - menu.replace_before.length;
   const end = cursor + menu.replace_after.length;
   if (
@@ -3228,7 +3241,7 @@ async function acceptAutocomplete(index = autocompleteSelection.value) {
     draft.value.slice(start, cursor) !== menu.replace_before ||
     draft.value.slice(cursor, end) !== menu.replace_after
   ) {
-    await refreshAutocomplete(element);
+    await refreshAutocomplete();
     return;
   }
 
@@ -3241,7 +3254,7 @@ async function acceptAutocomplete(index = autocompleteSelection.value) {
   element.setSelectionRange(nextCursor, nextCursor);
   resizeComposer();
   if (item.kind === "directory") {
-    await refreshAutocomplete(element);
+    await refreshAutocomplete();
   }
 }
 
@@ -3304,9 +3317,7 @@ function handleComposerKey(event) {
 }
 
 function resizeComposer() {
-  if (!composer.value) return;
-  composer.value.style.height = "auto";
-  composer.value.style.height = `${Math.min(composer.value.scrollHeight, 192)}px`;
+  composer.value?.resize();
 }
 
 async function clearComposer(options) {
@@ -3402,8 +3413,11 @@ async function insertBrowserFiles(files) {
         continue;
       }
       const element = composer.value;
-      const start = element?.selectionStart ?? draft.value.length;
-      const end = element?.selectionEnd ?? start;
+      const selection = element?.getSelectionRange() ?? {
+        start: draft.value.length,
+        end: draft.value.length
+      };
+      const { start, end } = selection;
       const previousDraft = draft.value;
       const inserted = insertAttachmentReference(
         previousDraft,
@@ -5823,11 +5837,11 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="composer-shell">
-              <textarea
+              <ComposerEditor
                 ref="composer"
                 v-model="draft"
-                rows="1"
-                class="max-h-48 min-h-12 w-full resize-none bg-transparent px-4 py-3.5 text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 disabled:cursor-not-allowed disabled:opacity-40"
+                :segments="composerSegments"
+                class="disabled:cursor-not-allowed disabled:opacity-40"
                 :disabled="branchesOpen || Boolean(editingMessageNode)"
                 placeholder="Message CodeCrab…"
                 aria-label="Message CodeCrab"
@@ -5842,7 +5856,7 @@ onBeforeUnmount(() => {
                 @paste="pasteAttachments"
                 @dragover.prevent
                 @drop.prevent="dropAttachments"
-                @select="refreshAutocomplete($event.target)"
+                @select="refreshAutocomplete()"
                 @blur="handleComposerBlur"
                 @keydown="handleComposerKey"
               />
