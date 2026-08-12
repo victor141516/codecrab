@@ -61,7 +61,8 @@ use crate::{
     provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection},
     session::{
         Session, SessionMetadataUpdate, SessionProject, SessionStore, SessionSummary,
-        arrange_session_projects, list_session_projects, resolve_global_session,
+        SessionTitleMatch, arrange_session_projects, list_session_projects, resolve_global_session,
+        search_session_titles,
     },
     skills::SkillRegistry,
     terminal::{TerminalOutputSnapshot, TerminalProcessState},
@@ -277,6 +278,11 @@ struct AttachmentResponse {
 #[derive(Deserialize)]
 struct ConversationRequest {
     session_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct SessionTitleSearchRequest {
+    query: String,
 }
 
 #[derive(Deserialize)]
@@ -678,6 +684,7 @@ fn server_app(state: ServerState) -> Router {
                 .route("/branches/preview", post(preview_branch))
                 .route("/branches/select", post(select_branch))
                 .route("/sessions", post(new_session))
+                .route("/sessions/search", get(search_sessions))
                 .route("/sessions/stream", get(session_stream))
                 .route("/sessions/metadata", put(update_session_metadata))
                 .route("/sessions/delete", post(delete_session))
@@ -1079,6 +1086,15 @@ async fn snapshot_for(state: &ServerState, requested: Option<Uuid>) -> Result<St
 
 async fn snapshot(state: &ServerState) -> Result<StateResponse> {
     snapshot_for(state, None).await
+}
+
+async fn search_sessions(
+    State(state): State<ServerState>,
+    Query(request): Query<SessionTitleSearchRequest>,
+) -> ApiResult<Vec<SessionTitleMatch>> {
+    let root = state.inner.workspace.lock().await.root.clone();
+    let projects = live_session_projects(&root, &state.inner)?;
+    Ok(Json(search_session_titles(&projects, &request.query)))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -4970,6 +4986,53 @@ mod tests {
                 .any(|session| session.id == created.id)
         );
         assert!(paths_equal(&state.inner.workspace.lock().await.root, &root));
+    }
+
+    #[tokio::test]
+    async fn session_title_search_uses_live_state_and_returns_ranked_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config::test("auto", "http://127.0.0.1:1/v1");
+        let store = SessionStore::new(&root).unwrap();
+        let mut exact = store.create("model".into()).unwrap();
+        exact.title = "Alpha".into();
+        exact.archived_at = Some(chrono::Utc::now());
+        store.save(&exact).unwrap();
+        let mut live = store.create("model".into()).unwrap();
+        live.title = "Project Alpha".into();
+        let agent = build_agent(&root, &config, false, live.clone()).unwrap();
+        let state = test_state(config, root.clone(), test_conversation(agent), false);
+
+        let matches = search_sessions(
+            State(state.clone()),
+            Query(SessionTitleSearchRequest {
+                query: "ALPHA".into(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].session.id, exact.id);
+        assert!(matches[0].session.effectively_archived());
+        assert_eq!(matches[1].session.id, live.id);
+        assert!(paths_equal(
+            matches[1].project.as_deref().unwrap(),
+            root.as_path()
+        ));
+        assert!(
+            search_sessions(
+                State(state),
+                Query(SessionTitleSearchRequest { query: " ".into() }),
+            )
+            .await
+            .ok()
+            .unwrap()
+            .0
+            .is_empty()
+        );
     }
 
     #[tokio::test]

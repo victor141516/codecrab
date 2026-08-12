@@ -198,6 +198,57 @@ describe("session sidebar actions", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     expect(resumeBodies).toHaveLength(1);
   });
+
+  test("searches session titles through Rust and resumes a cross-project archived result", async () => {
+    let searchQuery;
+    let resumeBody;
+    const archived = {
+      id: "archived-alpha",
+      title: "Alpha",
+      archived_at: "2026-08-12T12:00:00Z",
+      archived_by_ancestor: false,
+      pinned_at: null
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url === "/api/state") return response(sidebarState());
+      if (url.startsWith("/api/sessions/search?")) {
+        searchQuery = new URL(url, "http://codecrab.test").searchParams.get("query");
+        return response([
+          { project: "/other", session: archived },
+          { project: "/workspace", session: { id: "word-alpha", title: "Project Alpha" } }
+        ]);
+      }
+      if (url === "/api/sessions/resume") {
+        resumeBody = JSON.parse(options.body);
+        return response(sidebarState());
+      }
+      throw new Error(`offline test: ${url}`);
+    }));
+
+    mountApp();
+    await vi.waitFor(() => expect(root.textContent).toContain("Regular session"));
+    const search = get('input[aria-label="Search session titles"]');
+    search.value = "  ALPHA  ";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+
+    await vi.waitFor(() => expect(searchQuery).toBe("ALPHA"));
+    await vi.waitFor(() => expect(root.textContent).toContain("Title matches · 2"));
+    expect(root.textContent).toContain("other");
+    expect(root.textContent).toContain("archived");
+    expect(get('[aria-label="Session title search results"]').textContent).not.toContain(
+      "Regular session"
+    );
+
+    [...get('[aria-label="Session title search results"]').querySelectorAll("button")]
+      .find((button) => button.textContent.includes("Alpha"))
+      .click();
+    await vi.waitFor(() =>
+      expect(resumeBody).toEqual({ project: "/other", id: "archived-alpha" })
+    );
+    expect(get('input[aria-label="Search session titles"]').value).toBe("");
+    await vi.waitFor(() => expect(root.textContent).toContain("Regular session"));
+  });
 });
 
 describe("No project sessions", () => {
