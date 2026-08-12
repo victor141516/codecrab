@@ -43,9 +43,10 @@ use crate::{
     changes::ChangeStore,
     code_server::{CodeServerManager, EditorStatus, ExtensionAction, ExtensionDiffFile},
     completion::{
-        CompletionItem, complete_with_policy as complete_input,
-        file_completion_context_with_policy, filesystem_root, recursive_file_completion_available,
-        slash_completion_range, start_file_completion_search,
+        CompletionItem, ComposerSegment, complete_with_policy as complete_input,
+        composer_decorations, composer_segments, file_completion_context_with_policy,
+        filesystem_root, recursive_file_completion_available, slash_completion_range,
+        start_file_completion_search,
     },
     config::{Config, ProviderSummary, SessionRegistry, paths_equal},
     conversation::{
@@ -419,6 +420,7 @@ struct CompletionResponse {
     replace_after: String,
     recursive: bool,
     slash_context: bool,
+    segments: Vec<ComposerSegment>,
 }
 
 #[derive(Serialize)]
@@ -1259,6 +1261,16 @@ async fn completions(
         usage_available,
         absolute_only,
     );
+    let decorations = composer_decorations(
+        &input,
+        &snapshot.project_root,
+        skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.description.as_str())),
+        usage_available,
+        absolute_only,
+    );
+    let segments = composer_segments(&input, &decorations);
     let (items, token_start, token_end) = match menu {
         Some(menu) => (menu.items, menu.token_start, menu.token_end),
         None if recursive => {
@@ -1275,7 +1287,7 @@ async fn completions(
             let (start, end) = slash_range.expect("checked above");
             (Vec::new(), start, end)
         }
-        None => return Ok(Json(None)),
+        None => (Vec::new(), cursor, cursor),
     };
     Ok(Json(Some(CompletionResponse {
         request_id: request.request_id,
@@ -1284,6 +1296,7 @@ async fn completions(
         items,
         recursive,
         slash_context: slash_range.is_some(),
+        segments,
     })))
 }
 
@@ -4486,7 +4499,7 @@ mod tests {
         assert_eq!(immediate.request_id, 9);
 
         let response = recursive_completions(
-            State(state),
+            State(state.clone()),
             Json(CompletionRequest {
                 request_id: 9,
                 session_id: None,
@@ -4506,6 +4519,34 @@ mod tests {
         assert!(messages.contains("\"request_id\":9"));
         assert!(messages.contains("nested/deeper/my-config-file.toml"));
         assert!(messages.contains("\"type\":\"done\""));
+
+        let decorated = completions(
+            State(state),
+            Json(CompletionRequest {
+                request_id: 10,
+                session_id: None,
+                before_cursor: "Use /review-rust and /missing".into(),
+                after_cursor: String::new(),
+                skill_refresh_id: None,
+            }),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0
+        .unwrap();
+        assert!(decorated.items.is_empty());
+        assert_eq!(
+            decorated
+                .segments
+                .iter()
+                .filter_map(|segment| segment.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::completion::ComposerDecorationKind::Skill,
+                crate::completion::ComposerDecorationKind::Invalid,
+            ]
+        );
     }
 
     #[tokio::test]

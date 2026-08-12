@@ -40,8 +40,9 @@ use crate::{
     attachments::AttachmentStore,
     audio::AudioRecording,
     completion::{
-        CompletionKind, CompletionMenu, CompletionSearch, builtin_command_from_input,
-        complete_progressive, goal_objective_from_input, slash_completion_range,
+        CompletionKind, CompletionMenu, CompletionSearch, ComposerDecoration,
+        ComposerDecorationKind, builtin_command_from_input, complete_progressive,
+        composer_decorations, goal_objective_from_input, slash_completion_range,
     },
     config::{Config, SessionRegistry, normalized_root, paths_equal},
     conversation::{
@@ -962,6 +963,7 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     markdown: Arc<MarkdownHighlighter>,
     input: String,
+    composer_decorations: Vec<ComposerDecoration>,
     composer_attachments: Vec<AttachmentBinding>,
     cursor: usize,
     preferred_column: Option<usize>,
@@ -1143,6 +1145,7 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             markdown: shared_markdown_highlighter(),
             input: String::new(),
+            composer_decorations: Vec::new(),
             composer_attachments: Vec::new(),
             cursor: 0,
             preferred_column: None,
@@ -1410,10 +1413,24 @@ impl App {
                 false
             }
         });
+        self.refresh_composer_decorations();
+    }
+
+    fn refresh_composer_decorations(&mut self) {
+        self.composer_decorations = composer_decorations(
+            &self.input,
+            &self.project_root,
+            self.skills
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill.description.as_str())),
+            self.usage_available(),
+            self.session_scope == SessionScope::NoProject,
+        );
     }
 
     fn clear_composer_text(&mut self) {
         self.input.clear();
+        self.composer_decorations.clear();
         self.composer_attachments.clear();
         self.cursor = 0;
     }
@@ -1562,6 +1579,7 @@ impl App {
                         scope: skill.scope,
                     })
                     .collect();
+                self.refresh_composer_decorations();
             }
             Err(error) => self.error = Some(format!("Could not refresh skills: {error:#}")),
         }
@@ -2247,6 +2265,7 @@ impl App {
                 scope: skill.scope,
             })
             .collect();
+        self.refresh_composer_decorations();
     }
 
     fn apply_branch_session(&mut self, session: &Session) {
@@ -2401,6 +2420,7 @@ impl App {
         self.branch_navigator = None;
         self.pending_branch_node = None;
         self.input = content;
+        self.refresh_composer_decorations();
         self.composer_attachments = attachments;
         self.cursor = self.input.len();
         self.preferred_column = None;
@@ -2419,6 +2439,7 @@ impl App {
             return;
         };
         self.input = edit.previous_input;
+        self.refresh_composer_decorations();
         self.composer_attachments = edit.previous_attachments;
         self.cursor = edit.previous_cursor.min(self.input.len());
         self.preferred_column = None;
@@ -2451,8 +2472,10 @@ impl App {
         let Some(node_id) = self.transcript_node_ids.get(message_index).copied() else {
             return;
         };
+        let attachments = attachment_bindings_for_message(message);
         self.input = content.to_owned();
-        self.composer_attachments = attachment_bindings_for_message(message);
+        self.refresh_composer_decorations();
+        self.composer_attachments = attachments;
         self.cursor = self.input.len();
         self.preferred_column = None;
         self.close_completion();
@@ -3652,6 +3675,7 @@ impl App {
             previous_attachments: std::mem::take(&mut self.composer_attachments),
         });
         self.input = content;
+        self.refresh_composer_decorations();
         self.composer_attachments = attachments;
         self.cursor = self.input.len();
         self.preferred_column = None;
@@ -3664,6 +3688,7 @@ impl App {
             return;
         };
         self.input = edit.previous_input;
+        self.refresh_composer_decorations();
         self.composer_attachments = edit.previous_attachments;
         self.cursor = edit.previous_cursor.min(self.input.len());
         self.preferred_column = None;
@@ -3682,6 +3707,7 @@ impl App {
             self.error = None;
         }
         self.input = edit.previous_input;
+        self.refresh_composer_decorations();
         self.composer_attachments = edit.previous_attachments;
         self.cursor = edit.previous_cursor.min(self.input.len());
         self.preferred_column = None;
@@ -3929,6 +3955,7 @@ impl App {
                     && let Some(prompt) = pending_user
                 {
                     self.input = prompt;
+                    self.refresh_composer_decorations();
                     self.composer_attachments = pending_attachments;
                     self.cursor = self.input.len();
                 }
@@ -6051,6 +6078,53 @@ fn activity_detail_for_display(project_root: &Path, activity: &AgentActivity) ->
         .unwrap_or_else(|| activity.detail.clone())
 }
 
+fn composer_decoration_style(kind: ComposerDecorationKind) -> Style {
+    Style::default().fg(match kind {
+        ComposerDecorationKind::Command => Color::Green,
+        ComposerDecorationKind::Skill => Color::Blue,
+        ComposerDecorationKind::File => Color::Cyan,
+        ComposerDecorationKind::Directory => Color::Yellow,
+        ComposerDecorationKind::Invalid => Color::Red,
+    })
+}
+
+fn styled_composer_rows(
+    input: &str,
+    rows: &[ComposerRow],
+    decorations: &[ComposerDecoration],
+) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| {
+            let mut spans = Vec::new();
+            let mut cursor = row.start;
+            for decoration in decorations {
+                if decoration.end <= row.start {
+                    continue;
+                }
+                if decoration.start >= row.end {
+                    break;
+                }
+                let start = decoration.start.max(row.start);
+                let end = decoration.end.min(row.end);
+                if cursor < start {
+                    spans.push(Span::raw(input[cursor..start].to_owned()));
+                }
+                if start < end {
+                    spans.push(Span::styled(
+                        input[start..end].to_owned(),
+                        composer_decoration_style(decoration.kind),
+                    ));
+                }
+                cursor = end;
+            }
+            if cursor < row.end {
+                spans.push(Span::raw(input[cursor..row.end].to_owned()));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let color = if app.recording.is_some() {
         Color::Red
@@ -6106,11 +6180,10 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (line_index, column) = composer_cursor_position(&app.input, &rows, app.cursor);
     let visible = inner.height.max(1) as usize;
     let start = line_index.saturating_sub(visible - 1);
-    let shown = rows
-        .iter()
+    let shown = styled_composer_rows(&app.input, &rows, &app.composer_decorations)
+        .into_iter()
         .skip(start)
         .take(visible)
-        .map(|row| Line::from(app.input[row.start..row.end].to_owned()))
         .collect::<Vec<_>>();
     if app.input.is_empty() {
         frame.render_widget(
@@ -8443,6 +8516,38 @@ mod tests {
         app.cursor = app.composer_attachments[0].start + 1;
         app.delete();
         assert!(app.composer_attachments.is_empty());
+    }
+
+    #[test]
+    fn composer_rows_style_commands_skills_files_and_invalid_tokens() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}").unwrap();
+        let input = "/help /review-rust @main.rs /missing";
+        let rows = composer_rows(input, 80);
+        let decorations = crate::completion::composer_decorations(
+            input,
+            root.path(),
+            [("review-rust", "Review Rust changes.")],
+            true,
+            false,
+        );
+
+        let lines = styled_composer_rows(input, &rows, &decorations);
+        let styled = lines[0]
+            .spans
+            .iter()
+            .filter_map(|span| span.style.fg.map(|color| (span.content.as_ref(), color)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            styled,
+            vec![
+                ("/help", Color::Green),
+                ("/review-rust", Color::Blue),
+                ("@main.rs", Color::Cyan),
+                ("/missing", Color::Red),
+            ]
+        );
     }
 
     #[test]
