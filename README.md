@@ -135,6 +135,9 @@ Useful composer controls:
 | `/processes` | Inspect and stop managed shell processes in the current session |
 | `Ctrl+V`, `Alt+V`, `Command+V` when reported | Paste clipboard files or image pixels; terminals may consume `Command+V` before CodeCrab sees it |
 | `Enter` | Complete the selected item or send |
+| `Tab` | Complete the selected autocomplete item; otherwise focus the next visible terminal control |
+| `Shift+Tab` | Focus the previous visible terminal control |
+| `Space` | Activate the focused terminal control; insert a space while the composer is focused |
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | Insert a newline (`Alt+Enter` or `Ctrl+J` on macOS) |
 | `Ctrl+Shift+S` | Start or stop dictation (`Ctrl+S` on macOS) |
 | `Up` / `Down` | Navigate menus or move between visual editor rows |
