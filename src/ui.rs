@@ -64,6 +64,10 @@ use crate::{
 };
 use uuid::Uuid;
 
+mod focus;
+
+use focus::InteractionRegistry;
+
 const CRAB: Color = Color::Rgb(244, 99, 86);
 const AQUA: Color = Color::Rgb(74, 210, 200);
 const GOAL: Color = Color::Rgb(190, 150, 255);
@@ -173,12 +177,33 @@ enum PendingGoalAction {
     BeginEdit(Uuid),
 }
 
-#[derive(Default)]
-struct GoalButtons {
-    toggle: Option<Rect>,
-    edit: Option<Rect>,
-    delete: Option<Rect>,
-    list: Option<Rect>,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FocusScope {
+    Root,
+    Overlay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FocusId {
+    Composer,
+    GoalToggle(Uuid),
+    GoalEdit(Uuid),
+    GoalDelete(Uuid),
+    GoalList,
+    QueuedSteer(u64),
+    QueuedEdit(u64),
+    QueuedDelete(u64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InteractionAction {
+    GoalToggle(Uuid),
+    GoalEdit(Uuid),
+    GoalDelete(Uuid),
+    OpenGoals,
+    QueuedSteer(u64),
+    QueuedEdit(u64),
+    QueuedDelete(u64),
 }
 
 struct SessionProjectView {
@@ -993,21 +1018,6 @@ struct QueuedPromptEdit {
     previous_attachments: Vec<AttachmentBinding>,
 }
 
-#[derive(Clone, Copy)]
-struct QueuedPromptButtons {
-    id: u64,
-    steer: Rect,
-    edit: Rect,
-    delete: Rect,
-}
-
-#[derive(Clone, Copy)]
-enum QueuedPromptAction {
-    Steer(u64),
-    Edit(u64),
-    Delete(u64),
-}
-
 struct App {
     coordinator: SessionCoordinator,
     conversations: ConversationManager,
@@ -1045,9 +1055,8 @@ struct App {
     editing_goal_id: Option<Uuid>,
     editing_goal_resume: bool,
     editing_message: Option<MessageEdit>,
-    goal_buttons: GoalButtons,
+    interactions: InteractionRegistry<FocusId, InteractionAction, FocusScope>,
     last_escape: Option<Instant>,
-    queued_prompt_buttons: Vec<QueuedPromptButtons>,
     conversation_view: Option<ConversationView>,
     text_selection: Option<TextSelection>,
     copy_flash: Option<CopyFlash>,
@@ -1227,9 +1236,8 @@ impl App {
             editing_goal_id: None,
             editing_goal_resume: false,
             editing_message: None,
-            goal_buttons: GoalButtons::default(),
+            interactions: InteractionRegistry::new(FocusScope::Root, FocusId::Composer),
             last_escape: None,
-            queued_prompt_buttons: Vec::new(),
             conversation_view: None,
             text_selection: None,
             copy_flash: None,
@@ -3597,9 +3605,8 @@ impl App {
         self.editing_goal_id = None;
         self.editing_goal_resume = false;
         self.editing_message = None;
-        self.goal_buttons = GoalButtons::default();
+        self.interactions = InteractionRegistry::new(FocusScope::Root, FocusId::Composer);
         self.last_escape = None;
-        self.queued_prompt_buttons.clear();
         self.conversation_view = None;
         self.text_selection = None;
         self.copy_flash = None;
@@ -3860,74 +3867,68 @@ impl App {
         }
     }
 
+    fn active_focus_scope(&self) -> FocusScope {
+        if self.exit_confirm
+            || self.session_rename.is_some()
+            || self.session_delete_confirm
+            || self.process_dialog.is_some()
+            || self.usage_open
+            || self.branch_navigator.is_some()
+            || self.goal_picker.is_some()
+            || self.show_help
+            || self.show_skills
+            || self.model_picker.is_some()
+            || self.provider_picker.is_some()
+            || self.session_picker.is_some()
+        {
+            FocusScope::Overlay
+        } else {
+            FocusScope::Root
+        }
+    }
+
+    fn dispatch_interaction(&mut self, action: InteractionAction) {
+        match action {
+            InteractionAction::GoalToggle(id) => {
+                self.request_goal_action(PendingGoalAction::Toggle(id));
+            }
+            InteractionAction::GoalEdit(id) => {
+                self.interactions
+                    .focus(&FocusScope::Root, &FocusId::Composer);
+                self.request_goal_action(PendingGoalAction::BeginEdit(id));
+            }
+            InteractionAction::GoalDelete(id) => {
+                self.request_goal_action(PendingGoalAction::Delete(id));
+            }
+            InteractionAction::OpenGoals => self.open_goal_picker(),
+            InteractionAction::QueuedSteer(id) => self.steer_queued_prompt(id),
+            InteractionAction::QueuedEdit(id) => {
+                self.begin_queued_prompt_edit(id);
+                self.interactions
+                    .focus(&FocusScope::Root, &FocusId::Composer);
+            }
+            InteractionAction::QueuedDelete(id) => self.delete_queued_prompt(id),
+        }
+    }
+
+    fn activate_focused_control(&mut self) -> bool {
+        let Some(action) = self.interactions.focused_action() else {
+            return false;
+        };
+        self.dispatch_interaction(action);
+        true
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.goal_picker.is_none()
-            && self.session_picker.is_none()
-            && self.process_dialog.is_none()
-            && !self.session_delete_confirm
-            && !self.exit_confirm
-            && self.model_picker.is_none()
-            && self.provider_picker.is_none()
-            && !self.show_help
-            && !self.show_skills
+            && self.active_focus_scope() == FocusScope::Root
         {
             let point = (mouse.column, mouse.row).into();
-            if self
-                .goal_buttons
-                .list
-                .is_some_and(|area| area.contains(point))
-            {
-                self.open_goal_picker();
-                return;
-            }
-            if let Some(id) = self.visible_goal_id {
-                if self
-                    .goal_buttons
-                    .toggle
-                    .is_some_and(|area| area.contains(point))
-                {
-                    self.request_goal_action(PendingGoalAction::Toggle(id));
-                    return;
+            if let Some((id, action)) = self.interactions.hit_test(point) {
+                self.interactions.focus_active(&id);
+                if let Some(action) = action {
+                    self.dispatch_interaction(action);
                 }
-                if self
-                    .goal_buttons
-                    .edit
-                    .is_some_and(|area| area.contains(point))
-                {
-                    self.request_goal_action(PendingGoalAction::BeginEdit(id));
-                    return;
-                }
-                if self
-                    .goal_buttons
-                    .delete
-                    .is_some_and(|area| area.contains(point))
-                {
-                    self.request_goal_action(PendingGoalAction::Delete(id));
-                    return;
-                }
-            }
-        }
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            let point = (mouse.column, mouse.row).into();
-            let action = self.queued_prompt_buttons.iter().find_map(|buttons| {
-                if buttons.steer.contains(point) {
-                    Some(QueuedPromptAction::Steer(buttons.id))
-                } else if buttons.edit.contains(point) {
-                    Some(QueuedPromptAction::Edit(buttons.id))
-                } else if buttons.delete.contains(point) {
-                    Some(QueuedPromptAction::Delete(buttons.id))
-                } else {
-                    None
-                }
-            });
-            match action {
-                Some(QueuedPromptAction::Steer(id)) => self.steer_queued_prompt(id),
-                Some(QueuedPromptAction::Edit(id)) => self.begin_queued_prompt_edit(id),
-                Some(QueuedPromptAction::Delete(id)) => self.delete_queued_prompt(id),
-                None => {}
-            }
-            if action.is_some() {
                 return;
             }
         }
@@ -4852,6 +4853,54 @@ impl App {
             }
         }
 
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            match key.code {
+                KeyCode::Tab => {
+                    self.interactions
+                        .move_focus(!key.modifiers.contains(KeyModifiers::SHIFT));
+                    return Ok(());
+                }
+                KeyCode::BackTab => {
+                    self.interactions.move_focus(false);
+                    return Ok(());
+                }
+                KeyCode::Char(' ')
+                    if self.interactions.focused_id() != Some(&FocusId::Composer)
+                        && self.activate_focused_control() =>
+                {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if self.interactions.focused_id() != Some(&FocusId::Composer) {
+            if key.modifiers == KeyModifiers::CONTROL {
+                if matches!(key.code, KeyCode::Char('c' | 'd')) && !self.is_busy() {
+                    self.request_quit();
+                }
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::PageUp => self.scroll_up(10),
+                KeyCode::PageDown => self.scroll_down(10),
+                KeyCode::F(1) | KeyCode::Char('?') if self.input.is_empty() => {
+                    self.show_help = true;
+                }
+                KeyCode::F(2) => self.open_skill_picker(),
+                KeyCode::Esc => {
+                    self.interactions
+                        .focus(&FocusScope::Root, &FocusId::Composer);
+                    self.close_completion();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if let Some(action) = editor_action(&key) {
             self.apply_editor_action(action);
             return Ok(());
@@ -5094,6 +5143,8 @@ fn collect_terminal_events(
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    let focus_scope = app.active_focus_scope();
+    app.interactions.begin_frame(focus_scope);
     app.composer_width = area.width.saturating_sub(2).max(1) as usize;
     let input_lines = composer_rows(&app.input, app.composer_width)
         .len()
@@ -5175,10 +5226,54 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             "Every managed terminal will be stopped before CodeCrab exits.\n\nEnter/Y confirm  •  Esc/N cancel",
         );
     }
+    app.interactions.finish_frame();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_interactive_button(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    label: &str,
+    color: Color,
+    id: FocusId,
+    action: InteractionAction,
+    enabled: bool,
+) {
+    let focused = app.interactions.is_focused(&FocusScope::Root, &id);
+    app.interactions
+        .register(id, area, Some(action), enabled, FocusScope::Root);
+    let border_style = if focused {
+        Style::default().fg(AQUA).add_modifier(Modifier::BOLD)
+    } else if enabled {
+        Style::default().fg(color)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let text_style = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(AQUA)
+            .add_modifier(Modifier::BOLD)
+    } else if enabled {
+        Style::default()
+    } else {
+        Style::default().fg(MUTED)
+    };
+    frame.render_widget(
+        Paragraph::new(label.to_owned())
+            .style(text_style)
+            .centered()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style),
+            ),
+        area,
+    );
 }
 
 fn render_queued_prompts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    app.queued_prompt_buttons.clear();
     let visible = (area.height / 3).min(app.prompt_queue.items.len() as u16) as usize;
     if visible == 0 || area.width < 16 {
         return;
@@ -5186,14 +5281,14 @@ fn render_queued_prompts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = Layout::vertical(vec![Constraint::Length(3); visible]).split(area);
     let total = app.prompt_queue.items.len();
     let editing_id = app.queued_prompt_edit.as_ref().map(|edit| edit.id);
-    for (index, (prompt, row)) in app
+    let prompts = app
         .prompt_queue
         .items
         .iter()
         .take(visible)
-        .zip(rows.iter().copied())
-        .enumerate()
-    {
+        .cloned()
+        .collect::<Vec<_>>();
+    for (index, (prompt, row)) in prompts.into_iter().zip(rows.iter().copied()).enumerate() {
         let editing = editing_id == Some(prompt.id);
         if row.width < 25 {
             frame.render_widget(
@@ -5253,52 +5348,44 @@ fn render_queued_prompts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .wrap(Wrap { trim: true }),
             message,
         );
-        frame.render_widget(
-            Paragraph::new(if compact_controls { "S" } else { "Steer" })
-                .centered()
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(if editing { MUTED } else { CRAB })),
-                ),
+        render_interactive_button(
+            frame,
+            app,
             steer,
+            if compact_controls { "S" } else { "Steer" },
+            CRAB,
+            FocusId::QueuedSteer(prompt.id),
+            InteractionAction::QueuedSteer(prompt.id),
+            !editing,
         );
-        frame.render_widget(
-            Paragraph::new(if compact_controls { "E" } else { "Edit" })
-                .centered()
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(CRAB)),
-                ),
+        render_interactive_button(
+            frame,
+            app,
             edit,
+            if compact_controls { "E" } else { "Edit" },
+            CRAB,
+            FocusId::QueuedEdit(prompt.id),
+            InteractionAction::QueuedEdit(prompt.id),
+            true,
         );
-        frame.render_widget(
-            Paragraph::new(if compact_controls { "X" } else { "Delete" })
-                .centered()
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(MUTED)),
-                ),
+        render_interactive_button(
+            frame,
+            app,
             delete,
+            if compact_controls { "X" } else { "Delete" },
+            MUTED,
+            FocusId::QueuedDelete(prompt.id),
+            InteractionAction::QueuedDelete(prompt.id),
+            true,
         );
-        app.queued_prompt_buttons.push(QueuedPromptButtons {
-            id: prompt.id,
-            steer,
-            edit,
-            delete,
-        });
     }
 }
 
 fn render_goal(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(goal) = app.visible_goal().cloned() else {
-        app.goal_buttons = GoalButtons::default();
         return;
     };
     if area.height < 3 {
-        app.goal_buttons = GoalButtons::default();
         return;
     }
     if area.width < 34 {
@@ -5323,7 +5410,6 @@ fn render_goal(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             ),
             area,
         );
-        app.goal_buttons = GoalButtons::default();
         return;
     }
 
@@ -5367,33 +5453,50 @@ fn render_goal(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ),
         message,
     );
-    let button = |label: &str, color: Color| {
-        Paragraph::new(label.to_owned()).centered().block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(color)),
-        )
-    };
-    frame.render_widget(
-        button(
-            if goal.status == GoalStatus::Active {
-                "Pause"
-            } else {
-                "Play"
-            },
-            status_color,
-        ),
+    render_interactive_button(
+        frame,
+        app,
         toggle,
+        if goal.status == GoalStatus::Active {
+            "Pause"
+        } else {
+            "Play"
+        },
+        status_color,
+        FocusId::GoalToggle(goal.id),
+        InteractionAction::GoalToggle(goal.id),
+        true,
     );
-    frame.render_widget(button("Edit", MUTED), edit);
-    frame.render_widget(button("Delete", Color::Red), delete);
-    frame.render_widget(button("Goals", GOAL), list);
-    app.goal_buttons = GoalButtons {
-        toggle: Some(toggle),
-        edit: Some(edit),
-        delete: Some(delete),
-        list: Some(list),
-    };
+    render_interactive_button(
+        frame,
+        app,
+        edit,
+        "Edit",
+        MUTED,
+        FocusId::GoalEdit(goal.id),
+        InteractionAction::GoalEdit(goal.id),
+        true,
+    );
+    render_interactive_button(
+        frame,
+        app,
+        delete,
+        "Delete",
+        Color::Red,
+        FocusId::GoalDelete(goal.id),
+        InteractionAction::GoalDelete(goal.id),
+        true,
+    );
+    render_interactive_button(
+        frame,
+        app,
+        list,
+        "Goals",
+        GOAL,
+        FocusId::GoalList,
+        InteractionAction::OpenGoals,
+        true,
+    );
 }
 
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -6279,7 +6382,12 @@ fn styled_composer_rows(
         .collect()
 }
 
-fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_composer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let focused = app
+        .interactions
+        .is_focused(&FocusScope::Root, &FocusId::Composer);
+    app.interactions
+        .register(FocusId::Composer, area, None, true, FocusScope::Root);
     let color = if app.recording.is_some() {
         Color::Red
     } else if app.is_running() || app.transcription.is_some() {
@@ -6307,7 +6415,11 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
+        .border_style(if focused {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        })
         .title(Span::styled(title, Style::default().fg(color)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -6484,7 +6596,7 @@ fn render_completion(frame: &mut Frame<'_>, app: &App, body: Rect, composer: Rec
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered_rect(area, 74, 25);
+    let popup = centered_rect(area, 74, area.height.saturating_sub(2).min(37));
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
@@ -6492,7 +6604,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(CRAB).add_modifier(Modifier::BOLD),
         )),
         Line::from("  Enter                 complete, send, or send recording"),
-        Line::from("  Tab                   complete slash selection"),
+        Line::from("  Tab                   complete selection or focus next control"),
+        Line::from("  Shift+Tab             focus previous control"),
+        Line::from("  Space                 activate focused control; type in composer"),
         Line::from(format!("  {:<30}insert newline", newline_shortcut_label())),
         Line::from(format!(
             "  {:<30}start or stop voice dictation",
@@ -8963,7 +9077,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn double_escape_and_the_mouse_only_steer_button_cancel_a_turn() {
+    async fn double_escape_and_the_registered_steer_button_cancel_a_turn() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
         let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
@@ -8982,16 +9096,14 @@ mod tests {
         assert!(app.last_escape.is_none());
 
         let id = app.prompt_queue.push("Steer now".into(), Vec::new());
-        app.queued_prompt_buttons.push(QueuedPromptButtons {
-            id,
-            steer: Rect::new(10, 4, 9, 3),
-            edit: Rect::new(19, 4, 7, 3),
-            delete: Rect::new(26, 4, 9, 3),
-        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let steer = app.interactions.area(&FocusId::QueuedSteer(id)).unwrap();
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 12,
-            row: 5,
+            column: steer.x + 1,
+            row: steer.y + 1,
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.prompt_queue.steered_id, Some(id));
@@ -9005,7 +9117,8 @@ mod tests {
         let mut app = test_app(root.path());
         app.prompt_queue
             .push("Use the other implementation".into(), Vec::new());
-        app.prompt_queue
+        let second = app
+            .prompt_queue
             .push("Then update its tests".into(), Vec::new());
         let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -9024,23 +9137,27 @@ mod tests {
         assert!(text.contains("Steer"));
         assert!(text.contains("Edit"));
         assert!(text.contains("Delete"));
-        assert_eq!(app.queued_prompt_buttons.len(), 2);
+        assert_eq!(app.interactions.focusable_count(&FocusScope::Root), 7);
 
-        let controls = app.queued_prompt_buttons[1];
+        let edit = app.interactions.area(&FocusId::QueuedEdit(second)).unwrap();
+        let delete = app
+            .interactions
+            .area(&FocusId::QueuedDelete(second))
+            .unwrap();
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: controls.edit.x + 1,
-            row: controls.edit.y + 1,
+            column: edit.x + 1,
+            row: edit.y + 1,
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(
             app.queued_prompt_edit.as_ref().map(|edit| edit.id),
-            Some(controls.id)
+            Some(second)
         );
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: controls.delete.x + 1,
-            row: controls.delete.y + 1,
+            column: delete.x + 1,
+            row: delete.y + 1,
             modifiers: KeyModifiers::NONE,
         });
         assert!(app.queued_prompt_edit.is_none());
@@ -9127,7 +9244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_picker_pauses_the_active_goal_and_the_goal_row_has_mouse_controls() {
+    async fn goal_picker_pauses_the_active_goal_and_the_goal_row_registers_controls() {
         let root = tempfile::tempdir().unwrap();
         let mut app = test_app(root.path());
         let snapshot = app
@@ -9159,10 +9276,197 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("PAUSED"));
         assert!(text.contains("Finish the migration"));
-        assert!(app.goal_buttons.toggle.is_some());
-        assert!(app.goal_buttons.edit.is_some());
-        assert!(app.goal_buttons.delete.is_some());
-        assert!(app.goal_buttons.list.is_some());
+        assert!(app.interactions.area(&FocusId::GoalToggle(id)).is_some());
+        assert!(app.interactions.area(&FocusId::GoalEdit(id)).is_some());
+        assert!(app.interactions.area(&FocusId::GoalDelete(id)).is_some());
+        assert!(app.interactions.area(&FocusId::GoalList).is_some());
+    }
+
+    #[tokio::test]
+    async fn goal_controls_traverse_wrap_render_focus_and_activate_with_space() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let snapshot = app
+            .conversation
+            .create_goal("Navigate every goal action".into())
+            .await
+            .unwrap();
+        let id = snapshot.session.goals[0].id;
+        app.apply_snapshot(snapshot);
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.interactions.focused_id(), Some(&FocusId::Composer));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.interactions.focused_id(),
+            Some(&FocusId::GoalToggle(id))
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let toggle = app.interactions.area(&FocusId::GoalToggle(id)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(toggle.x + 1, toggle.y + 1)].bg,
+            AQUA
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.apply_pending_goal_action().await.unwrap();
+        assert_eq!(
+            app.goals.iter().find(|goal| goal.id == id).unwrap().status,
+            GoalStatus::Paused
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        assert_eq!(app.interactions.focused_id(), Some(&FocusId::Composer));
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        assert_eq!(app.interactions.focused_id(), Some(&FocusId::GoalList));
+    }
+
+    #[tokio::test]
+    async fn completion_and_overlay_key_handling_precede_global_focus_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let snapshot = app
+            .conversation
+            .create_goal("Keep contextual keys first".into())
+            .await
+            .unwrap();
+        app.apply_snapshot(snapshot);
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        app.input = "/".into();
+        app.cursor = 1;
+        app.refresh_completion();
+        assert!(app.completion.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_ne!(app.input, "/");
+        assert_eq!(app.interactions.focused_id(), Some(&FocusId::Composer));
+
+        app.open_goal_picker();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.interactions.focused_id(), None);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.interactions.focused_id(), None);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.interactions.focused_id(), Some(&FocusId::Composer));
+    }
+
+    #[tokio::test]
+    async fn queued_controls_keep_stable_focus_and_share_mouse_and_keyboard_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let first = app.prompt_queue.push("first".into(), Vec::new());
+        let second = app.prompt_queue.push("second".into(), Vec::new());
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.interactions.focused_id(),
+            Some(&FocusId::QueuedSteer(first))
+        );
+        app.delete_queued_prompt(first);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.interactions.focused_id(),
+            Some(&FocusId::QueuedSteer(second))
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.interactions.focused_id(),
+            Some(&FocusId::QueuedSteer(second))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.queued_prompt_edit.as_ref().map(|edit| edit.id),
+            Some(second)
+        );
+        app.cancel_queued_prompt_edit();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let edit = app.interactions.area(&FocusId::QueuedEdit(second)).unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: edit.x + 1,
+            row: edit.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.queued_prompt_edit.as_ref().map(|edit| edit.id),
+            Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_layouts_and_overlays_cannot_leave_or_activate_stale_focus() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = test_app(root.path());
+        let id = app.prompt_queue.push("compact".into(), Vec::new());
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let edit = app.interactions.area(&FocusId::QueuedEdit(id)).unwrap();
+        let composer = app.interactions.area(&FocusId::Composer).unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: composer.x + 1,
+            row: composer.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.interactions.focused_id(), Some(&FocusId::Composer));
+
+        app.show_help = true;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: edit.x + 1,
+            row: edit.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.queued_prompt_edit.is_none());
+        app.show_help = false;
+
+        let backend = TestBackend::new(20, 20);
+        let mut compact = Terminal::new(backend).unwrap();
+        compact.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.interactions.focusable_count(&FocusScope::Root), 1);
+        assert_eq!(app.interactions.focused_id(), Some(&FocusId::Composer));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.input, " ");
     }
 
     #[test]
