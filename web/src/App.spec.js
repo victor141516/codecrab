@@ -101,6 +101,26 @@ describe("session sidebar actions", () => {
     return { ok: true, status: 200, json: async () => body };
   }
 
+  function ndjsonResponse(messages, delay = 0) {
+    const encoder = new TextEncoder();
+    return {
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          const send = () => {
+            controller.enqueue(
+              encoder.encode(`${messages.map((message) => JSON.stringify(message)).join("\n")}\n`)
+            );
+            controller.close();
+          };
+          if (delay) window.setTimeout(send, delay);
+          else send();
+        }
+      })
+    };
+  }
+
   function sidebarState(activeSessionId = "regular") {
     const pinned = {
       id: "pinned",
@@ -199,7 +219,7 @@ describe("session sidebar actions", () => {
     expect(resumeBodies).toHaveLength(1);
   });
 
-  test("searches session titles through Rust and resumes a cross-project archived result", async () => {
+  test("streams separate title and content matches and resumes either result", async () => {
     let searchQuery;
     let resumeBody;
     const archived = {
@@ -213,10 +233,29 @@ describe("session sidebar actions", () => {
       const url = String(input);
       if (url === "/api/state") return response(sidebarState());
       if (url.startsWith("/api/sessions/search?")) {
-        searchQuery = new URL(url, "http://codecrab.test").searchParams.get("query");
-        return response([
-          { project: "/other", session: archived },
-          { project: "/workspace", session: { id: "word-alpha", title: "Project Alpha" } }
+        const params = new URL(url, "http://codecrab.test").searchParams;
+        searchQuery = params.get("query");
+        const requestId = Number(params.get("request_id"));
+        return ndjsonResponse([
+          {
+            type: "titles",
+            request_id: requestId,
+            results: [
+              { project: "/other", session: archived },
+              { project: "/workspace", session: { id: "word-alpha", title: "Project Alpha" } }
+            ]
+          },
+          {
+            type: "content",
+            request_id: requestId,
+            results: [{
+              project: "/other-content",
+              session: { id: "content-alpha", title: "Conversation notes" },
+              role: "user",
+              snippet: "The ALPHA detail appears in this message"
+            }]
+          },
+          { type: "done", request_id: requestId }
         ]);
       }
       if (url === "/api/sessions/resume") {
@@ -228,26 +267,79 @@ describe("session sidebar actions", () => {
 
     mountApp();
     await vi.waitFor(() => expect(root.textContent).toContain("Regular session"));
-    const search = get('input[aria-label="Search session titles"]');
+    const search = get('input[aria-label="Search sessions"]');
     search.value = "  ALPHA  ";
     search.dispatchEvent(new Event("input", { bubbles: true }));
 
     await vi.waitFor(() => expect(searchQuery).toBe("ALPHA"));
     await vi.waitFor(() => expect(root.textContent).toContain("Title matches · 2"));
+    expect(root.textContent).toContain("Content matches · 1");
+    expect(root.textContent).toContain("The ALPHA detail appears in this message");
     expect(root.textContent).toContain("other");
     expect(root.textContent).toContain("archived");
-    expect(get('[aria-label="Session title search results"]').textContent).not.toContain(
+    expect(get('[aria-label="Session search results"]').textContent).not.toContain(
       "Regular session"
     );
 
-    [...get('[aria-label="Session title search results"]').querySelectorAll("button")]
-      .find((button) => button.textContent.includes("Alpha"))
+    [...get('[aria-label="Session search results"]').querySelectorAll("button")]
+      .find((button) => button.textContent.includes("Conversation notes"))
       .click();
     await vi.waitFor(() =>
-      expect(resumeBody).toEqual({ project: "/other", id: "archived-alpha" })
+      expect(resumeBody).toEqual({ project: "/other-content", id: "content-alpha" })
     );
-    expect(get('input[aria-label="Search session titles"]').value).toBe("");
+    expect(get('input[aria-label="Search sessions"]').value).toBe("");
     await vi.waitFor(() => expect(root.textContent).toContain("Regular session"));
+  });
+
+  test("ignores content updates from a stale identified search", async () => {
+    const queries = [];
+    vi.stubGlobal("fetch", vi.fn(async (input) => {
+      const url = String(input);
+      if (url === "/api/state") return response(sidebarState());
+      if (url.startsWith("/api/sessions/search?")) {
+        const params = new URL(url, "http://codecrab.test").searchParams;
+        const query = params.get("query");
+        const requestId = Number(params.get("request_id"));
+        queries.push(query);
+        return ndjsonResponse([
+          {
+            type: "titles",
+            request_id: requestId,
+            results: [{
+              project: "/workspace",
+              session: { id: `${query}-title`, title: `${query} title` }
+            }]
+          },
+          {
+            type: "content",
+            request_id: requestId,
+            results: [{
+              project: "/workspace",
+              session: { id: `${query}-content`, title: `${query} content` },
+              role: "assistant",
+              snippet: `${query} snippet`
+            }]
+          },
+          { type: "done", request_id: requestId }
+        ], query === "alpha" ? 40 : 0);
+      }
+      throw new Error(`offline test: ${url}`);
+    }));
+
+    mountApp();
+    await vi.waitFor(() => expect(root.textContent).toContain("Regular session"));
+    const search = get('input[aria-label="Search sessions"]');
+    search.value = "alpha";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.waitFor(() => expect(queries).toContain("alpha"));
+    search.value = "beta";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+
+    await vi.waitFor(() => expect(root.textContent).toContain("beta snippet"));
+    await new Promise((resolve) => window.setTimeout(resolve, 60));
+    expect(root.textContent).toContain("beta content");
+    expect(root.textContent).not.toContain("alpha content");
+    expect(root.textContent).not.toContain("alpha snippet");
   });
 });
 

@@ -3,11 +3,20 @@ use std::{
     fs,
     ops::Deref,
     path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -875,6 +884,80 @@ pub(crate) struct SessionTitleMatch {
     pub session: SessionSummary,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SessionContentSearchPolicy {
+    pub(crate) minimum_query_characters: usize,
+    pub(crate) maximum_sessions: usize,
+    pub(crate) maximum_file_bytes: u64,
+    pub(crate) maximum_total_bytes: u64,
+    pub(crate) maximum_results: usize,
+    pub(crate) sessions_per_batch: usize,
+    pub(crate) update_interval: Duration,
+    pub(crate) maximum_elapsed: Duration,
+    pub(crate) debounce: Duration,
+    pub(crate) maximum_concurrent_searches: usize,
+}
+
+pub(crate) const SESSION_CONTENT_SEARCH_POLICY: SessionContentSearchPolicy =
+    SessionContentSearchPolicy {
+        minimum_query_characters: 2,
+        maximum_sessions: 1_000,
+        maximum_file_bytes: 16 * 1024 * 1024,
+        maximum_total_bytes: 128 * 1024 * 1024,
+        maximum_results: 60,
+        sessions_per_batch: 8,
+        update_interval: Duration::from_millis(60),
+        maximum_elapsed: Duration::from_millis(1_500),
+        debounce: Duration::from_millis(100),
+        maximum_concurrent_searches: 2,
+    };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionContentRole {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SessionContentMatch {
+    pub project: Option<PathBuf>,
+    pub session: SessionSummary,
+    pub role: SessionContentRole,
+    pub snippet: String,
+}
+
+pub(crate) struct SessionContentUpdate {
+    pub(crate) request_id: u64,
+    pub(crate) matches: Vec<SessionContentMatch>,
+}
+
+pub(crate) struct SessionContentSearch {
+    pub(crate) request_id: u64,
+    updates: mpsc::UnboundedReceiver<SessionContentUpdate>,
+    cancelled: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl SessionContentSearch {
+    pub(crate) fn try_recv(
+        &mut self,
+    ) -> std::result::Result<SessionContentUpdate, mpsc::error::TryRecvError> {
+        self.updates.try_recv()
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<SessionContentUpdate> {
+        self.updates.recv().await
+    }
+}
+
+impl Drop for SessionContentSearch {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.task.abort();
+    }
+}
+
 impl SessionProject {
     pub(crate) fn store(&self, no_project_data_root: &Path) -> Result<SessionStore> {
         SessionStore::for_project_root_in(self.root.as_deref(), no_project_data_root)
@@ -1100,6 +1183,10 @@ impl SessionStore {
 
     pub(crate) fn load(&self, query: Option<&str>) -> Result<Session> {
         let id = self.resolve_id(query)?;
+        self.load_id(id)
+    }
+
+    pub(crate) fn load_id(&self, id: Uuid) -> Result<Session> {
         self.read(&self.dir.join(format!("{id}.json")))
     }
 
@@ -1272,6 +1359,310 @@ pub(crate) fn search_session_titles(
             .then_with(|| left.session.id.cmp(&right.session.id))
     });
     matches.into_iter().map(|(_, result)| result).collect()
+}
+
+pub(crate) fn start_session_content_search(
+    projects: Vec<SessionProject>,
+    no_project_data_root: PathBuf,
+    query: String,
+    request_id: u64,
+) -> Option<SessionContentSearch> {
+    start_session_content_search_with_policy(
+        projects,
+        no_project_data_root,
+        query,
+        request_id,
+        SESSION_CONTENT_SEARCH_POLICY,
+    )
+}
+
+fn start_session_content_search_with_policy(
+    projects: Vec<SessionProject>,
+    no_project_data_root: PathBuf,
+    query: String,
+    request_id: u64,
+    policy: SessionContentSearchPolicy,
+) -> Option<SessionContentSearch> {
+    let query = normalize_search_text(query.trim());
+    if query.chars().count() < policy.minimum_query_characters {
+        return None;
+    }
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let task_cancelled = cancelled.clone();
+    let semaphore = session_content_search_semaphore();
+    let task = runtime.spawn(async move {
+        tokio::time::sleep(policy.debounce).await;
+        if task_cancelled.load(Ordering::Acquire) || updates_tx.is_closed() {
+            return;
+        }
+        let Ok(_permit) = semaphore.acquire_owned().await else {
+            return;
+        };
+        if task_cancelled.load(Ordering::Acquire) || updates_tx.is_closed() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            scan_session_contents(
+                &projects,
+                &no_project_data_root,
+                &query,
+                request_id,
+                policy,
+                &task_cancelled,
+                &updates_tx,
+            );
+        })
+        .await;
+    });
+    Some(SessionContentSearch {
+        request_id,
+        updates: updates_rx,
+        cancelled,
+        task,
+    })
+}
+
+fn session_content_search_semaphore() -> Arc<Semaphore> {
+    static SEARCHES: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEARCHES
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                SESSION_CONTENT_SEARCH_POLICY.maximum_concurrent_searches,
+            ))
+        })
+        .clone()
+}
+
+#[derive(Clone)]
+struct RankedSessionContentMatch {
+    rank: u8,
+    message_index: usize,
+    result: SessionContentMatch,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_session_contents(
+    projects: &[SessionProject],
+    no_project_data_root: &Path,
+    query: &str,
+    request_id: u64,
+    policy: SessionContentSearchPolicy,
+    cancelled: &AtomicBool,
+    updates: &mpsc::UnboundedSender<SessionContentUpdate>,
+) {
+    let started = Instant::now();
+    let query_lower = query.to_lowercase();
+    let mut matches = Vec::<RankedSessionContentMatch>::new();
+    let mut visited_sessions = 0_usize;
+    let mut visited_bytes = 0_u64;
+    let mut sessions_since_update = 0_usize;
+    let mut last_update = Instant::now();
+    let mut matches_changed = false;
+
+    'projects: for project in projects {
+        let Ok(store) = project.store(no_project_data_root) else {
+            continue;
+        };
+        for summary in &project.sessions {
+            if session_content_budget_exhausted(
+                cancelled,
+                updates,
+                started,
+                visited_sessions,
+                visited_bytes,
+                policy,
+            ) {
+                break 'projects;
+            }
+            let path = store.dir.join(format!("{}.json", summary.id));
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let bytes = metadata.len();
+            if bytes > policy.maximum_file_bytes
+                || visited_bytes.saturating_add(bytes) > policy.maximum_total_bytes
+            {
+                continue;
+            }
+            visited_sessions += 1;
+            visited_bytes += bytes;
+            sessions_since_update += 1;
+
+            let Ok(session) = store.load_id(summary.id) else {
+                continue;
+            };
+            if let Some(result) = best_session_content_match(
+                project.root.clone(),
+                summary.clone(),
+                &session,
+                &query_lower,
+            ) {
+                matches.push(result);
+                matches_changed = true;
+            }
+            if matches.len() > policy.maximum_results.saturating_mul(2) {
+                sort_session_content_matches(&mut matches);
+                matches.truncate(policy.maximum_results);
+            }
+            if matches_changed
+                && (sessions_since_update >= policy.sessions_per_batch
+                    || last_update.elapsed() >= policy.update_interval)
+            {
+                sort_session_content_matches(&mut matches);
+                matches.truncate(policy.maximum_results);
+                if send_session_content_update(&matches, request_id, updates).is_err() {
+                    return;
+                }
+                matches_changed = false;
+                sessions_since_update = 0;
+                last_update = Instant::now();
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    if matches_changed {
+        sort_session_content_matches(&mut matches);
+        matches.truncate(policy.maximum_results);
+        let _ = send_session_content_update(&matches, request_id, updates);
+    }
+}
+
+fn session_content_budget_exhausted(
+    cancelled: &AtomicBool,
+    updates: &mpsc::UnboundedSender<SessionContentUpdate>,
+    started: Instant,
+    visited_sessions: usize,
+    visited_bytes: u64,
+    policy: SessionContentSearchPolicy,
+) -> bool {
+    cancelled.load(Ordering::Acquire)
+        || updates.is_closed()
+        || visited_sessions >= policy.maximum_sessions
+        || visited_bytes >= policy.maximum_total_bytes
+        || started.elapsed() >= policy.maximum_elapsed
+}
+
+fn best_session_content_match(
+    project: Option<PathBuf>,
+    summary: SessionSummary,
+    session: &Session,
+    query_lower: &str,
+) -> Option<RankedSessionContentMatch> {
+    session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            !message.hidden && matches!(message.role, Role::User | Role::Assistant)
+        })
+        .filter_map(|(message_index, message)| {
+            let text = normalize_search_text(message.content.as_deref()?.trim());
+            if text.is_empty() {
+                return None;
+            }
+            let lower = text.to_lowercase();
+            let match_byte = lower.find(query_lower)?;
+            let rank = if lower == query_lower {
+                0
+            } else if match_byte == 0 {
+                1
+            } else if lower[..match_byte]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_alphanumeric())
+            {
+                2
+            } else {
+                3
+            };
+            let role = if matches!(message.role, Role::User) {
+                SessionContentRole::User
+            } else {
+                SessionContentRole::Assistant
+            };
+            Some(RankedSessionContentMatch {
+                rank,
+                message_index,
+                result: SessionContentMatch {
+                    project: project.clone(),
+                    session: summary.clone(),
+                    role,
+                    snippet: content_match_snippet(&text, lower[..match_byte].chars().count()),
+                },
+            })
+        })
+        .min_by(|left, right| {
+            left.rank
+                .cmp(&right.rank)
+                .then_with(|| {
+                    let left_assistant = left.result.role == SessionContentRole::Assistant;
+                    let right_assistant = right.result.role == SessionContentRole::Assistant;
+                    left_assistant.cmp(&right_assistant)
+                })
+                .then_with(|| right.message_index.cmp(&left.message_index))
+        })
+}
+
+fn normalize_search_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn content_match_snippet(text: &str, match_character: usize) -> String {
+    const MAXIMUM_SNIPPET_CHARACTERS: usize = 180;
+    const CONTEXT_BEFORE: usize = 60;
+
+    let characters = text.chars().collect::<Vec<_>>();
+    if characters.len() <= MAXIMUM_SNIPPET_CHARACTERS {
+        return text.to_owned();
+    }
+    let start = match_character
+        .saturating_sub(CONTEXT_BEFORE)
+        .min(characters.len() - MAXIMUM_SNIPPET_CHARACTERS);
+    let end = start + MAXIMUM_SNIPPET_CHARACTERS;
+    let mut snippet = characters[start..end].iter().collect::<String>();
+    if start > 0 {
+        snippet.insert(0, '…');
+    }
+    if end < characters.len() {
+        snippet.push('…');
+    }
+    snippet
+}
+
+fn sort_session_content_matches(matches: &mut [RankedSessionContentMatch]) {
+    matches.sort_by(|left, right| {
+        left.rank
+            .cmp(&right.rank)
+            .then_with(|| {
+                let left_assistant = left.result.role == SessionContentRole::Assistant;
+                let right_assistant = right.result.role == SessionContentRole::Assistant;
+                left_assistant.cmp(&right_assistant)
+            })
+            .then_with(|| {
+                right
+                    .result
+                    .session
+                    .updated_at
+                    .cmp(&left.result.session.updated_at)
+            })
+            .then_with(|| left.result.session.title.cmp(&right.result.session.title))
+            .then_with(|| left.result.project.cmp(&right.result.project))
+            .then_with(|| left.result.session.id.cmp(&right.result.session.id))
+    });
+}
+
+fn send_session_content_update(
+    matches: &[RankedSessionContentMatch],
+    request_id: u64,
+    updates: &mpsc::UnboundedSender<SessionContentUpdate>,
+) -> std::result::Result<(), mpsc::error::SendError<SessionContentUpdate>> {
+    updates.send(SessionContentUpdate {
+        request_id,
+        matches: matches.iter().map(|item| item.result.clone()).collect(),
+    })
 }
 
 fn arrange_session_tree(sessions: &mut Vec<SessionSummary>) {
@@ -2252,6 +2643,209 @@ mod tests {
         assert!(matches[3].session.effectively_archived());
         assert!(search_session_titles(&projects, "   ").is_empty());
         assert!(search_session_titles(&projects, "missing").is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_search_streams_ranked_visible_matches_across_projects_and_skips_malformed_sessions()
+     {
+        fn save_session(
+            store: &SessionStore,
+            title: &str,
+            updated_at: i64,
+            message: Message,
+        ) -> Session {
+            let mut session = store.create("model".into()).unwrap();
+            session.title = title.into();
+            session.updated_at = DateTime::from_timestamp(updated_at, 0).unwrap();
+            session.messages.push(message);
+            store.save(&session).unwrap();
+            session
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        let global_root = temp.path().join("global");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        fs::create_dir_all(&global_root).unwrap();
+        let first_store = SessionStore::new(&first_root).unwrap();
+        let second_store = SessionStore::new(&second_root).unwrap();
+        let global_store = SessionStore::no_project_at(&global_root).unwrap();
+        let exact = save_session(
+            &first_store,
+            "Exact body",
+            1,
+            Message::text(Role::User, "Needle"),
+        );
+        let prefix = save_session(
+            &second_store,
+            "Prefix body",
+            4,
+            Message::text(Role::Assistant, "needle begins here"),
+        );
+        let word = save_session(
+            &first_store,
+            "Word body",
+            3,
+            Message::text(Role::User, "Unicode café\nand then NEEDLE nearby"),
+        );
+        let contains = save_session(
+            &second_store,
+            "Contains body",
+            2,
+            Message::text(Role::User, "pineedle suffix"),
+        );
+        let mut no_project = global_store
+            .create_for_provider_with_scope(
+                "provider".into(),
+                "model".into(),
+                SessionScope::NoProject,
+            )
+            .unwrap();
+        no_project.title = "Global body".into();
+        no_project.updated_at = DateTime::from_timestamp(7, 0).unwrap();
+        no_project
+            .messages
+            .push(Message::text(Role::User, "global needle memory"));
+        global_store.save(&no_project).unwrap();
+        let hidden = save_session(
+            &first_store,
+            "Hidden body",
+            5,
+            Message::hidden_text(Role::User, "needle must stay hidden"),
+        );
+        let malformed = save_session(
+            &second_store,
+            "Malformed body",
+            6,
+            Message::text(Role::User, "needle in a corrupt file"),
+        );
+        let projects = vec![
+            SessionProject {
+                root: None,
+                sessions: global_store.list().unwrap(),
+            },
+            SessionProject {
+                root: Some(first_root.clone()),
+                sessions: first_store.list().unwrap(),
+            },
+            SessionProject {
+                root: Some(second_root.clone()),
+                sessions: second_store.list().unwrap(),
+            },
+        ];
+        fs::write(
+            second_store.dir.join(format!("{}.json", malformed.id)),
+            b"not json",
+        )
+        .unwrap();
+        let policy = SessionContentSearchPolicy {
+            minimum_query_characters: 1,
+            maximum_sessions: 20,
+            maximum_file_bytes: 1_000_000,
+            maximum_total_bytes: 10_000_000,
+            maximum_results: 20,
+            sessions_per_batch: 1,
+            update_interval: Duration::ZERO,
+            maximum_elapsed: Duration::from_secs(5),
+            debounce: Duration::ZERO,
+            maximum_concurrent_searches: 2,
+        };
+        let mut search = start_session_content_search_with_policy(
+            projects,
+            global_root,
+            "  nEeDlE  ".into(),
+            41,
+            policy,
+        )
+        .unwrap();
+        let mut updates = Vec::new();
+        while let Some(update) = search.recv().await {
+            assert_eq!(update.request_id, 41);
+            updates.push(update.matches);
+        }
+
+        assert!(updates.len() > 1, "matches should arrive progressively");
+        let matches = updates.last().unwrap();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|result| result.session.id)
+                .collect::<Vec<_>>(),
+            vec![exact.id, prefix.id, no_project.id, word.id, contains.id]
+        );
+        assert_eq!(matches[0].role, SessionContentRole::User);
+        assert_eq!(matches[1].role, SessionContentRole::Assistant);
+        assert!(matches[2].project.is_none());
+        assert!(matches[3].snippet.contains("café and then NEEDLE"));
+        assert!(!matches.iter().any(|result| result.session.id == hidden.id));
+        assert!(
+            !matches
+                .iter()
+                .any(|result| result.session.id == malformed.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn content_search_is_bounded_and_cancelled_when_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let global_root = temp.path().join("global");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&global_root).unwrap();
+        let store = SessionStore::new(&root).unwrap();
+        for index in 0..3 {
+            let mut session = store.create("model".into()).unwrap();
+            session.title = format!("session {index}");
+            session
+                .messages
+                .push(Message::text(Role::User, format!("needle content {index}")));
+            store.save(&session).unwrap();
+        }
+        let projects = vec![SessionProject {
+            root: Some(root),
+            sessions: store.list().unwrap(),
+        }];
+        let policy = SessionContentSearchPolicy {
+            minimum_query_characters: 1,
+            maximum_sessions: 1,
+            maximum_file_bytes: 1_000_000,
+            maximum_total_bytes: 10_000_000,
+            maximum_results: 20,
+            sessions_per_batch: 1,
+            update_interval: Duration::ZERO,
+            maximum_elapsed: Duration::from_secs(5),
+            debounce: Duration::ZERO,
+            maximum_concurrent_searches: 2,
+        };
+        let mut bounded = start_session_content_search_with_policy(
+            projects.clone(),
+            global_root.clone(),
+            "needle".into(),
+            7,
+            policy,
+        )
+        .unwrap();
+        let update = bounded.recv().await.unwrap();
+        assert_eq!(update.matches.len(), 1);
+        assert!(bounded.recv().await.is_none());
+
+        let delayed_policy = SessionContentSearchPolicy {
+            debounce: Duration::from_secs(30),
+            ..policy
+        };
+        let search = start_session_content_search_with_policy(
+            projects,
+            global_root,
+            "needle".into(),
+            8,
+            delayed_policy,
+        )
+        .unwrap();
+        let cancelled = search.cancelled.clone();
+        drop(search);
+        assert!(cancelled.load(Ordering::Acquire));
     }
 
     #[test]
