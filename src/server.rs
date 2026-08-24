@@ -60,9 +60,9 @@ use crate::{
     project_fs::{DirectoryListing, browse_directories, create_directory, existing_directory},
     provider::{AttachmentBinding, Message, ModelCatalogEntry, ModelSelection},
     session::{
-        Session, SessionMetadataUpdate, SessionProject, SessionStore, SessionSummary,
-        SessionTitleMatch, arrange_session_projects, list_session_projects, resolve_global_session,
-        search_session_titles,
+        Session, SessionContentMatch, SessionMetadataUpdate, SessionProject, SessionStore,
+        SessionSummary, SessionTitleMatch, arrange_session_projects, list_session_projects,
+        resolve_global_session, search_session_titles, start_session_content_search,
     },
     skills::SkillRegistry,
     terminal::{TerminalOutputSnapshot, TerminalProcessState},
@@ -281,7 +281,9 @@ struct ConversationRequest {
 }
 
 #[derive(Deserialize)]
-struct SessionTitleSearchRequest {
+struct SessionSearchRequest {
+    #[serde(default)]
+    request_id: u64,
     query: String,
 }
 
@@ -436,6 +438,22 @@ enum CompletionStreamMessage {
     Update {
         request_id: u64,
         items: Vec<CompletionItem>,
+    },
+    Done {
+        request_id: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SessionSearchStreamMessage {
+    Titles {
+        request_id: u64,
+        results: Vec<SessionTitleMatch>,
+    },
+    Content {
+        request_id: u64,
+        results: Vec<SessionContentMatch>,
     },
     Done {
         request_id: u64,
@@ -1090,11 +1108,83 @@ async fn snapshot(state: &ServerState) -> Result<StateResponse> {
 
 async fn search_sessions(
     State(state): State<ServerState>,
-    Query(request): Query<SessionTitleSearchRequest>,
-) -> ApiResult<Vec<SessionTitleMatch>> {
+    Query(request): Query<SessionSearchRequest>,
+) -> std::result::Result<Response, ApiError> {
     let root = state.inner.workspace.lock().await.root.clone();
     let projects = live_session_projects(&root, &state.inner)?;
-    Ok(Json(search_session_titles(&projects, &request.query)))
+    let titles = search_session_titles(&projects, &request.query);
+    let content_search = start_session_content_search(
+        projects,
+        state.inner.registry.data_dir()?,
+        request.query,
+        request.request_id,
+    );
+    let (output_tx, output_rx) = mpsc::channel::<std::result::Result<Bytes, Infallible>>(8);
+    tokio::spawn(async move {
+        if !send_session_search_stream_message(
+            &output_tx,
+            SessionSearchStreamMessage::Titles {
+                request_id: request.request_id,
+                results: titles,
+            },
+        )
+        .await
+        {
+            return;
+        }
+        if let Some(mut search) = content_search {
+            loop {
+                let update = tokio::select! {
+                    _ = output_tx.closed() => return,
+                    update = search.recv() => update,
+                };
+                let Some(update) = update else {
+                    break;
+                };
+                if !send_session_search_stream_message(
+                    &output_tx,
+                    SessionSearchStreamMessage::Content {
+                        request_id: update.request_id,
+                        results: update.matches,
+                    },
+                )
+                .await
+                {
+                    return;
+                }
+            }
+        }
+        let _ = send_session_search_stream_message(
+            &output_tx,
+            SessionSearchStreamMessage::Done {
+                request_id: request.request_id,
+            },
+        )
+        .await;
+    });
+
+    let mut response = Body::from_stream(ReceiverStream::new(output_rx)).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache"),
+    );
+    Ok(response)
+}
+
+async fn send_session_search_stream_message(
+    output: &mpsc::Sender<std::result::Result<Bytes, Infallible>>,
+    message: SessionSearchStreamMessage,
+) -> bool {
+    let mut line = match serde_json::to_vec(&message) {
+        Ok(line) => line,
+        Err(_) => return false,
+    };
+    line.push(b'\n');
+    output.send(Ok(Bytes::from(line))).await.is_ok()
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -4989,7 +5079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_title_search_uses_live_state_and_returns_ranked_matches() {
+    async fn session_search_streams_titles_before_visible_content_matches() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let config = Config::test("auto", "http://127.0.0.1:1/v1");
@@ -4997,42 +5087,85 @@ mod tests {
         let mut exact = store.create("model".into()).unwrap();
         exact.title = "Alpha".into();
         exact.archived_at = Some(chrono::Utc::now());
+        exact.messages.push(crate::provider::Message::text(
+            crate::provider::Role::User,
+            "other",
+        ));
         store.save(&exact).unwrap();
         let mut live = store.create("model".into()).unwrap();
         live.title = "Project Alpha".into();
+        live.messages.push(crate::provider::Message::text(
+            crate::provider::Role::Assistant,
+            "Alpha appears in persisted conversation content",
+        ));
+        live.messages.push(crate::provider::Message::hidden_text(
+            crate::provider::Role::User,
+            "alpha hidden continuation",
+        ));
+        store.save(&live).unwrap();
         let agent = build_agent(&root, &config, false, live.clone()).unwrap();
         let state = test_state(config, root.clone(), test_conversation(agent), false);
 
-        let matches = search_sessions(
+        let response = search_sessions(
             State(state.clone()),
-            Query(SessionTitleSearchRequest {
+            Query(SessionSearchRequest {
+                request_id: 12,
                 query: "ALPHA".into(),
             }),
         )
         .await
         .ok()
-        .unwrap()
-        .0;
-
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].session.id, exact.id);
-        assert!(matches[0].session.effectively_archived());
-        assert_eq!(matches[1].session.id, live.id);
-        assert!(paths_equal(
-            matches[1].project.as_deref().unwrap(),
-            root.as_path()
-        ));
-        assert!(
-            search_sessions(
-                State(state),
-                Query(SessionTitleSearchRequest { query: " ".into() }),
-            )
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1_000_000)
             .await
-            .ok()
+            .unwrap();
+        let messages = String::from_utf8(body.to_vec())
             .unwrap()
-            .0
-            .is_empty()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages[0]["type"], "titles");
+        assert_eq!(messages[0]["request_id"], 12);
+        assert_eq!(messages[0]["results"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            messages[0]["results"][0]["session"]["id"],
+            exact.id.to_string()
         );
+        assert_eq!(
+            messages[0]["results"][1]["session"]["id"],
+            live.id.to_string()
+        );
+        assert!(messages.iter().any(|message| {
+            message["type"] == "content"
+                && message["results"].as_array().is_some_and(|results| {
+                    results.iter().any(|result| {
+                        result["session"]["id"] == live.id.to_string()
+                            && result["role"] == "assistant"
+                            && result["snippet"]
+                                .as_str()
+                                .is_some_and(|snippet| snippet.contains("persisted conversation"))
+                    })
+                })
+        }));
+        assert_eq!(messages.last().unwrap()["type"], "done");
+
+        let empty = search_sessions(
+            State(state),
+            Query(SessionSearchRequest {
+                request_id: 13,
+                query: " ".into(),
+            }),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let body = axum::body::to_bytes(empty.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("\"type\":\"titles\",\"request_id\":13,\"results\":[]"));
+        assert!(text.contains("\"type\":\"done\",\"request_id\":13"));
     }
 
     #[tokio::test]
