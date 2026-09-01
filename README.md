@@ -18,24 +18,31 @@ CodeCrab keeps final responses concise by default while adapting when the user r
 - 🤖 **Autonomous execution** — no approval prompts, artificial tool-round limits, or hidden iteration cap.
 - 💬 **ChatGPT Plus/Pro login** — use your ChatGPT subscription through browser-based OAuth; no API key or separate API billing is required.
 - 📊 **OpenAI usage and resets** — see provider-reported quota windows and use available manual reset credits from the terminal or web client.
-- 🖥️ **Three ways to work** — full-screen terminal UI, pipe-friendly one-shot CLI, and a responsive browser interface.
-- 🔌 **Flexible providers** — use OpenAI or OpenAI-compatible Chat Completions APIs, including local providers.
+- 🖥️ **Four shared surfaces** — use the same agent through the full-screen terminal UI, pipe-friendly one-shot CLI, responsive browser app, or streaming HTTP/NDJSON API.
+- 🔌 **Session-scoped models and providers** — use OpenAI or OpenAI-compatible profiles, including local endpoints, and persist each session's provider, model, reasoning, and speed without changing global defaults.
 - ⚡ **Live, transparent progress** — stream assistant text and structured reads, searches, edits, commands, retries, and other tool activity as they happen.
+- 🛠️ **Filesystem and shell tools** — read, write, replace, search, run non-interactive commands, and control persistent PTYs with the operating-system account's normal filesystem access.
 - 🧵 **Managed background processes** — see per-session process counts, inspect styled live output, jump to the originating shell activity, and stop a process tree from either client.
-- 🧭 **Web code explorer and diffs** — optionally embed a managed `code-server`, follow edits live, and inspect per-operation or complete turn changes.
-- 💾 **Persistent sessions** — resume, rename, pin, and archive conversations with their messages, tool history, model settings, terminals, goals, and project context intact.
+- 📎 **Files and images** — attach, paste, or drop files; deduplicate session uploads; preserve ordered prompt bindings; and send bounded image renditions only to models that declare image support.
+- 💾 **Cross-project and No project sessions** — browse and resume persistent conversations across every registered project or work without a project identity while keeping messages, activity, terminals, goals, and model state intact.
+- 📌 **Session organization** — rename, pin, archive, restore, and navigate sessions as collapsible parent/child trees from the web, TUI, or CLI listing.
 - 🌿 **Conversation branches** — edit an earlier prompt, preview alternate paths, and switch branches without losing history.
+- ⏭️ **Queued follow-ups and steering** — keep writing while a turn runs, edit or remove queued prompts, or cancel the active turn and send one selected follow-up next.
 - 🎯 **Long-running goals** — give CodeCrab an objective and let it continue across turns until it verifies completion or reports a blocker.
 - 🗓️ **Scheduled agent tasks** — run recurring or delayed prompts through a persistent, hot-reloaded cron daemon, with execution history in both clients.
-- 🧩 **Agent Skills** — discover reusable `SKILL.md` workflows and invoke them explicitly with `/skill-name` or let the model select one.
-- 👥 **Agent delegation** — create isolated child sessions for parallel work or independent validation, then inspect and steer them live.
-- 📎 **Project-aware input** — shared `/command`, skill, and fuzzy `@path` autocomplete in both terminal and web clients.
+- 👥 **Agent delegation and lineage** — create isolated child or independent sessions for parallel work, inspect and steer them live, and keep their relationship visible in the session hierarchy.
+- 🧭 **Managed web workspace and diffs** — optionally embed `code-server`, follow edits live, and inspect reconstructible per-operation or accumulated turn changes.
+- 📱 **Installable and navigable web app** — use a collapsible responsive sidebar, URL-addressable sessions, browser-local drafts, self-signed HTTPS, PWA installation, and optional default-browser app windows.
+- 🧩 **Hot-refreshing Agent Skills** — discover reusable `SKILL.md` workflows, invoke them with `/skill-name` or automatic selection, and refresh the active catalog by reopening slash completion.
+- 🔎 **Shared smart completion** — complete commands, skills, and local or recursively discovered fuzzy `@path` matches through the same Rust engine in both clients.
+- 🧠 **Automatic context compaction** — summarize older safe turn boundaries without deleting the canonical transcript, while preserving checkpoints, retries, cancellation, and provider-specific request contracts.
 - 🎙️ **Voice dictation** — record, transcribe, review, or send prompts from either interface.
+- ✨ **Terminal-native reading and editing** — keep Unicode-aware wrapping and navigation, international keyboard layouts, Markdown and syntax highlighting, mouse selection, clipboard actions, compact long commands, and stable manual scrolling.
 - 🦀 **One native binary** — the Vue web application and syntax highlighting are embedded; Node.js is not needed at runtime.
 
 ## CodeCrab vs. OpenAI Codex
 
-The table below compares the user-facing capabilities documented in this README with OpenAI Codex at [`b545c94`](https://github.com/openai/codex/tree/b545c94041017d000e2c8b2f6272705d21b85dfb). It is a product comparison, not a benchmark: some Codex capabilities are experimental, account-dependent, or available only through particular clients. CodeCrab has also evolved since the gap analysis used for this comparison—most notably, it now includes persistent PTYs and agent-to-agent delegation.
+The table below compares the user-facing capabilities documented in this README with OpenAI Codex at [`b545c94`](https://github.com/openai/codex/tree/b545c94041017d000e2c8b2f6272705d21b85dfb). It is a product comparison, not a benchmark: some Codex capabilities are experimental, account-dependent, or available only through particular clients. CodeCrab has also evolved since the gap analysis used for this comparison, including persistent PTYs and process controls, agent delegation, managed diffs, scheduled tasks, No project sessions, session-scoped provider selection, and editable session metadata.
 
 | Capability | CodeCrab | OpenAI Codex | Practical difference |
 | --- | --- | --- | --- |
